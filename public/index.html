@@ -72,6 +72,23 @@
 let currentCity = null;
 let allCities = [];
 
+// Helper to format UTC time to local time for a given timezone
+function formatTimeLocal(utcTimeString, tz) {
+    if (!utcTimeString) return '';
+    try {
+        const date = new Date(utcTimeString);
+        if (isNaN(date.getTime())) return utcTimeString;
+        return date.toLocaleTimeString('en-US', { 
+            timeZone: tz || 'America/New_York', 
+            hour: 'numeric', 
+            minute: '2-digit',
+            hour12: true 
+        });
+    } catch (e) {
+        return utcTimeString;
+    }
+}
+
 async function init() {
     const r = await fetch('/api/cities');
     allCities = await r.json();
@@ -258,10 +275,13 @@ async function loadCity(code) {
                         </div>
                     </div>
                     ${forecast ? `
-                        <div class="mt-2 pt-2 border-t border-gray-800/50 flex items-center gap-4 text-sm">
-                            <span class="text-gray-500">Forecast:</span>
-                            <span class="text-purple-400 font-medium">${forecast.high}°F high</span>
-                            ${forecast.source ? `<span class="text-gray-600 text-xs">(${forecast.source})</span>` : ''}
+                        <div class="mt-2 pt-2 border-t border-gray-800/50 text-sm">
+                            <div class="flex items-center gap-4">
+                                <span class="text-gray-500">Forecast:</span>
+                                <span class="text-purple-400 font-medium">${forecast.high}°F high</span>
+                                ${forecast.timeOfHighUTC ? `<span class="text-gray-500 text-xs">@ ${formatTimeLocal(forecast.timeOfHighUTC, d.tz)}</span>` : ''}
+                                ${forecast.source ? `<span class="text-gray-600 text-xs">(${forecast.source})</span>` : ''}
+                            </div>
                         </div>
                     ` : ''}
                 </div>
@@ -287,9 +307,12 @@ async function loadCity(code) {
                         </div>
                     </div>
                     ${forecast ? `
-                        <div class="mt-2 pt-2 border-t border-gray-800/50 flex items-center gap-4 text-sm">
-                            <span class="text-gray-500">Forecast:</span>
-                            <span class="text-purple-400 font-medium">${forecast.low}°F low</span>
+                        <div class="mt-2 pt-2 border-t border-gray-800/50 text-sm">
+                            <div class="flex items-center gap-4">
+                                <span class="text-gray-500">Forecast:</span>
+                                <span class="text-purple-400 font-medium">${forecast.low}°F low</span>
+                                ${forecast.timeOfLowUTC ? `<span class="text-gray-500 text-xs">@ ${formatTimeLocal(forecast.timeOfLowUTC, d.tz)}</span>` : ''}
+                            </div>
                         </div>
                     ` : ''}
                 </div>
@@ -357,10 +380,11 @@ function buildMarketViz(marketData, type, observed, forecastTemp) {
     
     const brackets = marketData.brackets;
     
-    // Sort brackets for display (ascending for HIGH, descending for LOW could be done)
+    // Sort brackets for display - use high if available (for "X or below" and ranges),
+    // otherwise use low (for "X or above")
     const sortedBrackets = [...brackets].sort((a, b) => {
-        const aVal = a.low ?? a.high ?? 0;
-        const bVal = b.low ?? b.high ?? 0;
+        const aVal = a.high !== null ? a.high : (a.low !== null ? a.low : 0);
+        const bVal = b.high !== null ? b.high : (b.low !== null ? b.low : 0);
         return aVal - bVal;
     });
     

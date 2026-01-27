@@ -34,8 +34,8 @@ const CITIES = {
         tz: 'America/New_York',
         utcOffset: -5,
         dstOffset: -4,
-        kalshiHighSeries: 'KXHIGHPHIL',
-        kalshiLowSeries: 'KXLOWTPHIL',
+        kalshiHighSeries: 'KXHIGHPHL',
+        kalshiLowSeries: 'KXLOWTPHL',
         hasLow: true
     },
     CHI: { 
@@ -90,8 +90,8 @@ const CITIES = {
         tz: 'America/Chicago',
         utcOffset: -6,
         dstOffset: -5,
-        kalshiHighSeries: 'KXHIGHAUS',
-        kalshiLowSeries: 'KXLOWTAUS',
+        kalshiHighSeries: 'KXHIGHAUT',
+        kalshiLowSeries: 'KXLOWTAUT',
         hasLow: true
     },
     SFO: { 
@@ -118,7 +118,7 @@ const CITIES = {
         tz: 'America/Los_Angeles',
         utcOffset: -8,
         dstOffset: -7,
-        kalshiHighSeries: 'KXHIGHTSEA',
+        kalshiHighSeries: 'KXHIGHSEA',
         kalshiLowSeries: null,
         hasLow: false
     },
@@ -146,7 +146,7 @@ const CITIES = {
         tz: 'America/Chicago',
         utcOffset: -6,
         dstOffset: -5,
-        kalshiHighSeries: 'KXHIGHTNOLA',
+        kalshiHighSeries: 'KXHIGHNO',
         kalshiLowSeries: null,
         hasLow: false
     },
@@ -160,7 +160,7 @@ const CITIES = {
         tz: 'America/Los_Angeles',
         utcOffset: -8,
         dstOffset: -7,
-        kalshiHighSeries: 'KXHIGHTLV',
+        kalshiHighSeries: 'KXHIGHLAS',
         kalshiLowSeries: null,
         hasLow: false
     },
@@ -650,19 +650,24 @@ async function fetchKalshiMarkets(seriesTicker, localDate) {
         // We want to match the date part
         if (!localDate) return allMarkets;
         
-        // Convert localDate (YYYY-MM-DD) to Kalshi format (DDMMMYY)
+        // Convert localDate (YYYY-MM-DD) to Kalshi format (DDMMMYY or DMMMYY)
         const dateParts = localDate.split('-');
         const year = dateParts[0].slice(2); // "26" from "2026"
         const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
         const month = months[parseInt(dateParts[1]) - 1];
-        const day = dateParts[2];
-        const kalshiDate = `${day}${month}${year}`; // e.g., "26JAN26"
+        const day = parseInt(dateParts[2]).toString(); // Remove leading zero: "07" -> "7"
+        const kalshiDate = `${day}${month}${year}`; // e.g., "7JAN26" or "27JAN26"
         
-        console.log(`[Kalshi] Filtering ${seriesTicker} markets for date: ${kalshiDate}`);
+        console.log(`[Kalshi] Filtering ${seriesTicker} markets for date: ${kalshiDate} (from localDate: ${localDate})`);
         
         const todayMarkets = allMarkets.filter(m => {
             // Check if the market ticker contains today's date
-            return m.ticker && m.ticker.includes(kalshiDate);
+            const matches = m.ticker && m.ticker.includes(kalshiDate);
+            if (!matches && m.ticker) {
+                // Debug: log first few non-matching tickers
+                console.log(`[Kalshi] Ticker ${m.ticker} does not match ${kalshiDate}`);
+            }
+            return matches;
         });
         
         console.log(`[Kalshi] Found ${todayMarkets.length} markets for today (${allMarkets.length} total)`);
@@ -697,24 +702,38 @@ function parseBracket(subtitle) {
     
     // "45° to 46°" or "45 to 46"
     const rangeMatch = subtitle.match(/(\d+)°?\s*to\s*(\d+)°?/i);
+    
     // "≤44°" or "44° or below" or "below 44"
-    const underMatch = subtitle.match(/([≤<]|or below|below)\s*(\d+)°?/i) || subtitle.match(/(\d+)°?\s*(or below)/i);
-    // "≥50°" or "50° or above" or "above 50"  
-    const overMatch = subtitle.match(/([≥>]|or above|above)\s*(\d+)°?/i) || subtitle.match(/(\d+)°?\s*(or above)/i);
+    // Try "X or below" format first (number before keyword)
+    const underMatchA = subtitle.match(/(\d+)°?\s*or\s*below/i);
+    // Then try "≤X" or "below X" format (keyword before number)
+    const underMatchB = subtitle.match(/([≤<]|below)\s*(\d+)°?/i);
+    
+    // "≥50°" or "50° or above" or "above 50"
+    // Try "X or above" format first (number before keyword)
+    const overMatchA = subtitle.match(/(\d+)°?\s*or\s*above/i);
+    // Then try "≥X" or "above X" format (keyword before number)
+    const overMatchB = subtitle.match(/([≥>]|above)\s*(\d+)°?/i);
     
     if (rangeMatch) {
         low = parseInt(rangeMatch[1]);
         high = parseInt(rangeMatch[2]);
-    } else if (underMatch) {
-        // For "≤44" or "44 or below", the bracket covers up to and including that number
-        const num = parseInt(underMatch[2] || underMatch[1]);
-        high = num;
-        low = null; // No lower bound
-    } else if (overMatch) {
-        // For "≥50" or "50 or above", the bracket covers from that number up
-        const num = parseInt(overMatch[2] || overMatch[1]);
-        low = num;
-        high = null; // No upper bound
+    } else if (underMatchA) {
+        // "57° or below" - number is in group 1
+        high = parseInt(underMatchA[1]);
+        low = null;
+    } else if (underMatchB) {
+        // "≤57" or "below 57" - number is in group 2
+        high = parseInt(underMatchB[2]);
+        low = null;
+    } else if (overMatchA) {
+        // "66° or above" - number is in group 1
+        low = parseInt(overMatchA[1]);
+        high = null;
+    } else if (overMatchB) {
+        // "≥66" or "above 66" - number is in group 2
+        low = parseInt(overMatchB[2]);
+        high = null;
     }
     
     return { low, high };
@@ -932,6 +951,7 @@ app.get('/api/city/:code', async (req, res) => {
             localDate,
             localTime: new Date().toLocaleTimeString('en-US', { timeZone: cityConfig.tz }),
             tzAbbrev: getTzAbbrev(cityConfig.tz),
+            tz: cityConfig.tz,  // Full timezone for frontend formatting
             dataSource: source,
             
             // HIGH market data
