@@ -192,13 +192,11 @@ class WXSniper:
         """
         Attempt to find and execute a trade for a confirmed temperature.
         
-        Args:
-            station: ICAO code
-            signal_type: 'high' or 'low'
-            temperature_f: Confirmed temperature in F
-            ticker_base: Base ticker (e.g., 'KXHIGHTSFO')
-            market_date: Date string (e.g., '29JAN26')
-            metar_time: METAR observation time
+        NEW LOGIC: Consider BOTH YES and NO on ALL brackets!
+        - If temp IS in bracket → YES wins at $1.00
+        - If temp is NOT in bracket → NO wins at $1.00
+        
+        Buy whichever has the best edge (lowest price for confirmed winner)
         """
         signal = TradeSignal(
             station=station,
@@ -208,82 +206,74 @@ class WXSniper:
             market_date=market_date
         )
         
-        print(f"[SNIPER] Looking for {signal_type} bracket containing {temperature_f}°F")
+        print(f"[SNIPER] Looking for trades on {signal_type} with confirmed temp {temperature_f}°F")
         print(f"[SNIPER] Ticker base: {ticker_base}, date: {market_date}")
         
         try:
-            # Find the bracket that contains this temperature
-            bracket = self._find_bracket_for_temp(
+            # Find the BEST trade across ALL brackets
+            best_trade = self._find_best_trade(
                 ticker_base=ticker_base,
                 market_date=market_date,
                 temperature_f=temperature_f,
                 signal_type=signal_type
             )
             
-            if not bracket:
+            if not best_trade:
                 return TradeResult(
                     signal=signal,
                     success=False,
-                    error=f"No bracket found containing {temperature_f}°F"
+                    error=f"No profitable trade found for {temperature_f}°F"
                 )
             
-            market_ticker, bracket_range, yes_ask = bracket
+            market_ticker, bracket_range, side, price_cents, edge_cents = best_trade
             
-            print(f"[SNIPER] Found bracket: {market_ticker}")
-            print(f"[SNIPER] Range: {bracket_range}, Ask: {yes_ask}¢")
+            print(f"[SNIPER] Best trade: {side.upper()} on {market_ticker}")
+            print(f"[SNIPER] Range: {bracket_range}, Price: {price_cents}¢, Edge: {edge_cents}¢")
             
             # Check if price is acceptable
-            if yes_ask is None:
+            if price_cents > self.max_price_cents:
                 return TradeResult(
                     signal=signal,
                     success=False,
                     market_ticker=market_ticker,
                     bracket_range=bracket_range,
-                    error="No ask price available"
-                )
-            
-            if yes_ask > self.max_price_cents:
-                return TradeResult(
-                    signal=signal,
-                    success=False,
-                    market_ticker=market_ticker,
-                    bracket_range=bracket_range,
-                    price_paid_cents=yes_ask,
-                    error=f"Price {yes_ask}¢ exceeds max {self.max_price_cents}¢"
+                    price_paid_cents=price_cents,
+                    error=f"Price {price_cents}¢ exceeds max {self.max_price_cents}¢"
                 )
             
             # Execute the trade!
             if self.dry_run:
-                print(f"[SNIPER] 🧪 DRY RUN - Would buy {market_ticker} at {yes_ask}¢")
+                print(f"[SNIPER] 🧪 DRY RUN - Would buy {side.upper()} on {market_ticker} at {price_cents}¢")
                 return TradeResult(
                     signal=signal,
                     success=True,
                     market_ticker=market_ticker,
-                    bracket_range=bracket_range,
-                    price_paid_cents=yes_ask,
+                    bracket_range=f"{bracket_range} ({side.upper()})",
+                    price_paid_cents=price_cents,
                     contracts=1,
-                    error="DRY RUN - no actual trade"
+                    error=f"DRY RUN - {edge_cents}¢ edge"
                 )
             else:
                 # LIVE TRADE
-                print(f"[SNIPER] 🔴 LIVE TRADE - Buying {market_ticker} at {yes_ask}¢")
+                print(f"[SNIPER] 🔴 LIVE TRADE - Buying {side.upper()} on {market_ticker} at {price_cents}¢")
                 order = self.kalshi.create_order(
                     ticker=market_ticker,
-                    side='yes',
+                    side=side,  # 'yes' or 'no'
                     action='buy',
                     count=1,
-                    price_cents=yes_ask,
-                    order_type='market'  # Take whatever is available
+                    price_cents=price_cents,
+                    order_type='market'
                 )
                 
                 return TradeResult(
                     signal=signal,
                     success=True,
                     market_ticker=market_ticker,
-                    bracket_range=bracket_range,
-                    price_paid_cents=yes_ask,
+                    bracket_range=f"{bracket_range} ({side.upper()})",
+                    price_paid_cents=price_cents,
                     contracts=1,
-                    order_id=order.get('order_id')
+                    order_id=order.get('order_id') if order else None,
+                    error=None
                 )
                 
         except Exception as e:
@@ -296,79 +286,74 @@ class WXSniper:
                 error=str(e)
             )
     
-    def _find_bracket_for_temp(
+    def _find_best_trade(
         self,
         ticker_base: str,
         market_date: str,
         temperature_f: int,
         signal_type: str
-    ) -> Optional[Tuple[str, str, int]]:
+    ) -> Optional[Tuple[str, str, str, int, int]]:
         """
-        Find the Kalshi bracket that contains the given temperature.
+        Find the BEST trade across all brackets for a confirmed temperature.
+        
+        For each bracket:
+        - If temp IS in bracket → YES wins, check YES ask price
+        - If temp is NOT in bracket → NO wins, check NO ask price
         
         Returns:
-            Tuple of (market_ticker, bracket_range, yes_ask_cents) or None
+            Tuple of (market_ticker, bracket_range, side, price_cents, edge_cents) or None
+            side is 'yes' or 'no'
         """
-        # Construct event ticker (e.g., KXHIGHTSFO-29JAN26)
         event_ticker = f"{ticker_base}-{market_date}"
         
         print(f"[SNIPER] Fetching markets for event: {event_ticker}")
         
         try:
-            # Get all markets for this event
             markets = self.kalshi.get_markets(event_ticker=event_ticker)
             
             if not markets:
                 print(f"[SNIPER] No markets found for {event_ticker}")
-                # Try to list what events ARE available
-                try:
-                    all_markets = self.kalshi.get_markets(series_ticker=ticker_base, limit=10)
-                    if all_markets:
-                        print(f"[SNIPER] Available events for {ticker_base}:")
-                        seen = set()
-                        for m in all_markets:
-                            evt = m.get('event_ticker', '')
-                            if evt and evt not in seen:
-                                print(f"  - {evt}")
-                                seen.add(evt)
-                except:
-                    pass
                 return None
             
-            print(f"[SNIPER] Found {len(markets)} brackets")
+            print(f"[SNIPER] Found {len(markets)} brackets, analyzing all...")
             
-            # Find the bracket containing our temperature
+            best_trade = None
+            best_edge = -100  # Worst possible
+            
             for market in markets:
                 ticker = market.get('ticker', '')
                 subtitle = market.get('yes_sub_title', '') or market.get('subtitle', '')
                 
-                # Parse the bracket range from subtitle or ticker
-                bracket_match = self._parse_bracket(subtitle, ticker, temperature_f, signal_type)
+                # Get prices - handle different formats
+                yes_ask = self._parse_price(market.get('yes_ask'), market.get('yes_ask_dollars'))
+                no_ask = self._parse_price(market.get('no_ask'), market.get('no_ask_dollars'))
                 
-                if bracket_match:
-                    # Get the ask price
-                    yes_ask = market.get('yes_ask')
-                    yes_ask_dollars = market.get('yes_ask_dollars')
-                    
-                    # Handle different formats
-                    if yes_ask_dollars:
-                        # It's in dollars like "0.98"
-                        yes_ask = int(float(yes_ask_dollars) * 100)
-                    elif yes_ask is not None:
-                        if isinstance(yes_ask, str):
-                            yes_ask = int(float(yes_ask) * 100)
-                        elif yes_ask < 2:  # Probably in dollars
-                            yes_ask = int(yes_ask * 100)
-                    
-                    print(f"[SNIPER] ✓ Match! {ticker} - {subtitle} @ {yes_ask}¢")
-                    return (ticker, subtitle or bracket_match, yes_ask)
+                # Determine if temp is IN this bracket
+                temp_in_bracket = self._temp_in_bracket(subtitle, ticker, temperature_f)
+                
+                if temp_in_bracket:
+                    # YES wins - check YES price
+                    if yes_ask is not None and yes_ask <= self.max_price_cents:
+                        edge = 100 - yes_ask  # Profit potential
+                        print(f"  [YES] {ticker}: {subtitle} @ {yes_ask}¢ → {edge}¢ edge (temp IN bracket)")
+                        if edge > best_edge:
+                            best_edge = edge
+                            best_trade = (ticker, subtitle, 'yes', yes_ask, edge)
+                else:
+                    # NO wins - check NO price
+                    if no_ask is not None and no_ask <= self.max_price_cents:
+                        edge = 100 - no_ask  # Profit potential
+                        print(f"  [NO]  {ticker}: {subtitle} @ {no_ask}¢ → {edge}¢ edge (temp NOT in bracket)")
+                        if edge > best_edge:
+                            best_edge = edge
+                            best_trade = (ticker, subtitle, 'no', no_ask, edge)
             
-            print(f"[SNIPER] No bracket found containing {temperature_f}°F")
-            print(f"[SNIPER] Available brackets:")
-            for m in markets[:10]:
-                print(f"  - {m.get('ticker')}: {m.get('yes_sub_title', m.get('subtitle', ''))}")
+            if best_trade:
+                print(f"[SNIPER] ✓ Best trade: {best_trade[2].upper()} on {best_trade[0]} @ {best_trade[3]}¢ ({best_trade[4]}¢ edge)")
+            else:
+                print(f"[SNIPER] No trade found under {self.max_price_cents}¢ threshold")
             
-            return None
+            return best_trade
             
         except Exception as e:
             print(f"[SNIPER] Error fetching markets: {e}")
@@ -376,59 +361,62 @@ class WXSniper:
             traceback.print_exc()
             return None
     
-    def _parse_bracket(
-        self,
-        subtitle: str,
-        ticker: str,
-        temperature_f: int,
-        signal_type: str
-    ) -> Optional[str]:
+    def _parse_price(self, price_raw, price_dollars) -> Optional[int]:
+        """Parse price from various Kalshi formats to cents"""
+        if price_dollars:
+            try:
+                return int(float(price_dollars) * 100)
+            except:
+                pass
+        if price_raw is not None:
+            try:
+                if isinstance(price_raw, str):
+                    return int(float(price_raw) * 100)
+                elif price_raw < 2:  # Probably in dollars
+                    return int(price_raw * 100)
+                else:
+                    return int(price_raw)
+            except:
+                pass
+        return None
+    
+    def _temp_in_bracket(self, subtitle: str, ticker: str, temperature_f: int) -> bool:
         """
-        Check if a bracket contains the given temperature.
+        Check if a temperature falls within a bracket.
         
-        Bracket formats from Kalshi:
-        - "60° to 61°" (temp is 60 or 61)
-        - "60° or below" (temp <= 60)
-        - "66° or above" (temp >= 66)
-        
-        For HIGHS: we want the bracket where the temp falls within range
-        For LOWS: same logic
+        Bracket formats:
+        - "60° to 61°" → temp 60 or 61 is IN
+        - "57° or below" → temp <= 57 is IN  
+        - "66° or above" → temp >= 66 is IN
         """
         subtitle_lower = subtitle.lower() if subtitle else ''
         
-        # Check for range bracket: "60° to 61°" or "60 to 61"
+        # Range: "60° to 61°"
         range_match = re.search(r'(\d+)°?\s*to\s*(\d+)°?', subtitle_lower)
         if range_match:
             low = int(range_match.group(1))
             high = int(range_match.group(2))
-            # Temperature falls within this range
-            if low <= temperature_f <= high:
-                return f"{low}° to {high}°"
+            return low <= temperature_f <= high
         
-        # Check for "X or below" / "X° or below"
+        # Below: "57° or below"
         below_match = re.search(r'(\d+)°?\s*or\s*below', subtitle_lower)
         if below_match:
             threshold = int(below_match.group(1))
-            if temperature_f <= threshold:
-                return f"{threshold}° or below"
+            return temperature_f <= threshold
         
-        # Check for "X or above" / "X° or above"
+        # Above: "66° or above"
         above_match = re.search(r'(\d+)°?\s*or\s*above', subtitle_lower)
         if above_match:
             threshold = int(above_match.group(1))
-            if temperature_f >= threshold:
-                return f"{threshold}° or above"
+            return temperature_f >= threshold
         
-        # Try to parse from ticker (e.g., KXHIGHTSFO-29JAN26-T60)
-        # The bracket temp indicates the LOW end of the range
+        # Fallback: parse from ticker (e.g., -T60 means 60-61)
         ticker_match = re.search(r'-T?(\d+)$', ticker)
         if ticker_match:
             bracket_temp = int(ticker_match.group(1))
-            # Bracket "60" typically means "60 to 61" (2-degree ranges)
-            if bracket_temp <= temperature_f <= bracket_temp + 1:
-                return f"{bracket_temp}° to {bracket_temp + 1}°"
+            return bracket_temp <= temperature_f <= bracket_temp + 1
         
-        return None
+        return False
 
 
 # Global sniper instance
