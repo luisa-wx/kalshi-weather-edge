@@ -304,19 +304,28 @@ class WXSniper:
             Tuple of (market_ticker, bracket_range, side, price_cents, edge_cents) or None
             side is 'yes' or 'no'
         """
-        # Kalshi event tickers are lowercase
-        event_ticker = f"{ticker_base.lower()}-{market_date}"
+        # Query by series_ticker (e.g., KXHIGHTSFO) and filter by date
+        series_ticker = ticker_base  # Already uppercase like KXHIGHTSFO
         
-        print(f"[SNIPER] Fetching markets for event: {event_ticker}")
+        print(f"[SNIPER] Fetching markets for series: {series_ticker}, filtering for date: {market_date}")
         
         try:
-            markets = self.kalshi.get_markets(event_ticker=event_ticker)
+            all_markets = self.kalshi.get_markets(series_ticker=series_ticker, status='open')
             
-            if not markets:
-                print(f"[SNIPER] No markets found for {event_ticker}")
+            if not all_markets:
+                print(f"[SNIPER] No open markets found for series {series_ticker}")
                 return None
             
-            print(f"[SNIPER] Found {len(markets)} brackets, analyzing all...")
+            # Filter to only TODAY's markets based on ticker containing the date
+            # Market tickers look like: KXHIGHTSFO-26JAN28-B60.5
+            date_upper = market_date.upper()  # 26JAN28
+            markets = [m for m in all_markets if date_upper in m.get('ticker', '').upper()]
+            
+            if not markets:
+                print(f"[SNIPER] No markets found for date {date_upper} (had {len(all_markets)} total)")
+                return None
+            
+            print(f"[SNIPER] Found {len(markets)} brackets for {date_upper}, analyzing all...")
             
             best_trade = None
             best_edge = -100  # Worst possible
