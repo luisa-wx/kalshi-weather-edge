@@ -237,6 +237,106 @@ def create_app():
     
     # Note: /health route is defined in twilio_handler.py's create_webhook_app()
     
+    @app.route('/prices/<city>')
+    def check_prices(city):
+        """
+        Check current prices for a city's high temp market
+        Usage: /prices/sfo or /prices/las
+        """
+        from kalshi_client import KalshiClient
+        from config import STATIONS
+        from datetime import datetime
+        
+        city_map = {
+            'sfo': 'KSFO',
+            'las': 'KLAS',
+            'nyc': 'KNYC',
+            'phl': 'KPHL',
+            'chi': 'KMDW',
+            'mia': 'KMIA',
+            'aus': 'KAUS',
+            'den': 'KDEN',
+            'sea': 'KSEA',
+            'dca': 'KDCA',
+            'msy': 'KMSY',
+            'lax': 'KLAX'
+        }
+        
+        station = city_map.get(city.lower())
+        if not station:
+            return jsonify({'error': f'Unknown city: {city}', 'valid': list(city_map.keys())})
+        
+        station_config = STATIONS.get(station)
+        if not station_config:
+            return jsonify({'error': f'Station {station} not configured'})
+        
+        # Get today's date in Kalshi format
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        
+        tz_map = {
+            'KSFO': 'America/Los_Angeles', 'KLAS': 'America/Los_Angeles',
+            'KSEA': 'America/Los_Angeles', 'KLAX': 'America/Los_Angeles',
+            'KDEN': 'America/Denver', 'KAUS': 'America/Chicago',
+            'KMDW': 'America/Chicago', 'KMSY': 'America/Chicago',
+            'KNYC': 'America/New_York', 'KPHL': 'America/New_York',
+            'KMIA': 'America/New_York', 'KDCA': 'America/New_York'
+        }
+        
+        local_tz = ZoneInfo(tz_map.get(station, 'America/New_York'))
+        local_now = datetime.now(local_tz)
+        market_date = local_now.strftime("%d%b%y").upper()
+        
+        ticker_base = station_config.get('high_ticker', '')
+        event_ticker = f"{ticker_base}-{market_date}"
+        
+        result = {
+            'station': station,
+            'city': city.upper(),
+            'event_ticker': event_ticker,
+            'market_date': market_date,
+            'local_time': local_now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            'brackets': []
+        }
+        
+        try:
+            client = KalshiClient()
+            markets = client.get_markets(event_ticker=event_ticker)
+            
+            if not markets:
+                result['error'] = f'No markets found for {event_ticker}'
+                return jsonify(result)
+            
+            for m in markets:
+                bracket = {
+                    'ticker': m.get('ticker'),
+                    'subtitle': m.get('yes_sub_title') or m.get('subtitle'),
+                    'yes_bid': m.get('yes_bid'),
+                    'yes_bid_dollars': m.get('yes_bid_dollars'),
+                    'yes_ask': m.get('yes_ask'),
+                    'yes_ask_dollars': m.get('yes_ask_dollars'),
+                    'no_bid': m.get('no_bid'),
+                    'no_bid_dollars': m.get('no_bid_dollars'),
+                    'no_ask': m.get('no_ask'),
+                    'no_ask_dollars': m.get('no_ask_dollars'),
+                    'last_price': m.get('last_price'),
+                    'last_price_dollars': m.get('last_price_dollars'),
+                    'volume': m.get('volume')
+                }
+                result['brackets'].append(bracket)
+            
+            # Sort by subtitle (temperature range)
+            result['brackets'].sort(key=lambda x: x.get('subtitle', ''))
+            
+        except Exception as e:
+            result['error'] = str(e)
+            import traceback
+            result['traceback'] = traceback.format_exc()
+        
+        return jsonify(result)
+    
     # Background polling thread
     def poll_aviation_weather():
         """Poll aviationweather.gov with adaptive rate"""
