@@ -287,17 +287,14 @@ def create_app():
         
         local_tz = ZoneInfo(tz_map.get(station, 'America/New_York'))
         local_now = datetime.now(local_tz)
-        # Kalshi format: 26JAN28 = YY + MON + DD (lowercase in URL but API may need caps)
         market_date = local_now.strftime("%y%b%d").upper()
         
-        ticker_base = station_config.get('kalshi_high_ticker', '')
-        # Kalshi event tickers are lowercase
-        event_ticker = f"{ticker_base.lower()}-{market_date.lower()}"
+        series_ticker = station_config.get('kalshi_high_ticker', '')
         
         result = {
             'station': station,
             'city': city.upper(),
-            'event_ticker': event_ticker,
+            'series_ticker': series_ticker,
             'market_date': market_date,
             'local_time': local_now.strftime("%Y-%m-%d %H:%M:%S %Z"),
             'brackets': []
@@ -305,11 +302,17 @@ def create_app():
         
         try:
             client = KalshiClient()
-            markets = client.get_markets(event_ticker=event_ticker)
+            # Query by series_ticker to find open markets
+            markets = client.get_markets(series_ticker=series_ticker, status='open')
             
             if not markets:
-                result['error'] = f'No markets found for {event_ticker}'
+                result['error'] = f'No open markets found for series {series_ticker}'
                 return jsonify(result)
+            
+            # Get event_ticker from first market
+            event_ticker = markets[0].get('event_ticker', '')
+            result['event_ticker'] = event_ticker
+            result['total_markets'] = len(markets)
             
             for m in markets:
                 bracket = {

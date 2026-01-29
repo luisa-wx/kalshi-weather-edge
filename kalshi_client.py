@@ -156,15 +156,17 @@ class KalshiClient:
                                     params={"with_nested_markets": "true"})
         return result
     
-    def get_markets(self, event_ticker: str = None, status: str = "open", limit: int = 200) -> List[Dict]:
+    def get_markets(self, event_ticker: str = None, series_ticker: str = None, status: str = "open", limit: int = 200) -> List[Dict]:
         """
-        Get markets, optionally filtered by event
+        Get markets, optionally filtered by event or series
         
         For temperature, each market is a temperature bracket (e.g., "71°F or higher")
         """
         params = {"limit": limit}
         if event_ticker:
             params["event_ticker"] = event_ticker
+        if series_ticker:
+            params["series_ticker"] = series_ticker
         if status:
             params["status"] = status
             
