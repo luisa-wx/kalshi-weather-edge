@@ -7,12 +7,40 @@ Format:
 
 Example: 10217 = +21.7°C = 71.06°F
 Example: 21012 = -1.2°C = 29.84°F
+
+CRITICAL: NWS uses "round half up asymmetric" (ROUND_HALF_UP) not Python's banker's rounding.
+This matters when F value is exactly X.5:
+- Python round(0.5) = 0 (banker's: round to even)
+- NWS round(0.5) = 1 (always round up)
 """
 
 import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from datetime import datetime
+import math
+
+
+import math
+
+
+def nws_round(value: float) -> int:
+    """
+    Round using NWS "round half up asymmetric" method.
+    
+    This is math.floor(x + 0.5), which means:
+    - 0.5 -> 1 (rounds up)
+    - 1.5 -> 2 (rounds up)
+    - -0.5 -> 0 (rounds towards positive infinity)
+    - -1.5 -> -1 (rounds towards positive infinity)
+    - -2.5 -> -2 (rounds towards positive infinity)
+    
+    This is DIFFERENT from Python's Decimal ROUND_HALF_UP which rounds 
+    away from zero (so -0.5 -> -1).
+    
+    Per NCDC TIN 12-54 and WMO requirements for "asymmetric half-up".
+    """
+    return math.floor(value + 0.5)
 
 
 @dataclass
@@ -49,16 +77,16 @@ class MetarTemps:
     
     @property
     def six_hour_max_f_rounded(self) -> Optional[int]:
-        """Rounded to nearest whole degree (how Kalshi settles)"""
+        """Rounded to nearest whole degree using NWS ROUND_HALF_UP"""
         if self.six_hour_max_f is not None:
-            return round(self.six_hour_max_f)
+            return nws_round(self.six_hour_max_f)
         return None
     
     @property
     def six_hour_min_f_rounded(self) -> Optional[int]:
-        """Rounded to nearest whole degree (how Kalshi settles)"""
+        """Rounded to nearest whole degree using NWS ROUND_HALF_UP"""
         if self.six_hour_min_f is not None:
-            return round(self.six_hour_min_f)
+            return nws_round(self.six_hour_min_f)
         return None
 
 
