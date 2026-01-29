@@ -26,8 +26,12 @@ class KalshiClient:
         
     def _load_private_key(self):
         """Load RSA private key from PEM string"""
+        # Handle escaped newlines from environment variables
+        key_str = KALSHI_PRIVATE_KEY
+        if '\\n' in key_str:
+            key_str = key_str.replace('\\n', '\n')
         return serialization.load_pem_private_key(
-            KALSHI_PRIVATE_KEY.encode(),
+            key_str.encode(),
             password=None,
             backend=default_backend()
         )
