@@ -18,13 +18,122 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
-# Simple health check server for DigitalOcean
+# Simple health check server for DigitalOcean with status page
 class HealthHandler(BaseHTTPRequestHandler):
+    poller = None  # Will be set after poller is created
+    
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write(b'OK')
+        
+        if HealthHandler.poller is None:
+            self.wfile.write(b'<h1>WX Sniper - Starting...</h1>')
+            return
+        
+        p = HealthHandler.poller
+        s = p._get_synoptic_state()
+        
+        # Build HTML
+        html = f"""
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>WX Sniper v3.1</title>
+            <meta http-equiv="refresh" content="30">
+            <style>
+                body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }}
+                h1 {{ color: #00ff88; }}
+                h2 {{ color: #00aaff; margin-top: 30px; }}
+                .status {{ font-size: 24px; margin: 20px 0; }}
+                .hot {{ color: #00ff88; }}
+                .prep {{ color: #ffaa00; }}
+                .waiting {{ color: #ff4444; }}
+                table {{ border-collapse: collapse; margin: 10px 0; }}
+                th, td {{ border: 1px solid #444; padding: 8px 12px; text-align: left; }}
+                th {{ background: #333; }}
+                .locked {{ background: #004400; }}
+                .cheap {{ color: #00ff88; }}
+            </style>
+        </head>
+        <body>
+            <h1>🌡️ WX Sniper v3.1</h1>
+            <div class="status">
+                Mode: {'💰 LIVE' if not p.dry_run else '🧪 DRY RUN'} | 
+                Hourly: {'✅ ON' if p.hourly_mode else '❌ OFF'} |
+                Max Price: {p.max_price_cents}¢
+            </div>
+            <div class="status">
+                Current: {s['current_hour']:02d}:{s['current_minute']:02d}Z |
+                Status: <span class="{'hot' if s['is_hot_window'] else 'prep' if s['is_prep_window'] else 'waiting'}">
+                    {'🟢 HOT WINDOW' if s['is_hot_window'] else '🟡 PREP WINDOW' if s['is_prep_window'] else f"🔴 Next hot in {s['minutes_to_hot']}min"}
+                </span>
+            </div>
+            <div class="status">
+                Trades executed this session: {len(p.executed_trades)}
+            </div>
+        """
+        
+        # Show watchlists for each station
+        for station, state in p.market_states.items():
+            if state.watchlist:
+                html += f"<h2>{station}</h2>"
+                html += "<table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>Floor</th><th>Cap</th><th>Ticker</th></tr>"
+                for b in state.watchlist:
+                    price_class = "cheap" if b.no_ask <= 70 else ""
+                    html += f"""<tr>
+                        <td>{b.subtitle}</td>
+                        <td>{b.signal_type.upper()}</td>
+                        <td class="{price_class}">{b.no_ask}¢</td>
+                        <td>{b.floor_strike or '-'}</td>
+                        <td>{b.cap_strike or '-'}</td>
+                        <td>{b.ticker}</td>
+                    </tr>"""
+                html += "</table>"
+        
+        if not any(st.watchlist for st in p.market_states.values()):
+            html += "<h2>No watchlist yet</h2><p>Watchlist builds at :48 each hour</p>"
+        
+        # Show latest METARs
+        if p.latest_metars:
+            html += "<h2>📡 Latest METARs</h2>"
+            html += "<table><tr><th>Station</th><th>Temp</th><th>Raw METAR</th></tr>"
+            for station, metar in p.latest_metars.items():
+                temp = p.latest_temps.get(station, '?')
+                html += f"<tr><td>{station}</td><td>{temp}°F</td><td style='font-size:11px'>{metar[:80]}...</td></tr>"
+            html += "</table>"
+        
+        # Show trade log (most recent first)
+        if p.trade_log:
+            html += "<h2>💰 Trade Log</h2>"
+            html += "<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Price</th><th>Status</th></tr>"
+            for t in reversed(p.trade_log[-20:]):  # Last 20 trades
+                status = "✅" if t.get('success') else "❌"
+                if t.get('dry_run'):
+                    status = "🧪 DRY"
+                html += f"""<tr>
+                    <td>{t.get('time', '?')}</td>
+                    <td>{t.get('station', '?')}</td>
+                    <td>{t.get('subtitle', t.get('ticker', '?'))}</td>
+                    <td>{t.get('price', '?')}¢</td>
+                    <td>{status}</td>
+                </tr>"""
+            html += "</table>"
+        
+        # Show executed tickers (simple list)
+        if p.executed_trades:
+            html += f"<h2>Executed Tickers ({len(p.executed_trades)})</h2><p style='font-size:11px'>"
+            html += ", ".join(sorted(p.executed_trades))
+            html += "</p>"
+        
+        html += """
+            <br><br>
+            <small>Auto-refreshes every 30s</small>
+        </body>
+        </html>
+        """
+        
+        self.wfile.write(html.encode())
     
     def log_message(self, format, *args):
         pass  # Suppress logs
@@ -87,12 +196,18 @@ class SmartPoller:
         11: ['KLAX', 'KSFO', 'KSEA', 'KLAS', 'KDEN'],  # PST + MST
     }
     
-    def __init__(self, dry_run: bool = True, max_price_cents: int = 93):
+    def __init__(self, dry_run: bool = True, max_price_cents: int = 93, hourly_mode: bool = False):
         self.dry_run = dry_run
         self.max_price_cents = max_price_cents
+        self.hourly_mode = hourly_mode  # Use hourly T-group instead of 6-hour data
         self.kalshi = KalshiClient()
         self.aviation = AviationWeatherPoller()
         self.running = False
+        
+        # Tracking for UI
+        self.latest_metars: Dict[str, str] = {}  # station -> raw METAR text
+        self.latest_temps: Dict[str, int] = {}   # station -> temp in F
+        self.trade_log: List[dict] = []          # list of trade results with timestamps
         
         self.station_timezones = {
             'KNYC': 'America/New_York',
@@ -139,6 +254,22 @@ class SmartPoller:
         hour = now.hour
         minute = now.minute
         
+        # In hourly mode, every hour is a hot hour
+        if self.hourly_mode:
+            is_prep_window = 48 <= minute <= 51
+            is_hot_window = 52 <= minute <= 59 or minute <= 2
+            minutes_to_hot = (52 - minute) % 60 if minute < 52 else 0
+            
+            return {
+                'now_utc': now,
+                'is_prep_window': is_prep_window,
+                'is_hot_window': is_hot_window,
+                'minutes_to_hot': minutes_to_hot,
+                'current_hour': hour,
+                'current_minute': minute
+            }
+        
+        # Synoptic mode - only specific hours
         # Check if in prep window (XX:48-51 of a synoptic hour)
         is_prep_window = 48 <= minute <= 51 and hour in self.SYNOPTIC_HOURS
         
@@ -191,6 +322,7 @@ class SmartPoller:
             event_ticker = f"{ticker_base}-{date_str}"
             
             try:
+                time.sleep(0.5)  # Rate limit protection - 500ms between calls
                 markets = self.kalshi.get_markets(event_ticker=event_ticker)
                 
                 for m in markets:
@@ -246,6 +378,33 @@ class SmartPoller:
         if not parsed.station:
             return results
         
+        # HOURLY MODE: Use current temp (T-group) for both high and low signals
+        if self.hourly_mode:
+            # Convert current_temp_c to F and round
+            if parsed.current_temp_c is not None:
+                current_temp = round(parsed.current_temp_c * 9/5 + 32)
+                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F (from {parsed.current_temp_c}°C)")
+                
+                # For HIGH markets: current temp proves high is AT LEAST this value
+                # Lock NOs where cap_strike < current_temp (brackets already exceeded)
+                for bracket in state.watchlist:
+                    if bracket.signal_type == 'high':
+                        if self._is_no_locked_for_high(current_temp, bracket):
+                            if bracket.ticker not in self.executed_trades:
+                                result = self._execute_trade(bracket)
+                                results.append(result)
+                
+                # For LOW markets: current temp proves low is AT MOST this value
+                # Lock NOs where floor_strike > current_temp (brackets already undercut)
+                for bracket in state.watchlist:
+                    if bracket.signal_type == 'low':
+                        if self._is_no_locked_for_low(current_temp, bracket):
+                            if bracket.ticker not in self.executed_trades:
+                                result = self._execute_trade(bracket)
+                                results.append(result)
+            return results
+        
+        # SYNOPTIC MODE: Use 6-hour min/max data
         # HIGH markets - check 6hr max
         if parsed.six_hour_max_f_rounded is not None:
             observed = parsed.six_hour_max_f_rounded
@@ -278,10 +437,14 @@ class SmartPoller:
         print(f"\n[EXECUTE] 🎯 LOCKED NO: {bracket.ticker}")
         print(f"[EXECUTE] {bracket.subtitle} @ {bracket.no_ask}¢")
         
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        
         if self.dry_run:
             print(f"[EXECUTE] 🧪 DRY RUN - Would buy NO @ {bracket.no_ask}¢, hedge @ 99¢")
             self.executed_trades.add(bracket.ticker)
-            return {'success': True, 'dry_run': True, 'ticker': bracket.ticker}
+            result = {'success': True, 'dry_run': True, 'ticker': bracket.ticker, 'time': timestamp, 'price': bracket.no_ask}
+            self.trade_log.append(result)
+            return result
         
         try:
             # Buy NO
@@ -319,14 +482,28 @@ class SmartPoller:
                 print(f"[EXECUTE] 🚨 HEDGE FAILED - MANUAL INTERVENTION NEEDED")
             
             self.executed_trades.add(bracket.ticker)
-            return {'success': True, 'ticker': bracket.ticker, 'buy': buy_id, 'hedge': hedge_id}
+            result = {
+                'success': True, 
+                'ticker': bracket.ticker, 
+                'buy': buy_id, 
+                'hedge': hedge_id,
+                'time': timestamp,
+                'price': bracket.no_ask,
+                'station': bracket.station,
+                'subtitle': bracket.subtitle
+            }
+            self.trade_log.append(result)
+            return result
             
         except Exception as e:
             print(f"[EXECUTE] ❌ FAILED: {e}")
-            return {'success': False, 'error': str(e), 'ticker': bracket.ticker}
+            result = {'success': False, 'error': str(e), 'ticker': bracket.ticker, 'time': timestamp}
+            self.trade_log.append(result)
+            return result
     
     def run(self):
         # Start health check server in background thread
+        HealthHandler.poller = self  # Give health handler access to poller state
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
         
@@ -335,9 +512,18 @@ class SmartPoller:
         print("WX SNIPER v3.1 - SMART POLLER")
         print("="*60)
         print(f"Mode: {'🧪 DRY RUN' if self.dry_run else '💰 LIVE'}")
+        print(f"Hourly mode: {'✅ ON (polling every hour)' if self.hourly_mode else '❌ OFF (synoptic only)'}")
         print(f"Max NO price: {self.max_price_cents}¢")
         print(f"Synoptic hours (UTC): {self.SYNOPTIC_HOURS}")
         print("="*60 + "\n")
+        
+        # BUILD WATCHLISTS ON STARTUP so we don't miss first window
+        print("[STARTUP] Building watchlists immediately...")
+        for state in self.market_states.values():
+            self.build_watchlist(state)
+            time.sleep(0.5)  # Extra delay between stations on startup
+        total = sum(len(st.watchlist) for st in self.market_states.values())
+        print(f"[STARTUP] Done - {total} total brackets watching\n")
         
         while self.running:
             try:
@@ -374,12 +560,18 @@ class SmartPoller:
                             
                             resp = self.aviation.fetch_metar(station)
                             if resp and resp.raw_text:
+                                # Store for UI
+                                self.latest_metars[station] = resp.raw_text
                                 parsed = parse_metar(resp.raw_text)
+                                if parsed.current_temp_c is not None:
+                                    self.latest_temps[station] = round(parsed.current_temp_c * 9/5 + 32)
+                                
                                 has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
                                 icon = "📊" if has_6hr else "⏳"
                                 print(f"[METAR] {station} {icon} {resp.raw_text[:50]}...")
                                 
-                                if has_6hr:
+                                # In hourly mode, always check. In synoptic mode, only if has 6hr data
+                                if self.hourly_mode or has_6hr:
                                     self.check_and_trade(state, resp.raw_text)
                         
                         time.sleep(5)
@@ -388,8 +580,18 @@ class SmartPoller:
                         time.sleep(30)
                     continue
                 
-                # Outside windows - sleep
-                sleep_mins = min(s['minutes_to_hot'], 5)
+                # Outside windows - sleep, but not past prep window
+                if self.hourly_mode:
+                    # In hourly mode, prep is at :48 every hour
+                    minute = s['current_minute']
+                    if minute < 48:
+                        sleep_mins = min(48 - minute, 5)
+                    else:
+                        # We're past :48 but not in prep/hot? Shouldn't happen, but sleep short
+                        sleep_mins = 1
+                else:
+                    sleep_mins = min(s['minutes_to_hot'], 5)
+                
                 print(f"[{now_str}] 🔴 Next hot in {s['minutes_to_hot']}min, sleeping {sleep_mins}min")
                 time.sleep(sleep_mins * 60)
                 
@@ -407,10 +609,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", help="Enable live trading")
+    parser.add_argument("--hourly", action="store_true", help="Use hourly T-group temps (not just synoptic 6hr)")
     parser.add_argument("--max-price", type=int, default=93, help="Max NO price in cents")
     args = parser.parse_args()
     
-    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price)
+    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price, hourly_mode=args.hourly)
     poller.run()
 
 
