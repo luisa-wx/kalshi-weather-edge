@@ -1,0 +1,25 @@
+# WX Sniper Dependencies
+
+# API and HTTP
+requests>=2.28.0
+
+# Cryptography for Kalshi API auth
+cryptography>=40.0.0
+
+# SMS via Twilio
+twilio>=8.0.0
+
+# Web server for webhooks
+flask>=2.3.0
+
+# Scheduling
+schedule>=1.2.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Optional but useful
+python-dotenv>=1.0.0
+
+# Production WSGI server
+gunicorn>=21.0.0
