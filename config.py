@@ -54,7 +54,7 @@ STATIONS = {
     },
     "KPHL": {
         "kalshi_high_ticker": "KXHIGHPHL",
-        "kalshi_low_ticker": "KXLOWTPHL",
+        "kalshi_low_ticker": "KXLOWTPHIL",
         "timezone": "America/New_York",
         "name": "Philadelphia"
     },
@@ -77,8 +77,8 @@ STATIONS = {
         "name": "Miami"
     },
     "KAUS": {
-        "kalshi_high_ticker": "KXHIGHAUT",
-        "kalshi_low_ticker": "KXLOWTAUT",
+        "kalshi_high_ticker": "KXHIGHAUS",
+        "kalshi_low_ticker": "KXLOWTAUS",
         "timezone": "America/Chicago",
         "name": "Austin"
     },
@@ -205,8 +205,16 @@ SMS_POLL_MAX_DURATION_SECONDS = 300  # Stop after 5 minutes if no response
 AVIATIONWEATHER_API_URL = "https://aviationweather.gov/api/data/metar"
 AVIATIONWEATHER_USER_AGENT = "WXSniper/1.0 (weather trading bot)"
 
-# Adaptive polling rates
-POLL_INTERVAL_NORMAL_SECONDS = 60      # Once per minute normally
-POLL_INTERVAL_HOT_SECONDS = 5          # Every 5 seconds during hot window
-HOT_WINDOW_START_MINUTE = 51           # Start rapid polling at :51
-HOT_WINDOW_END_MINUTE = 58             # End rapid polling at :58
+# Smart polling strategy (to avoid rate limits: 100 req/min on aviationweather)
+# 1. PRE-SCAN: At :50, scan Kalshi for opportunities
+# 2. TARGET: Only poll stations with opportunities  
+# 3. STOP: Stop polling each station once synoptic METAR received, or at :02
+PRE_SCAN_MINUTE = 50              # Pre-scan Kalshi at :50
+HOT_WINDOW_START_MINUTE = 52      # Start METAR polling at :52
+HOT_WINDOW_END_MINUTE = 2         # End METAR polling at :02 (next hour)
+POLL_INTERVAL_HOT_SECONDS = 5     # Every 5 seconds during hot window
+POLL_INTERVAL_NORMAL_SECONDS = 300  # Every 5 minutes normally (just for status)
+
+# Opportunity threshold - only watch stations with brackets at or below this price
+OPPORTUNITY_THRESHOLD_CENTS = 97  # Watch if any bracket ≤ 97¢
+

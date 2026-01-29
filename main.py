@@ -342,14 +342,36 @@ def create_app():
         
         return jsonify(result)
     
-    # Background polling thread
+    # Background polling thread - SMART approach
     def poll_aviation_weather():
-        """Poll aviationweather.gov with adaptive rate"""
-        print(f"[POLL] Starting adaptive polling:")
-        print(f"       Normal: every {POLL_INTERVAL_NORMAL_SECONDS}s")
-        print(f"       Hot window (:51-:58 on synoptic hours): every {POLL_INTERVAL_HOT_SECONDS}s")
+        """
+        Smart polling strategy:
+        1. At :50 - Pre-scan Kalshi for opportunities
+        2. At :52 - Start polling ONLY stations with opportunities
+        3. Stop polling each station once synoptic METAR received
+        4. At :02 - Stop all polling for this cycle
+        """
+        from smart_poller import SmartPoller
+        from config import (
+            PRE_SCAN_MINUTE,
+            HOT_WINDOW_START_MINUTE,
+            HOT_WINDOW_END_MINUTE,
+            POLL_INTERVAL_HOT_SECONDS,
+            POLL_INTERVAL_NORMAL_SECONDS,
+            OPPORTUNITY_THRESHOLD_CENTS
+        )
         
-        last_log_minute = -1
+        print(f"[POLL] Starting SMART polling:")
+        print(f"       Pre-scan Kalshi at :{PRE_SCAN_MINUTE:02d}")
+        print(f"       Hot window :{HOT_WINDOW_START_MINUTE:02d}-:{HOT_WINDOW_END_MINUTE:02d} (synoptic hours)")
+        print(f"       Opportunity threshold: {OPPORTUNITY_THRESHOLD_CENTS}¢")
+        
+        smart_poller = SmartPoller(sniper.kalshi, threshold_cents=OPPORTUNITY_THRESHOLD_CENTS)
+        
+        # Track cycle state
+        current_scan = None
+        last_pre_scan_hour = -1
+        last_status_minute = -1
         
         while True:
             try:
@@ -357,42 +379,95 @@ def create_app():
                 hour = now.hour
                 minute = now.minute
                 
-                # Check if we're in a hot window
                 is_synoptic_hour = hour in SYNOPTIC_HOURS_UTC
-                is_hot_window = is_synoptic_hour and HOT_WINDOW_START_MINUTE <= minute <= HOT_WINDOW_END_MINUTE
                 
-                if is_hot_window:
-                    interval = POLL_INTERVAL_HOT_SECONDS
-                    window_label = "🔥 HOT"
+                # Determine what phase we're in
+                if is_synoptic_hour and minute == PRE_SCAN_MINUTE and last_pre_scan_hour != hour:
+                    # PRE-SCAN PHASE: Scan Kalshi for opportunities
+                    print(f"\n[POLL] ━━━ PRE-SCAN PHASE ━━━")
+                    current_scan = smart_poller.pre_scan_kalshi()
+                    last_pre_scan_hour = hour
+                    smart_poller.reset_cycle()
+                    
+                    if current_scan.stations_to_watch:
+                        print(f"[POLL] Will watch: {', '.join(current_scan.stations_to_watch)}")
+                    else:
+                        print(f"[POLL] No opportunities - will skip this cycle")
+                
+                # Check if we're in hot window
+                # Handle wrap-around for :52 to :02 (next hour)
+                if HOT_WINDOW_END_MINUTE < HOT_WINDOW_START_MINUTE:
+                    # Window crosses hour boundary (e.g., :52 to :02)
+                    is_hot_window = is_synoptic_hour and (
+                        minute >= HOT_WINDOW_START_MINUTE or minute <= HOT_WINDOW_END_MINUTE
+                    )
                 else:
-                    interval = POLL_INTERVAL_NORMAL_SECONDS
-                    window_label = "💤 normal"
+                    is_hot_window = is_synoptic_hour and (
+                        HOT_WINDOW_START_MINUTE <= minute <= HOT_WINDOW_END_MINUTE
+                    )
                 
-                # Fetch new METARs
-                new_metars = poller.check_for_new_metars()
-                
-                for metar in new_metars:
-                    if poller.is_synoptic_metar(metar):
-                        print(f"[POLL] 📊 SYNOPTIC METAR detected: {metar.station}")
-                        results = sniper.process_metar(metar.raw_text)
+                if is_hot_window and current_scan and current_scan.stations_to_watch:
+                    # HOT POLLING PHASE: Poll targeted stations
+                    remaining = current_scan.stations_to_watch - smart_poller.stations_done
+                    
+                    if remaining:
+                        if minute != last_status_minute:
+                            print(f"[POLL] 🔥 HOT | {now.strftime('%H:%M:%S')}Z | {len(remaining)} stations remaining")
+                            last_status_minute = minute
                         
-                        for r in results:
-                            if r.success:
-                                print(f"[POLL] ✅ Trade executed: {r.market_ticker}")
-                            else:
-                                print(f"[POLL] ⏭️ No trade: {r.error}")
-                    elif is_hot_window:
-                        print(f"[POLL] Regular METAR (no 6hr groups): {metar.station}")
+                        for station in list(remaining):
+                            result = smart_poller.fetch_metar(station)
+                            
+                            if result:
+                                raw_text, obs_time = result
+                                
+                                # Check if NEW metar
+                                last_time = smart_poller.last_obs_time.get(station)
+                                if last_time and obs_time and obs_time <= last_time:
+                                    continue
+                                
+                                if obs_time:
+                                    smart_poller.last_obs_time[station] = obs_time
+                                
+                                # Check if synoptic
+                                if smart_poller.is_synoptic_metar(raw_text):
+                                    print(f"[POLL] ✅ SYNOPTIC: {station} @ {obs_time.strftime('%H:%M')}Z")
+                                    smart_poller.stations_done.add(station)
+                                    
+                                    # Process and trade!
+                                    try:
+                                        results = sniper.process_metar(raw_text)
+                                        for r in results:
+                                            if r.success:
+                                                print(f"[POLL] 💰 TRADE: {r.market_ticker} @ {r.price_paid_cents}¢")
+                                            elif r.error:
+                                                print(f"[POLL] ⏭️ {station}: {r.error}")
+                                    except Exception as e:
+                                        print(f"[POLL] Error processing {station}: {e}")
+                        
+                        time.sleep(POLL_INTERVAL_HOT_SECONDS)
+                        continue  # Don't sleep again at bottom
+                    
+                    else:
+                        # All stations done!
+                        if minute != last_status_minute:
+                            print(f"[POLL] ✅ All synoptic METARs received for this cycle")
+                            last_status_minute = minute
                 
-                # Log status during hot window
-                if is_hot_window and minute != last_log_minute:
-                    print(f"[POLL] {window_label} | {now.strftime('%H:%M:%SZ')} | polling every {interval}s")
-                    last_log_minute = minute
+                elif is_synoptic_hour and minute > HOT_WINDOW_END_MINUTE and minute < PRE_SCAN_MINUTE:
+                    # Between cycles - just log occasionally
+                    if minute != last_status_minute:
+                        print(f"[POLL] 💤 {now.strftime('%H:%M:%S')}Z | Waiting for next synoptic")
+                        last_status_minute = minute
+                
+                # Normal sleep
+                time.sleep(POLL_INTERVAL_NORMAL_SECONDS if not is_hot_window else POLL_INTERVAL_HOT_SECONDS)
                         
             except Exception as e:
                 print(f"[POLL] Error: {e}")
-            
-            time.sleep(interval)
+                import traceback
+                traceback.print_exc()
+                time.sleep(10)  # Wait before retrying
     
     # Start polling thread
     poll_thread = Thread(target=poll_aviation_weather, daemon=True)
