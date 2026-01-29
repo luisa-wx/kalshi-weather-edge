@@ -24,7 +24,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/html')
+        self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
         
         if HealthHandler.poller is None:
@@ -38,6 +38,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         html = f"""
         <html>
         <head>
+            <meta charset="UTF-8">
             <title>WX Sniper v3.1</title>
             <meta http-equiv="refresh" content="30">
             <style>
