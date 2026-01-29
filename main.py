@@ -183,11 +183,6 @@ def create_app():
             }
         })
     
-    @app.route('/health')
-    def health():
-        """Health check endpoint"""
-        return jsonify({'status': 'healthy', 'time': datetime.now(timezone.utc).isoformat()})
-    
     # Background polling thread
     def poll_aviation_weather():
         """Poll aviationweather.gov with adaptive rate"""
