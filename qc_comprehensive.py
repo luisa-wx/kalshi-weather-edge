@@ -119,12 +119,16 @@ try:
         resp = aviation.fetch_metar(station)
         if resp and resp.raw_text:
             parsed = parse_metar(resp.raw_text)
-            if parsed.current_temp_c is not None:
+            if parsed.t_group_temp_c is not None:
+                temp_f = round(parsed.t_group_temp_c * 9/5 + 32)
+                print(f"   ✅ {station}: {temp_f}°F (T-group {parsed.t_group_temp_c}°C) | {resp.raw_text[:50]}...")
+            elif parsed.current_temp_c is not None:
+                # Fallback but warn - we shouldn't trade without T-group
                 temp_f = round(parsed.current_temp_c * 9/5 + 32)
-                print(f"   ✅ {station}: {temp_f}°F ({parsed.current_temp_c}°C) | {resp.raw_text[:50]}...")
+                print(f"   ⚠️  {station}: {temp_f}°F (NO T-GROUP - using rounded {parsed.current_temp_c}°C) | {resp.raw_text[:50]}...")
             else:
-                failures.append(f"{station}: current_temp_c is None")
-                print(f"   ❌ {station}: current_temp_c is None")
+                failures.append(f"{station}: No temp parsed")
+                print(f"   ❌ {station}: No temp parsed")
         else:
             failures.append(f"{station}: Failed to fetch METAR")
             print(f"   ❌ {station}: Failed to fetch METAR")
@@ -213,10 +217,10 @@ low_tests = [
     (15, "between", 12, 13, False, "15°F > floor 12 → NO not locked"),
     (0, "between", 8, 9, True, "0°F < floor 8 → NO locked"),
     
-    # Greater brackets (e.g., "10° or above")
-    (9, "greater", 10, None, True, "9°F <= floor 10 → NO locked"),
-    (10, "greater", 10, None, True, "10°F <= floor 10 → NO locked"),
-    (11, "greater", 10, None, False, "11°F > floor 10 → NO not locked"),
+    # Greater brackets (e.g., "10° or above" has floor=9)
+    (9, "greater", 9, None, True, "9°F <= floor 9 → NO locked"),
+    (10, "greater", 9, None, False, "10°F > floor 9 → NO not locked"),
+    (8, "greater", 9, None, True, "8°F <= floor 9 → NO locked"),
     
     # Less brackets - should NEVER lock for LOW
     (0, "less", None, 5, False, "less type never locks for LOW"),
