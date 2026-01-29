@@ -378,12 +378,13 @@ class SmartPoller:
         if not parsed.station:
             return results
         
-        # HOURLY MODE: Use current temp (T-group) for both high and low signals
+        # HOURLY MODE: Use T-group temp (precise) for both high and low signals
         if self.hourly_mode:
-            # Convert current_temp_c to F and round
-            if parsed.current_temp_c is not None:
-                current_temp = round(parsed.current_temp_c * 9/5 + 32)
-                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F (from {parsed.current_temp_c}°C)")
+            # Use T-group if available (0.1°C precision), otherwise skip
+            if parsed.t_group_temp_c is not None:
+                temp_c = parsed.t_group_temp_c
+                current_temp = round(temp_c * 9/5 + 32)
+                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F (from T-group {temp_c}°C)")
                 
                 # For HIGH markets: current temp proves high is AT LEAST this value
                 # Lock NOs where cap_strike < current_temp (brackets already exceeded)
@@ -402,6 +403,9 @@ class SmartPoller:
                             if bracket.ticker not in self.executed_trades:
                                 result = self._execute_trade(bracket)
                                 results.append(result)
+            else:
+                print(f"[SIGNAL] {state.station} NO T-GROUP - skipping")
+            
             return results
         
         # SYNOPTIC MODE: Use 6-hour min/max data
@@ -563,8 +567,8 @@ class SmartPoller:
                                 # Store for UI
                                 self.latest_metars[station] = resp.raw_text
                                 parsed = parse_metar(resp.raw_text)
-                                if parsed.current_temp_c is not None:
-                                    self.latest_temps[station] = round(parsed.current_temp_c * 9/5 + 32)
+                                if parsed.t_group_temp_c is not None:
+                                    self.latest_temps[station] = round(parsed.t_group_temp_c * 9/5 + 32)
                                 
                                 has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
                                 icon = "📊" if has_6hr else "⏳"
