@@ -14,6 +14,27 @@ Hot windows: 05:52-06:02Z, 11:52-12:02Z, 17:52-18:02Z, 23:52-00:02Z
 import os
 import sys
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+# Simple health check server for DigitalOcean
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+
+def start_health_server():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    print(f"[HEALTH] Server on port {port}")
+    server.serve_forever()
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
@@ -66,9 +87,10 @@ class SmartPoller:
         11: ['KLAX', 'KSFO', 'KSEA', 'KLAS', 'KDEN'],  # PST + MST
     }
     
-    def __init__(self, dry_run: bool = True, max_price_cents: int = 93):
+    def __init__(self, dry_run: bool = True, max_price_cents: int = 93, hourly_mode: bool = False):
         self.dry_run = dry_run
         self.max_price_cents = max_price_cents
+        self.hourly_mode = hourly_mode  # Use hourly T-group instead of 6-hour data
         self.kalshi = KalshiClient()
         self.aviation = AviationWeatherPoller()
         self.running = False
@@ -118,6 +140,22 @@ class SmartPoller:
         hour = now.hour
         minute = now.minute
         
+        # In hourly mode, every hour is a hot hour
+        if self.hourly_mode:
+            is_prep_window = 48 <= minute <= 51
+            is_hot_window = 52 <= minute <= 59 or minute <= 2
+            minutes_to_hot = (52 - minute) % 60 if minute < 52 else 0
+            
+            return {
+                'now_utc': now,
+                'is_prep_window': is_prep_window,
+                'is_hot_window': is_hot_window,
+                'minutes_to_hot': minutes_to_hot,
+                'current_hour': hour,
+                'current_minute': minute
+            }
+        
+        # Synoptic mode - only specific hours
         # Check if in prep window (XX:48-51 of a synoptic hour)
         is_prep_window = 48 <= minute <= 51 and hour in self.SYNOPTIC_HOURS
         
@@ -225,6 +263,32 @@ class SmartPoller:
         if not parsed.station:
             return results
         
+        # HOURLY MODE: Use current temp (T-group) for both high and low signals
+        if self.hourly_mode:
+            if parsed.temp_f_rounded is not None:
+                current_temp = parsed.temp_f_rounded
+                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F")
+                
+                # For HIGH markets: current temp proves high is AT LEAST this value
+                # Lock NOs where cap_strike < current_temp (brackets already exceeded)
+                for bracket in state.watchlist:
+                    if bracket.signal_type == 'high':
+                        if self._is_no_locked_for_high(current_temp, bracket):
+                            if bracket.ticker not in self.executed_trades:
+                                result = self._execute_trade(bracket)
+                                results.append(result)
+                
+                # For LOW markets: current temp proves low is AT MOST this value
+                # Lock NOs where floor_strike > current_temp (brackets already undercut)
+                for bracket in state.watchlist:
+                    if bracket.signal_type == 'low':
+                        if self._is_no_locked_for_low(current_temp, bracket):
+                            if bracket.ticker not in self.executed_trades:
+                                result = self._execute_trade(bracket)
+                                results.append(result)
+            return results
+        
+        # SYNOPTIC MODE: Use 6-hour min/max data
         # HIGH markets - check 6hr max
         if parsed.six_hour_max_f_rounded is not None:
             observed = parsed.six_hour_max_f_rounded
@@ -305,11 +369,16 @@ class SmartPoller:
             return {'success': False, 'error': str(e), 'ticker': bracket.ticker}
     
     def run(self):
+        # Start health check server in background thread
+        health_thread = threading.Thread(target=start_health_server, daemon=True)
+        health_thread.start()
+        
         self.running = True
         print("\n" + "="*60)
         print("WX SNIPER v3.1 - SMART POLLER")
         print("="*60)
         print(f"Mode: {'🧪 DRY RUN' if self.dry_run else '💰 LIVE'}")
+        print(f"Hourly mode: {'✅ ON (polling every hour)' if self.hourly_mode else '❌ OFF (synoptic only)'}")
         print(f"Max NO price: {self.max_price_cents}¢")
         print(f"Synoptic hours (UTC): {self.SYNOPTIC_HOURS}")
         print("="*60 + "\n")
@@ -382,10 +451,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", help="Enable live trading")
+    parser.add_argument("--hourly", action="store_true", help="Use hourly T-group temps (not just synoptic 6hr)")
     parser.add_argument("--max-price", type=int, default=93, help="Max NO price in cents")
     args = parser.parse_args()
     
-    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price)
+    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price, hourly_mode=args.hourly)
     poller.run()
 
 
