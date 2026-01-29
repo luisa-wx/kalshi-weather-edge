@@ -22,8 +22,7 @@ from config import (
     SMS_POLL_START_SECONDS_BEFORE,
     SMS_POLL_INTERVAL_SECONDS,
     SMS_POLL_MAX_DURATION_SECONDS,
-    TWILIO_ACCOUNT_SID,
-    AVIATIONWEATHER_POLL_INTERVAL_SECONDS
+    TWILIO_ACCOUNT_SID
 )
 from metar_parser import parse_metar, format_metar_summary
 from kalshi_client import KalshiClient
@@ -181,11 +180,37 @@ def run_hybrid_server(host: str = "0.0.0.0", port: int = 5000, dry_run: bool = T
     
     # Background polling thread
     def poll_aviation_weather():
-        """Poll aviationweather.gov in background"""
-        print(f"[POLL] Starting aviation weather polling every {AVIATIONWEATHER_POLL_INTERVAL_SECONDS}s")
+        """Poll aviationweather.gov with adaptive rate - fast during synoptic windows"""
+        from config import (
+            POLL_INTERVAL_NORMAL_SECONDS,
+            POLL_INTERVAL_HOT_SECONDS,
+            HOT_WINDOW_START_MINUTE,
+            HOT_WINDOW_END_MINUTE,
+            SYNOPTIC_HOURS_UTC
+        )
+        
+        print(f"[POLL] Starting adaptive polling:")
+        print(f"       Normal: every {POLL_INTERVAL_NORMAL_SECONDS}s")
+        print(f"       Hot window (:51-:58 on synoptic hours): every {POLL_INTERVAL_HOT_SECONDS}s")
         
         while True:
             try:
+                now = datetime.now(timezone.utc)
+                hour = now.hour
+                minute = now.minute
+                
+                # Check if we're in a hot window (synoptic hour, minutes 51-58)
+                is_synoptic_hour = hour in SYNOPTIC_HOURS_UTC
+                is_hot_window = is_synoptic_hour and HOT_WINDOW_START_MINUTE <= minute <= HOT_WINDOW_END_MINUTE
+                
+                if is_hot_window:
+                    interval = POLL_INTERVAL_HOT_SECONDS
+                    window_label = "🔥 HOT"
+                else:
+                    interval = POLL_INTERVAL_NORMAL_SECONDS
+                    window_label = "💤 normal"
+                
+                # Fetch new METARs
                 new_metars = poller.check_for_new_metars()
                 
                 for metar in new_metars:
@@ -200,12 +225,19 @@ def run_hybrid_server(host: str = "0.0.0.0", port: int = 5000, dry_run: bool = T
                             else:
                                 print(f"[POLL] ⏭️ No trade: {r.error}")
                     else:
-                        print(f"[POLL] Regular METAR (no 6hr groups): {metar.station}")
+                        # Only log during hot window to reduce noise
+                        if is_hot_window:
+                            print(f"[POLL] Regular METAR (no 6hr groups): {metar.station}")
+                
+                # Log status during hot window
+                if is_hot_window and minute != getattr(poll_aviation_weather, '_last_log_minute', -1):
+                    print(f"[POLL] {window_label} | {now.strftime('%H:%M:%SZ')} | polling every {interval}s")
+                    poll_aviation_weather._last_log_minute = minute
                         
             except Exception as e:
                 print(f"[POLL] Error: {e}")
             
-            time.sleep(AVIATIONWEATHER_POLL_INTERVAL_SECONDS)
+            time.sleep(interval)
     
     poll_thread = Thread(target=poll_aviation_weather, daemon=True)
     poll_thread.start()

@@ -74,5 +74,10 @@ SMS_POLL_MAX_DURATION_SECONDS = 300  # Stop after 5 minutes if no response
 
 # AviationWeather.gov API polling (automated fallback)
 AVIATIONWEATHER_API_URL = "https://aviationweather.gov/api/data/metar"
-AVIATIONWEATHER_POLL_INTERVAL_SECONDS = 30  # Poll every 30 seconds
 AVIATIONWEATHER_USER_AGENT = "WXSniper/1.0 (weather trading bot)"
+
+# Adaptive polling rates
+POLL_INTERVAL_NORMAL_SECONDS = 60      # Once per minute normally
+POLL_INTERVAL_HOT_SECONDS = 5          # Every 5 seconds during hot window
+HOT_WINDOW_START_MINUTE = 51           # Start rapid polling at :51
+HOT_WINDOW_END_MINUTE = 58             # End rapid polling at :58
