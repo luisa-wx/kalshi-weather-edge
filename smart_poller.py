@@ -379,9 +379,10 @@ class SmartPoller:
         
         # HOURLY MODE: Use current temp (T-group) for both high and low signals
         if self.hourly_mode:
-            if parsed.temp_f_rounded is not None:
-                current_temp = parsed.temp_f_rounded
-                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F")
+            # Convert current_temp_c to F and round
+            if parsed.current_temp_c is not None:
+                current_temp = round(parsed.current_temp_c * 9/5 + 32)
+                print(f"[SIGNAL] {state.station} HOURLY TEMP: {current_temp}°F (from {parsed.current_temp_c}°C)")
                 
                 # For HIGH markets: current temp proves high is AT LEAST this value
                 # Lock NOs where cap_strike < current_temp (brackets already exceeded)
@@ -560,8 +561,8 @@ class SmartPoller:
                                 # Store for UI
                                 self.latest_metars[station] = resp.raw_text
                                 parsed = parse_metar(resp.raw_text)
-                                if parsed.temp_f_rounded:
-                                    self.latest_temps[station] = parsed.temp_f_rounded
+                                if parsed.current_temp_c is not None:
+                                    self.latest_temps[station] = round(parsed.current_temp_c * 9/5 + 32)
                                 
                                 has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
                                 icon = "📊" if has_6hr else "⏳"
