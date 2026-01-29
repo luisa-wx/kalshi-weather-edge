@@ -1,425 +1,444 @@
 """
-WX Sniper - Main Trading Bot
+WX Sniper - Trading Logic (V2 - Correct Implementation)
 
-This is the core trading logic that:
-1. Receives METAR data (via SMS webhook or polling)
-2. Extracts 6-hour max/min temperatures
-3. Compares against tracked daily extremes
-4. Finds appropriate Kalshi brackets
-5. Executes trades when edge exists
+Strategy:
+1. Parse synoptic METAR for 6-hour max/min temps
+2. Find Kalshi bracket containing that exact temperature
+3. If bracket is priced < 90¢, BUY immediately (we have confirmation!)
+4. Profit when it settles at $1.00
+
+The 6-hour extremes ALREADY HAPPENED - we're buying certainty.
 """
 
-import time
-import logging
-from datetime import datetime, timezone
-from typing import Optional, Dict, List, Tuple
+import os
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+from typing import Optional, List, Tuple
+import re
 
-from config import (
-    STATIONS,
-    MAX_TRADE_AMOUNT_CENTS,
-    MAX_BRACKET_PRICE_CENTS,
-    SYNOPTIC_HOURS_UTC
-)
-from metar_parser import parse_metar, MetarTemps, format_metar_summary
-from kalshi_client import KalshiClient, find_temperature_bracket, format_market_info
-from state_manager import StateManager
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler('wx_sniper.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+from metar_parser import parse_metar, ParsedMETAR
+from kalshi_client import KalshiClient
+from config import STATIONS
 
 
 @dataclass
 class TradeSignal:
-    """Represents a potential trade opportunity"""
-    station: str
-    bracket_type: str  # "high" or "low"
-    temperature_f: int
-    source: str  # "6hr_max", "6hr_min", "t_group"
-    confidence: str  # "locked" (6hr group) or "indicated" (other)
-    raw_temp_c: float
-    raw_temp_f: float
+    """A signal to trade based on METAR data"""
+    station: str           # ICAO code (KSFO)
+    signal_type: str       # 'high' or 'low'
+    temperature_f: int     # The confirmed temperature
+    metar_time: datetime   # When the METAR was issued
+    market_date: str       # Date string for market (29JAN28)
 
 
-@dataclass  
+@dataclass 
 class TradeResult:
-    """Result of a trade attempt"""
+    """Result of attempting a trade"""
+    signal: Optional[TradeSignal]
     success: bool
-    signal: TradeSignal
     market_ticker: Optional[str] = None
+    bracket_range: Optional[str] = None  # e.g., "60° to 61°"
     price_paid_cents: Optional[int] = None
-    contracts: int = 0
+    contracts: Optional[int] = None
+    order_id: Optional[str] = None
     error: Optional[str] = None
 
 
 class WXSniper:
-    """Main trading bot"""
+    """
+    Main trading bot for weather temperature markets.
+    """
     
-    def __init__(self, dry_run: bool = True):
+    def __init__(self, dry_run: bool = True, max_price_cents: int = 90):
+        """
+        Initialize the sniper.
+        
+        Args:
+            dry_run: If True, don't execute real trades
+            max_price_cents: Maximum price to pay (default 90¢)
+        """
         self.dry_run = dry_run
+        self.max_price_cents = max_price_cents
         self.kalshi = KalshiClient()
-        self.state = StateManager()
         
-        # Cache of event/market data
-        self._market_cache: Dict[str, Dict] = {}
-        self._cache_time: Dict[str, datetime] = {}
-        
-        logger.info(f"WX Sniper initialized (dry_run={dry_run})")
+        print(f"[SNIPER] Initialized - dry_run={dry_run}, max_price={max_price_cents}¢")
     
     def process_metar(self, metar_text: str) -> List[TradeResult]:
         """
-        Process a METAR and execute any trades
+        Process a METAR and execute trades if opportunities exist.
         
-        Returns list of trade results
+        Args:
+            metar_text: Raw METAR string
+            
+        Returns:
+            List of TradeResult objects
         """
-        logger.info(f"Processing METAR: {metar_text[:60]}...")
+        results = []
         
         # Parse the METAR
         parsed = parse_metar(metar_text)
-        logger.info(f"\n{format_metar_summary(parsed)}")
         
         if not parsed.station:
-            logger.warning("Could not determine station from METAR")
-            return []
+            return [TradeResult(
+                signal=None,
+                success=False,
+                error="Could not parse station from METAR"
+            )]
         
-        if parsed.station not in STATIONS:
-            logger.warning(f"Station {parsed.station} not in configured stations")
-            return []
+        # Check if this station is one we trade
+        station_config = STATIONS.get(parsed.station)
+        if not station_config:
+            return [TradeResult(
+                signal=None,
+                success=False,
+                error=f"Station {parsed.station} not in configured stations"
+            )]
         
-        # Generate trade signals
-        signals = self._generate_signals(parsed)
+        # Get the market date (handle timezone!)
+        market_date = self._get_market_date(parsed)
         
-        if not signals:
-            logger.info("No trade signals generated")
-            return []
+        print(f"[SNIPER] Processing {parsed.station} for date {market_date}")
+        print(f"[SNIPER] 6hr max: {parsed.six_hour_max_f_rounded}°F, 6hr min: {parsed.six_hour_min_f_rounded}°F")
         
-        logger.info(f"Generated {len(signals)} trade signals")
+        # Check for HIGH temperature trade
+        if parsed.six_hour_max_f_rounded is not None:
+            high_ticker_base = station_config.get('kalshi_high_ticker')
+            if high_ticker_base:
+                result = self._attempt_trade(
+                    station=parsed.station,
+                    signal_type='high',
+                    temperature_f=parsed.six_hour_max_f_rounded,
+                    ticker_base=high_ticker_base,
+                    market_date=market_date,
+                    metar_time=parsed.observation_time
+                )
+                results.append(result)
         
-        # Execute trades
-        results = []
-        for signal in signals:
-            result = self._execute_trade(signal)
-            results.append(result)
+        # Check for LOW temperature trade
+        if parsed.six_hour_min_f_rounded is not None:
+            low_ticker_base = station_config.get('kalshi_low_ticker')
+            if low_ticker_base:
+                result = self._attempt_trade(
+                    station=parsed.station,
+                    signal_type='low', 
+                    temperature_f=parsed.six_hour_min_f_rounded,
+                    ticker_base=low_ticker_base,
+                    market_date=market_date,
+                    metar_time=parsed.observation_time
+                )
+                results.append(result)
+        
+        if not results:
+            results.append(TradeResult(
+                signal=None,
+                success=False,
+                error="No 6-hour temperature groups found in METAR"
+            ))
         
         return results
     
-    def _generate_signals(self, parsed: MetarTemps) -> List[TradeSignal]:
-        """Generate trade signals from parsed METAR"""
-        signals = []
-        station = parsed.station
+    def _get_market_date(self, parsed: ParsedMETAR) -> str:
+        """
+        Get the market date string (e.g., '29JAN26') for a METAR.
         
-        # Check 6-hour maximum (most reliable - this is our primary signal)
-        if parsed.six_hour_max_c is not None:
-            temp_f_rounded = parsed.six_hour_max_f_rounded
-            
-            # Check if this sets a new daily high
-            is_new_high = self.state.update_high(
-                station, 
-                temp_f_rounded, 
-                source="6hr_max"
-            )
-            
-            if is_new_high:
-                # Check if we've already traded this bracket
-                if not self.state.is_bracket_traded(station, temp_f_rounded, "high"):
-                    signals.append(TradeSignal(
-                        station=station,
-                        bracket_type="high",
-                        temperature_f=temp_f_rounded,
-                        source="6hr_max",
-                        confidence="locked",
-                        raw_temp_c=parsed.six_hour_max_c,
-                        raw_temp_f=parsed.six_hour_max_f
-                    ))
-                    logger.info(f"SIGNAL: {station} HIGH {temp_f_rounded}°F LOCKED by 6hr max")
-                else:
-                    logger.info(f"Already traded {station} high bracket {temp_f_rounded}°F")
-        
-        # Check 6-hour minimum
-        if parsed.six_hour_min_c is not None:
-            temp_f_rounded = parsed.six_hour_min_f_rounded
-            
-            is_new_low = self.state.update_low(
-                station,
-                temp_f_rounded,
-                source="6hr_min"
-            )
-            
-            if is_new_low:
-                if not self.state.is_bracket_traded(station, temp_f_rounded, "low"):
-                    signals.append(TradeSignal(
-                        station=station,
-                        bracket_type="low",
-                        temperature_f=temp_f_rounded,
-                        source="6hr_min", 
-                        confidence="locked",
-                        raw_temp_c=parsed.six_hour_min_c,
-                        raw_temp_f=parsed.six_hour_min_f
-                    ))
-                    logger.info(f"SIGNAL: {station} LOW {temp_f_rounded}°F LOCKED by 6hr min")
-                else:
-                    logger.info(f"Already traded {station} low bracket {temp_f_rounded}°F")
-        
-        return signals
-    
-    def _get_event_ticker(self, station: str, bracket_type: str) -> Optional[str]:
-        """Get the current day's event ticker for a station"""
-        station_config = STATIONS.get(station, {})
-        
-        if bracket_type == "high":
-            series_ticker = station_config.get("kalshi_high_ticker")
+        CRITICAL: Kalshi markets are in LOCAL TIME, METARs are in UTC!
+        We need to convert based on station timezone.
+        """
+        if parsed.observation_time:
+            obs_utc = parsed.observation_time
         else:
-            series_ticker = station_config.get("kalshi_low_ticker")
+            obs_utc = datetime.now(timezone.utc)
         
-        if not series_ticker:
-            logger.warning(f"No Kalshi ticker configured for {station} {bracket_type}")
-            return None
+        # Get station timezone offset (simplified - should use proper tz)
+        # Most US stations are UTC-5 to UTC-8
+        station_offsets = {
+            'KSFO': -8,  # PST
+            'KLAS': -8,  # PST  
+            'KSEA': -8,  # PST
+            'KLAX': -8,  # PST
+            'KDEN': -7,  # MST
+            'KAUS': -6,  # CST
+            'KMDW': -6,  # CST
+            'KMSY': -6,  # CST
+            'KNYC': -5,  # EST (Note: usually KJFK, KLGA, KNYC)
+            'KJFK': -5,  # EST
+            'KPHL': -5,  # EST
+            'KMIA': -5,  # EST
+            'KDCA': -5,  # EST
+        }
         
-        # Get today's date in format used by Kalshi (e.g., 26JAN28)
-        # This appears to be DDmmmYY format
-        now = datetime.now(timezone.utc)
-        date_str = now.strftime("%d%b%y").upper()  # e.g., "28JAN26"
+        offset_hours = station_offsets.get(parsed.station, -5)  # Default EST
+        local_time = obs_utc + timedelta(hours=offset_hours)
         
-        event_ticker = f"{series_ticker}-{date_str}"
-        return event_ticker
+        # Format as Kalshi expects: 29JAN26 (day + month + 2-digit year)
+        return local_time.strftime("%d%b%y").upper()
     
-    def _get_markets_for_event(self, event_ticker: str) -> List[Dict]:
-        """Get markets for an event, with caching"""
-        cache_key = event_ticker
+    def _attempt_trade(
+        self,
+        station: str,
+        signal_type: str,
+        temperature_f: int,
+        ticker_base: str,
+        market_date: str,
+        metar_time: datetime
+    ) -> TradeResult:
+        """
+        Attempt to find and execute a trade for a confirmed temperature.
         
-        # Check cache (valid for 60 seconds)
-        if cache_key in self._market_cache:
-            cache_age = (datetime.now(timezone.utc) - self._cache_time[cache_key]).total_seconds()
-            if cache_age < 60:
-                return self._market_cache[cache_key]
+        Args:
+            station: ICAO code
+            signal_type: 'high' or 'low'
+            temperature_f: Confirmed temperature in F
+            ticker_base: Base ticker (e.g., 'KXHIGHTSFO')
+            market_date: Date string (e.g., '29JAN26')
+            metar_time: METAR observation time
+        """
+        signal = TradeSignal(
+            station=station,
+            signal_type=signal_type,
+            temperature_f=temperature_f,
+            metar_time=metar_time,
+            market_date=market_date
+        )
         
-        # Fetch from API
+        print(f"[SNIPER] Looking for {signal_type} bracket containing {temperature_f}°F")
+        print(f"[SNIPER] Ticker base: {ticker_base}, date: {market_date}")
+        
         try:
-            event_data = self.kalshi.get_event(event_ticker)
-            markets = event_data.get("event", {}).get("markets", [])
+            # Find the bracket that contains this temperature
+            bracket = self._find_bracket_for_temp(
+                ticker_base=ticker_base,
+                market_date=market_date,
+                temperature_f=temperature_f,
+                signal_type=signal_type
+            )
             
-            # Also try the separate markets field
-            if not markets:
-                markets = event_data.get("markets", [])
+            if not bracket:
+                return TradeResult(
+                    signal=signal,
+                    success=False,
+                    error=f"No bracket found containing {temperature_f}°F"
+                )
             
-            self._market_cache[cache_key] = markets
-            self._cache_time[cache_key] = datetime.now(timezone.utc)
+            market_ticker, bracket_range, yes_ask = bracket
             
-            logger.info(f"Fetched {len(markets)} markets for {event_ticker}")
-            return markets
+            print(f"[SNIPER] Found bracket: {market_ticker}")
+            print(f"[SNIPER] Range: {bracket_range}, Ask: {yes_ask}¢")
             
+            # Check if price is acceptable
+            if yes_ask is None:
+                return TradeResult(
+                    signal=signal,
+                    success=False,
+                    market_ticker=market_ticker,
+                    bracket_range=bracket_range,
+                    error="No ask price available"
+                )
+            
+            if yes_ask > self.max_price_cents:
+                return TradeResult(
+                    signal=signal,
+                    success=False,
+                    market_ticker=market_ticker,
+                    bracket_range=bracket_range,
+                    price_paid_cents=yes_ask,
+                    error=f"Price {yes_ask}¢ exceeds max {self.max_price_cents}¢"
+                )
+            
+            # Execute the trade!
+            if self.dry_run:
+                print(f"[SNIPER] 🧪 DRY RUN - Would buy {market_ticker} at {yes_ask}¢")
+                return TradeResult(
+                    signal=signal,
+                    success=True,
+                    market_ticker=market_ticker,
+                    bracket_range=bracket_range,
+                    price_paid_cents=yes_ask,
+                    contracts=1,
+                    error="DRY RUN - no actual trade"
+                )
+            else:
+                # LIVE TRADE
+                print(f"[SNIPER] 🔴 LIVE TRADE - Buying {market_ticker} at {yes_ask}¢")
+                order = self.kalshi.create_order(
+                    ticker=market_ticker,
+                    side='yes',
+                    action='buy',
+                    count=1,
+                    price_cents=yes_ask,
+                    order_type='market'  # Take whatever is available
+                )
+                
+                return TradeResult(
+                    signal=signal,
+                    success=True,
+                    market_ticker=market_ticker,
+                    bracket_range=bracket_range,
+                    price_paid_cents=yes_ask,
+                    contracts=1,
+                    order_id=order.get('order_id')
+                )
+                
         except Exception as e:
-            logger.error(f"Error fetching markets for {event_ticker}: {e}")
-            return []
-    
-    def _find_bracket_market(self, event_ticker: str, temp_f: int, bracket_type: str) -> Optional[Dict]:
-        """Find the specific market for a temperature bracket"""
-        markets = self._get_markets_for_event(event_ticker)
-        
-        if not markets:
-            return None
-        
-        # Log available markets for debugging
-        logger.info(f"Looking for {temp_f}°F bracket in {len(markets)} markets:")
-        for m in markets[:10]:  # Show first 10
-            logger.debug(f"  {m.get('ticker')}: {m.get('yes_sub_title')} (yes_ask: {m.get('yes_ask')})")
-        
-        return find_temperature_bracket(markets, temp_f, bracket_type)
-    
-    def _execute_trade(self, signal: TradeSignal) -> TradeResult:
-        """Execute a trade based on signal"""
-        logger.info(f"\n{'='*50}")
-        logger.info(f"EXECUTING TRADE: {signal.station} {signal.bracket_type.upper()} {signal.temperature_f}°F")
-        logger.info(f"Source: {signal.source}, Confidence: {signal.confidence}")
-        logger.info(f"Raw temp: {signal.raw_temp_c}°C = {signal.raw_temp_f:.2f}°F")
-        
-        # Get event ticker
-        event_ticker = self._get_event_ticker(signal.station, signal.bracket_type)
-        if not event_ticker:
+            print(f"[SNIPER] Error: {e}")
+            import traceback
+            traceback.print_exc()
             return TradeResult(
+                signal=signal,
                 success=False,
-                signal=signal,
-                error="Could not determine event ticker"
-            )
-        
-        logger.info(f"Event ticker: {event_ticker}")
-        
-        # Find the bracket market
-        market = self._find_bracket_market(event_ticker, signal.temperature_f, signal.bracket_type)
-        
-        if not market:
-            return TradeResult(
-                success=False,
-                signal=signal,
-                error=f"Could not find market for {signal.temperature_f}°F bracket"
-            )
-        
-        market_ticker = market.get("ticker")
-        yes_ask = market.get("yes_ask")  # Price to buy YES
-        yes_bid = market.get("yes_bid")
-        
-        logger.info(f"Found market: {market_ticker}")
-        logger.info(f"  Yes Bid: {yes_bid}¢ | Yes Ask: {yes_ask}¢")
-        
-        # Check if price is favorable (< 90 cents)
-        if yes_ask is None:
-            return TradeResult(
-                success=False,
-                signal=signal,
-                market_ticker=market_ticker,
-                error="No ask price available"
-            )
-        
-        if yes_ask > MAX_BRACKET_PRICE_CENTS:
-            logger.info(f"Price {yes_ask}¢ > {MAX_BRACKET_PRICE_CENTS}¢ threshold, skipping")
-            return TradeResult(
-                success=False,
-                signal=signal,
-                market_ticker=market_ticker,
-                price_paid_cents=yes_ask,
-                error=f"Price too high ({yes_ask}¢ > {MAX_BRACKET_PRICE_CENTS}¢)"
-            )
-        
-        # Calculate position size
-        contracts = MAX_TRADE_AMOUNT_CENTS // yes_ask
-        if contracts < 1:
-            contracts = 1
-        
-        cost_cents = contracts * yes_ask
-        potential_profit = (100 - yes_ask) * contracts  # Profit if bracket hits
-        
-        logger.info(f"Trade plan: BUY {contracts} YES @ {yes_ask}¢ = ${cost_cents/100:.2f}")
-        logger.info(f"Potential profit: ${potential_profit/100:.2f}")
-        
-        if self.dry_run:
-            logger.info("[DRY RUN] Would execute trade, but dry_run=True")
-            self.state.mark_bracket_traded(signal.station, signal.temperature_f, signal.bracket_type)
-            return TradeResult(
-                success=True,
-                signal=signal,
-                market_ticker=market_ticker,
-                price_paid_cents=yes_ask,
-                contracts=contracts,
-                error="DRY RUN"
-            )
-        
-        # Execute the trade!
-        try:
-            order_result = self.kalshi.create_order(
-                ticker=market_ticker,
-                side="yes",
-                action="buy",
-                count=contracts,
-                order_type="market"
-            )
-            
-            logger.info(f"ORDER PLACED: {order_result}")
-            
-            # Mark as traded
-            self.state.mark_bracket_traded(signal.station, signal.temperature_f, signal.bracket_type)
-            
-            return TradeResult(
-                success=True,
-                signal=signal,
-                market_ticker=market_ticker,
-                price_paid_cents=yes_ask,
-                contracts=contracts
-            )
-            
-        except Exception as e:
-            logger.error(f"Order failed: {e}")
-            return TradeResult(
-                success=False,
-                signal=signal,
-                market_ticker=market_ticker,
                 error=str(e)
             )
+    
+    def _find_bracket_for_temp(
+        self,
+        ticker_base: str,
+        market_date: str,
+        temperature_f: int,
+        signal_type: str
+    ) -> Optional[Tuple[str, str, int]]:
+        """
+        Find the Kalshi bracket that contains the given temperature.
+        
+        Returns:
+            Tuple of (market_ticker, bracket_range, yes_ask_cents) or None
+        """
+        # Construct event ticker (e.g., KXHIGHTSFO-29JAN26)
+        event_ticker = f"{ticker_base}-{market_date}"
+        
+        print(f"[SNIPER] Fetching markets for event: {event_ticker}")
+        
+        try:
+            # Get all markets for this event
+            markets = self.kalshi.get_markets(event_ticker=event_ticker)
+            
+            if not markets:
+                print(f"[SNIPER] No markets found for {event_ticker}")
+                # Try to list what events ARE available
+                try:
+                    all_markets = self.kalshi.get_markets(series_ticker=ticker_base, limit=10)
+                    if all_markets:
+                        print(f"[SNIPER] Available events for {ticker_base}:")
+                        seen = set()
+                        for m in all_markets:
+                            evt = m.get('event_ticker', '')
+                            if evt and evt not in seen:
+                                print(f"  - {evt}")
+                                seen.add(evt)
+                except:
+                    pass
+                return None
+            
+            print(f"[SNIPER] Found {len(markets)} brackets")
+            
+            # Find the bracket containing our temperature
+            for market in markets:
+                ticker = market.get('ticker', '')
+                subtitle = market.get('yes_sub_title', '') or market.get('subtitle', '')
+                
+                # Parse the bracket range from subtitle or ticker
+                bracket_match = self._parse_bracket(subtitle, ticker, temperature_f, signal_type)
+                
+                if bracket_match:
+                    # Get the ask price
+                    yes_ask = market.get('yes_ask')
+                    yes_ask_dollars = market.get('yes_ask_dollars')
+                    
+                    # Handle different formats
+                    if yes_ask_dollars:
+                        # It's in dollars like "0.98"
+                        yes_ask = int(float(yes_ask_dollars) * 100)
+                    elif yes_ask is not None:
+                        if isinstance(yes_ask, str):
+                            yes_ask = int(float(yes_ask) * 100)
+                        elif yes_ask < 2:  # Probably in dollars
+                            yes_ask = int(yes_ask * 100)
+                    
+                    print(f"[SNIPER] ✓ Match! {ticker} - {subtitle} @ {yes_ask}¢")
+                    return (ticker, subtitle or bracket_match, yes_ask)
+            
+            print(f"[SNIPER] No bracket found containing {temperature_f}°F")
+            print(f"[SNIPER] Available brackets:")
+            for m in markets[:10]:
+                print(f"  - {m.get('ticker')}: {m.get('yes_sub_title', m.get('subtitle', ''))}")
+            
+            return None
+            
+        except Exception as e:
+            print(f"[SNIPER] Error fetching markets: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _parse_bracket(
+        self,
+        subtitle: str,
+        ticker: str,
+        temperature_f: int,
+        signal_type: str
+    ) -> Optional[str]:
+        """
+        Check if a bracket contains the given temperature.
+        
+        Bracket formats from Kalshi:
+        - "60° to 61°" (temp is 60 or 61)
+        - "60° or below" (temp <= 60)
+        - "66° or above" (temp >= 66)
+        
+        For HIGHS: we want the bracket where the temp falls within range
+        For LOWS: same logic
+        """
+        subtitle_lower = subtitle.lower() if subtitle else ''
+        
+        # Check for range bracket: "60° to 61°" or "60 to 61"
+        range_match = re.search(r'(\d+)°?\s*to\s*(\d+)°?', subtitle_lower)
+        if range_match:
+            low = int(range_match.group(1))
+            high = int(range_match.group(2))
+            # Temperature falls within this range
+            if low <= temperature_f <= high:
+                return f"{low}° to {high}°"
+        
+        # Check for "X or below" / "X° or below"
+        below_match = re.search(r'(\d+)°?\s*or\s*below', subtitle_lower)
+        if below_match:
+            threshold = int(below_match.group(1))
+            if temperature_f <= threshold:
+                return f"{threshold}° or below"
+        
+        # Check for "X or above" / "X° or above"
+        above_match = re.search(r'(\d+)°?\s*or\s*above', subtitle_lower)
+        if above_match:
+            threshold = int(above_match.group(1))
+            if temperature_f >= threshold:
+                return f"{threshold}° or above"
+        
+        # Try to parse from ticker (e.g., KXHIGHTSFO-29JAN26-T60)
+        # The bracket temp indicates the LOW end of the range
+        ticker_match = re.search(r'-T?(\d+)$', ticker)
+        if ticker_match:
+            bracket_temp = int(ticker_match.group(1))
+            # Bracket "60" typically means "60 to 61" (2-degree ranges)
+            if bracket_temp <= temperature_f <= bracket_temp + 1:
+                return f"{bracket_temp}° to {bracket_temp + 1}°"
+        
+        return None
 
 
-# =========== Callback for SMS webhook ===========
-
-_sniper_instance: Optional[WXSniper] = None
+# Global sniper instance
+_sniper_instance = None
 
 def get_sniper(dry_run: bool = True) -> WXSniper:
-    """Get or create sniper instance"""
+    """Get or create the global sniper instance"""
     global _sniper_instance
     if _sniper_instance is None:
         _sniper_instance = WXSniper(dry_run=dry_run)
     return _sniper_instance
 
-def metar_callback(metar_text: str, parsed: MetarTemps):
-    """Callback for SMS webhook"""
+
+def metar_callback(metar_text: str) -> List[TradeResult]:
+    """
+    Callback function for processing METARs from any source.
+    Used by SMS webhook and polling.
+    """
     sniper = get_sniper()
-    results = sniper.process_metar(metar_text)
-    
-    for result in results:
-        if result.success:
-            logger.info(f"✓ Trade executed: {result.market_ticker} x{result.contracts} @ {result.price_paid_cents}¢")
-        else:
-            logger.info(f"✗ Trade failed: {result.error}")
-
-
-# =========== Test/Demo ===========
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("WX SNIPER TEST")
-    print("=" * 60)
-    
-    # Create sniper in dry run mode
-    sniper = WXSniper(dry_run=True)
-    
-    # Test METAR with 6-hour groups
-    test_metar = "KSFO 281853Z 29012KT 10SM FEW020 SCT200 17/08 A3012 RMK AO2 SLP203 T01720083 10189 20156 58010"
-    
-    print(f"\n[Test METAR]")
-    print(f"{test_metar}")
-    
-    print(f"\n[Processing...]")
-    results = sniper.process_metar(test_metar)
-    
-    print(f"\n[Results]")
-    for result in results:
-        print(f"  Success: {result.success}")
-        print(f"  Signal: {result.signal.bracket_type} {result.signal.temperature_f}°F")
-        print(f"  Market: {result.market_ticker}")
-        print(f"  Error: {result.error}")
-    
-    print(f"\n[State Summary]")
-    print(sniper.state.get_summary())
-    
-    print("\n" + "=" * 60)
-    print("TICKER FORMAT DISCOVERY")
-    print("=" * 60)
-    
-    print("\nAttempting to fetch real market data to discover ticker format...")
-    
-    try:
-        # Try to get SFO events
-        events = sniper.kalshi.get_events(series_ticker="KXHIGHTSFO", limit=3)
-        print(f"\nFound {len(events)} KXHIGHTSFO events:")
-        
-        for event in events:
-            print(f"\n  Event: {event.get('event_ticker')}")
-            print(f"  Title: {event.get('title')}")
-            
-            markets = event.get('markets', [])
-            print(f"  Markets ({len(markets)}):")
-            
-            for m in markets[:8]:
-                print(f"    TICKER: {m.get('ticker')}")
-                print(f"      Title: {m.get('yes_sub_title')}")
-                print(f"      Bid/Ask: {m.get('yes_bid')}¢ / {m.get('yes_ask')}¢")
-                print()
-                
-    except Exception as e:
-        print(f"Error fetching from Kalshi: {e}")
-        print("\nThis is expected if credentials aren't set up yet.")
+    return sniper.process_metar(metar_text)

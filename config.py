@@ -44,18 +44,79 @@ LEIDOS_PHONE_NUMBER = "358782"  # Short code - can receive from, can't send to
 
 # Station Configuration
 # Maps ICAO code -> Kalshi ticker base
+# From your spreadsheet: https://docs.google.com/spreadsheets/d/...
 STATIONS = {
+    "KNYC": {
+        "kalshi_high_ticker": "KXHIGHNY",
+        "kalshi_low_ticker": "KXLOWTNYC",
+        "timezone": "America/New_York",
+        "name": "NYC"
+    },
+    "KPHL": {
+        "kalshi_high_ticker": "KXHIGHPHL",
+        "kalshi_low_ticker": "KXLOWTPHL",
+        "timezone": "America/New_York",
+        "name": "Philadelphia"
+    },
+    "KMDW": {
+        "kalshi_high_ticker": "KXHIGHCHI",
+        "kalshi_low_ticker": "KXLOWTCHI",
+        "timezone": "America/Chicago",
+        "name": "Chicago"
+    },
+    "KLAX": {
+        "kalshi_high_ticker": "KXHIGHLAX",
+        "kalshi_low_ticker": "KXLOWTLAX",
+        "timezone": "America/Los_Angeles",
+        "name": "Los Angeles"
+    },
+    "KMIA": {
+        "kalshi_high_ticker": "KXHIGHMIA",
+        "kalshi_low_ticker": "KXLOWTMIA",
+        "timezone": "America/New_York",
+        "name": "Miami"
+    },
+    "KAUS": {
+        "kalshi_high_ticker": "KXHIGHAUS",
+        "kalshi_low_ticker": "KXLOWTAUS",
+        "timezone": "America/Chicago",
+        "name": "Austin"
+    },
     "KSFO": {
         "kalshi_high_ticker": "KXHIGHTSFO",
-        "kalshi_low_ticker": None,  # Not trading lows for SFO per your spreadsheet
+        "kalshi_low_ticker": None,  # N per your spreadsheet
         "timezone": "America/Los_Angeles",
         "name": "San Francisco"
     },
+    "KSEA": {
+        "kalshi_high_ticker": "KXHIGHTSEA",
+        "kalshi_low_ticker": None,  # N per your spreadsheet
+        "timezone": "America/Los_Angeles",
+        "name": "Seattle"
+    },
+    "KDCA": {
+        "kalshi_high_ticker": "KXHIGHTDC",
+        "kalshi_low_ticker": None,  # N per your spreadsheet
+        "timezone": "America/New_York",
+        "name": "Washington DC"
+    },
+    "KMSY": {
+        "kalshi_high_ticker": "KXHIGHTNOLA",
+        "kalshi_low_ticker": None,  # N per your spreadsheet
+        "timezone": "America/Chicago",
+        "name": "New Orleans"
+    },
     "KLAS": {
-        "kalshi_high_ticker": "KXHIGHTLV",  # Note: TLV not LAS
-        "kalshi_low_ticker": None,  # Not trading lows for LAS per your spreadsheet  
+        "kalshi_high_ticker": "KXHIGHTLV",
+        "kalshi_low_ticker": None,  # N per your spreadsheet
         "timezone": "America/Los_Angeles",
         "name": "Las Vegas"
+    },
+    "KDEN": {
+        "kalshi_high_ticker": "KXHIGHDEN",
+        "kalshi_low_ticker": None,  # Spreadsheet shows Y but no ticker listed
+        "timezone": "America/Denver",
+        "name": "Denver"
     }
 }
 

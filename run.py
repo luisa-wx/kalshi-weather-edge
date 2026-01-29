@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+Simple entry point for DigitalOcean App Platform
+"""
 import os
 from main import create_app
 
