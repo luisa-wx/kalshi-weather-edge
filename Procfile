@@ -1,1 +1,1 @@
-web: python main.py server --port ${PORT:-8080}
+web: gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 2 "main:create_app()"
