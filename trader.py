@@ -254,7 +254,7 @@ class WXSniper:
                     error=f"DRY RUN - {edge_cents}¢ edge"
                 )
             else:
-                # LIVE TRADE
+                # LIVE TRADE - Use limit order at ask price for predictable fills
                 print(f"[SNIPER] 🔴 LIVE TRADE - Buying {side.upper()} on {market_ticker} at {price_cents}¢")
                 order = self.kalshi.create_order(
                     ticker=market_ticker,
@@ -262,7 +262,7 @@ class WXSniper:
                     action='buy',
                     count=1,
                     price_cents=price_cents,
-                    order_type='market'
+                    order_type='limit'  # Use limit at ask for predictable fills
                 )
                 
                 return TradeResult(
@@ -426,7 +426,8 @@ def get_sniper(dry_run: bool = True) -> WXSniper:
     """Get or create the global sniper instance"""
     global _sniper_instance
     if _sniper_instance is None:
-        _sniper_instance = WXSniper(dry_run=dry_run)
+        from config import MAX_BRACKET_PRICE_CENTS
+        _sniper_instance = WXSniper(dry_run=dry_run, max_price_cents=MAX_BRACKET_PRICE_CENTS)
     return _sniper_instance
 
 

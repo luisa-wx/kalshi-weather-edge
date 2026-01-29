@@ -289,7 +289,7 @@ def create_app():
         local_now = datetime.now(local_tz)
         market_date = local_now.strftime("%d%b%y").upper()
         
-        ticker_base = station_config.get('high_ticker', '')
+        ticker_base = station_config.get('kalshi_high_ticker', '')
         event_ticker = f"{ticker_base}-{market_date}"
         
         result = {

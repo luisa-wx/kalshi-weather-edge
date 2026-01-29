@@ -190,17 +190,25 @@ class KalshiClient:
         action: str,  # "buy" or "sell"
         count: int,  # Number of contracts
         order_type: str = "market",  # "market" or "limit"
-        yes_price: int = None,  # Price in cents (1-99) for limit orders
+        price_cents: int = None,  # Price in cents (1-99) for limit orders
         client_order_id: str = None
     ) -> Dict:
         """
         Create an order
         
-        For our strategy:
-        - We BUY YES on temperature brackets when we know the temp will hit
-        - side="yes", action="buy"
-        - For market orders, no price needed
-        - For limit orders, set yes_price (aggressive = near ask)
+        Args:
+            ticker: Market ticker
+            side: "yes" or "no" - which side to trade
+            action: "buy" or "sell"
+            count: Number of contracts
+            order_type: "market" or "limit"
+            price_cents: Price in cents (1-99). For YES orders, this is yes_price.
+                        For NO orders, this is no_price.
+            client_order_id: Optional client-specified order ID
+        
+        API requires:
+        - yes_price when buying/selling YES
+        - no_price when buying/selling NO
         """
         data = {
             "ticker": ticker,
@@ -210,12 +218,17 @@ class KalshiClient:
             "type": order_type
         }
         
-        if order_type == "limit" and yes_price is not None:
-            data["yes_price"] = yes_price
-            
+        # Set price based on which side we're trading
+        if order_type == "limit" and price_cents is not None:
+            if side == "yes":
+                data["yes_price"] = price_cents
+            else:  # side == "no"
+                data["no_price"] = price_cents
+        
         if client_order_id:
             data["client_order_id"] = client_order_id
-            
+        
+        print(f"[KALSHI] Creating order: {data}")
         return self._make_request("POST", "/portfolio/orders", data=data)
     
     def get_positions(self, event_ticker: str = None) -> List[Dict]:
