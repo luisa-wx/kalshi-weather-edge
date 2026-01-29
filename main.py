@@ -287,10 +287,12 @@ def create_app():
         
         local_tz = ZoneInfo(tz_map.get(station, 'America/New_York'))
         local_now = datetime.now(local_tz)
-        market_date = local_now.strftime("%d%b%y").upper()
+        # Kalshi format: 26JAN28 = YY + MON + DD (lowercase in URL but API may need caps)
+        market_date = local_now.strftime("%y%b%d").upper()
         
         ticker_base = station_config.get('kalshi_high_ticker', '')
-        event_ticker = f"{ticker_base}-{market_date}"
+        # Kalshi event tickers are lowercase
+        event_ticker = f"{ticker_base.lower()}-{market_date.lower()}"
         
         result = {
             'station': station,

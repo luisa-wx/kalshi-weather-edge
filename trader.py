@@ -177,8 +177,8 @@ class WXSniper:
         local_tz = ZoneInfo(tz_name)
         local_time = obs_utc.astimezone(local_tz)
         
-        # Format as Kalshi expects: 29JAN26 (day + month + 2-digit year)
-        return local_time.strftime("%d%b%y").upper()
+        # Format as Kalshi expects: 26jan28 = YY + MON + DD (lowercase)
+        return local_time.strftime("%y%b%d").lower()
     
     def _attempt_trade(
         self,
@@ -304,7 +304,8 @@ class WXSniper:
             Tuple of (market_ticker, bracket_range, side, price_cents, edge_cents) or None
             side is 'yes' or 'no'
         """
-        event_ticker = f"{ticker_base}-{market_date}"
+        # Kalshi event tickers are lowercase
+        event_ticker = f"{ticker_base.lower()}-{market_date}"
         
         print(f"[SNIPER] Fetching markets for event: {event_ticker}")
         
