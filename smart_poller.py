@@ -322,6 +322,7 @@ class SmartPoller:
             event_ticker = f"{ticker_base}-{date_str}"
             
             try:
+                time.sleep(0.5)  # Rate limit protection - 500ms between calls
                 markets = self.kalshi.get_markets(event_ticker=event_ticker)
                 
                 for m in markets:
@@ -520,6 +521,7 @@ class SmartPoller:
         print("[STARTUP] Building watchlists immediately...")
         for state in self.market_states.values():
             self.build_watchlist(state)
+            time.sleep(0.5)  # Extra delay between stations on startup
         total = sum(len(st.watchlist) for st in self.market_states.values())
         print(f"[STARTUP] Done - {total} total brackets watching\n")
         
