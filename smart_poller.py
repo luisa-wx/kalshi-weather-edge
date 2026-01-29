@@ -515,6 +515,13 @@ class SmartPoller:
         print(f"Synoptic hours (UTC): {self.SYNOPTIC_HOURS}")
         print("="*60 + "\n")
         
+        # BUILD WATCHLISTS ON STARTUP so we don't miss first window
+        print("[STARTUP] Building watchlists immediately...")
+        for state in self.market_states.values():
+            self.build_watchlist(state)
+        total = sum(len(st.watchlist) for st in self.market_states.values())
+        print(f"[STARTUP] Done - {total} total brackets watching\n")
+        
         while self.running:
             try:
                 s = self._get_synoptic_state()
