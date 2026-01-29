@@ -18,13 +18,121 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
-# Simple health check server for DigitalOcean
+# Simple health check server for DigitalOcean with status page
 class HealthHandler(BaseHTTPRequestHandler):
+    poller = None  # Will be set after poller is created
+    
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b'OK')
+        
+        if HealthHandler.poller is None:
+            self.wfile.write(b'<h1>WX Sniper - Starting...</h1>')
+            return
+        
+        p = HealthHandler.poller
+        s = p._get_synoptic_state()
+        
+        # Build HTML
+        html = f"""
+        <html>
+        <head>
+            <title>WX Sniper v3.1</title>
+            <meta http-equiv="refresh" content="30">
+            <style>
+                body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }}
+                h1 {{ color: #00ff88; }}
+                h2 {{ color: #00aaff; margin-top: 30px; }}
+                .status {{ font-size: 24px; margin: 20px 0; }}
+                .hot {{ color: #00ff88; }}
+                .prep {{ color: #ffaa00; }}
+                .waiting {{ color: #ff4444; }}
+                table {{ border-collapse: collapse; margin: 10px 0; }}
+                th, td {{ border: 1px solid #444; padding: 8px 12px; text-align: left; }}
+                th {{ background: #333; }}
+                .locked {{ background: #004400; }}
+                .cheap {{ color: #00ff88; }}
+            </style>
+        </head>
+        <body>
+            <h1>🌡️ WX Sniper v3.1</h1>
+            <div class="status">
+                Mode: {'💰 LIVE' if not p.dry_run else '🧪 DRY RUN'} | 
+                Hourly: {'✅ ON' if p.hourly_mode else '❌ OFF'} |
+                Max Price: {p.max_price_cents}¢
+            </div>
+            <div class="status">
+                Current: {s['current_hour']:02d}:{s['current_minute']:02d}Z |
+                Status: <span class="{'hot' if s['is_hot_window'] else 'prep' if s['is_prep_window'] else 'waiting'}">
+                    {'🟢 HOT WINDOW' if s['is_hot_window'] else '🟡 PREP WINDOW' if s['is_prep_window'] else f"🔴 Next hot in {s['minutes_to_hot']}min"}
+                </span>
+            </div>
+            <div class="status">
+                Trades executed this session: {len(p.executed_trades)}
+            </div>
+        """
+        
+        # Show watchlists for each station
+        for station, state in p.market_states.items():
+            if state.watchlist:
+                html += f"<h2>{station}</h2>"
+                html += "<table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>Floor</th><th>Cap</th><th>Ticker</th></tr>"
+                for b in state.watchlist:
+                    price_class = "cheap" if b.no_ask <= 70 else ""
+                    html += f"""<tr>
+                        <td>{b.subtitle}</td>
+                        <td>{b.signal_type.upper()}</td>
+                        <td class="{price_class}">{b.no_ask}¢</td>
+                        <td>{b.floor_strike or '-'}</td>
+                        <td>{b.cap_strike or '-'}</td>
+                        <td>{b.ticker}</td>
+                    </tr>"""
+                html += "</table>"
+        
+        if not any(st.watchlist for st in p.market_states.values()):
+            html += "<h2>No watchlist yet</h2><p>Watchlist builds at :48 each hour</p>"
+        
+        # Show latest METARs
+        if p.latest_metars:
+            html += "<h2>📡 Latest METARs</h2>"
+            html += "<table><tr><th>Station</th><th>Temp</th><th>Raw METAR</th></tr>"
+            for station, metar in p.latest_metars.items():
+                temp = p.latest_temps.get(station, '?')
+                html += f"<tr><td>{station}</td><td>{temp}°F</td><td style='font-size:11px'>{metar[:80]}...</td></tr>"
+            html += "</table>"
+        
+        # Show trade log (most recent first)
+        if p.trade_log:
+            html += "<h2>💰 Trade Log</h2>"
+            html += "<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Price</th><th>Status</th></tr>"
+            for t in reversed(p.trade_log[-20:]):  # Last 20 trades
+                status = "✅" if t.get('success') else "❌"
+                if t.get('dry_run'):
+                    status = "🧪 DRY"
+                html += f"""<tr>
+                    <td>{t.get('time', '?')}</td>
+                    <td>{t.get('station', '?')}</td>
+                    <td>{t.get('subtitle', t.get('ticker', '?'))}</td>
+                    <td>{t.get('price', '?')}¢</td>
+                    <td>{status}</td>
+                </tr>"""
+            html += "</table>"
+        
+        # Show executed tickers (simple list)
+        if p.executed_trades:
+            html += f"<h2>Executed Tickers ({len(p.executed_trades)})</h2><p style='font-size:11px'>"
+            html += ", ".join(sorted(p.executed_trades))
+            html += "</p>"
+        
+        html += """
+            <br><br>
+            <small>Auto-refreshes every 30s</small>
+        </body>
+        </html>
+        """
+        
+        self.wfile.write(html.encode())
     
     def log_message(self, format, *args):
         pass  # Suppress logs
@@ -94,6 +202,11 @@ class SmartPoller:
         self.kalshi = KalshiClient()
         self.aviation = AviationWeatherPoller()
         self.running = False
+        
+        # Tracking for UI
+        self.latest_metars: Dict[str, str] = {}  # station -> raw METAR text
+        self.latest_temps: Dict[str, int] = {}   # station -> temp in F
+        self.trade_log: List[dict] = []          # list of trade results with timestamps
         
         self.station_timezones = {
             'KNYC': 'America/New_York',
@@ -321,10 +434,14 @@ class SmartPoller:
         print(f"\n[EXECUTE] 🎯 LOCKED NO: {bracket.ticker}")
         print(f"[EXECUTE] {bracket.subtitle} @ {bracket.no_ask}¢")
         
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        
         if self.dry_run:
             print(f"[EXECUTE] 🧪 DRY RUN - Would buy NO @ {bracket.no_ask}¢, hedge @ 99¢")
             self.executed_trades.add(bracket.ticker)
-            return {'success': True, 'dry_run': True, 'ticker': bracket.ticker}
+            result = {'success': True, 'dry_run': True, 'ticker': bracket.ticker, 'time': timestamp, 'price': bracket.no_ask}
+            self.trade_log.append(result)
+            return result
         
         try:
             # Buy NO
@@ -362,14 +479,28 @@ class SmartPoller:
                 print(f"[EXECUTE] 🚨 HEDGE FAILED - MANUAL INTERVENTION NEEDED")
             
             self.executed_trades.add(bracket.ticker)
-            return {'success': True, 'ticker': bracket.ticker, 'buy': buy_id, 'hedge': hedge_id}
+            result = {
+                'success': True, 
+                'ticker': bracket.ticker, 
+                'buy': buy_id, 
+                'hedge': hedge_id,
+                'time': timestamp,
+                'price': bracket.no_ask,
+                'station': bracket.station,
+                'subtitle': bracket.subtitle
+            }
+            self.trade_log.append(result)
+            return result
             
         except Exception as e:
             print(f"[EXECUTE] ❌ FAILED: {e}")
-            return {'success': False, 'error': str(e), 'ticker': bracket.ticker}
+            result = {'success': False, 'error': str(e), 'ticker': bracket.ticker, 'time': timestamp}
+            self.trade_log.append(result)
+            return result
     
     def run(self):
         # Start health check server in background thread
+        HealthHandler.poller = self  # Give health handler access to poller state
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
         
@@ -418,12 +549,18 @@ class SmartPoller:
                             
                             resp = self.aviation.fetch_metar(station)
                             if resp and resp.raw_text:
+                                # Store for UI
+                                self.latest_metars[station] = resp.raw_text
                                 parsed = parse_metar(resp.raw_text)
+                                if parsed.temp_f_rounded:
+                                    self.latest_temps[station] = parsed.temp_f_rounded
+                                
                                 has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
                                 icon = "📊" if has_6hr else "⏳"
                                 print(f"[METAR] {station} {icon} {resp.raw_text[:50]}...")
                                 
-                                if has_6hr:
+                                # In hourly mode, always check. In synoptic mode, only if has 6hr data
+                                if self.hourly_mode or has_6hr:
                                     self.check_and_trade(state, resp.raw_text)
                         
                         time.sleep(5)
