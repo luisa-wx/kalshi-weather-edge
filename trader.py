@@ -1,19 +1,23 @@
 """
-WX Sniper - Trading Logic (V2 - Correct Implementation)
+WX Sniper - Trading Logic (V3 - NO-Only Safe Strategy)
 
 Strategy:
 1. Parse synoptic METAR for 6-hour max/min temps
-2. Find Kalshi bracket containing that exact temperature
-3. If bracket is priced < 90¢, BUY immediately (we have confirmation!)
-4. Profit when it settles at $1.00
+2. Fetch ALL brackets from Kalshi API with floor_strike/cap_strike/strike_type
+3. For each bracket, determine if NO is LOCKED based on observed temp
+4. Buy NO on locked brackets where price < threshold
+5. Immediately place 99¢ sell limit as hedge
 
-The 6-hour extremes ALREADY HAPPENED - we're buying certainty.
+KEY INSIGHT: We only trade NOs because:
+- For HIGH markets: once temp exceeds a bracket's cap, it can't go back down
+- For LOW markets: once temp drops below a bracket's floor, it can't go back up
+- We do NOT trade YES because the final high/low isn't known until day end
 """
 
 import os
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import re
 
 from metar_parser import parse_metar, MetarTemps
@@ -26,9 +30,9 @@ class TradeSignal:
     """A signal to trade based on METAR data"""
     station: str           # ICAO code (KSFO)
     signal_type: str       # 'high' or 'low'
-    temperature_f: int     # The confirmed temperature
+    temperature_f: int     # The observed 6-hour max/min
     metar_time: datetime   # When the METAR was issued
-    market_date: str       # Date string for market (29JAN28)
+    market_date: str       # Date string for market (26JAN29)
 
 
 @dataclass 
@@ -37,7 +41,7 @@ class TradeResult:
     signal: Optional[TradeSignal]
     success: bool
     market_ticker: Optional[str] = None
-    bracket_range: Optional[str] = None  # e.g., "60° to 61°"
+    bracket_range: Optional[str] = None  # e.g., "8° to 9°"
     price_paid_cents: Optional[int] = None
     contracts: Optional[int] = None
     order_id: Optional[str] = None
@@ -47,6 +51,11 @@ class TradeResult:
 class WXSniper:
     """
     Main trading bot for weather temperature markets.
+    
+    NO-ONLY SAFE STRATEGY:
+    - Only buy NO on brackets where the outcome is LOCKED
+    - For HIGH markets: NO is locked when observed temp > cap_strike
+    - For LOW markets: NO is locked when observed temp < floor_strike
     """
     
     def __init__(self, dry_run: bool = True, max_price_cents: int = 90):
@@ -55,13 +64,14 @@ class WXSniper:
         
         Args:
             dry_run: If True, don't execute real trades
-            max_price_cents: Maximum price to pay (default 90¢)
+            max_price_cents: Maximum price to pay for NO (default 90¢)
         """
         self.dry_run = dry_run
         self.max_price_cents = max_price_cents
         self.kalshi = KalshiClient()
         
         print(f"[SNIPER] Initialized - dry_run={dry_run}, max_price={max_price_cents}¢")
+        print(f"[SNIPER] Strategy: NO-only safe trades (buy locked NOs)")
     
     def process_metar(self, metar_text: str) -> List[TradeResult]:
         """
@@ -100,63 +110,60 @@ class WXSniper:
         print(f"[SNIPER] Processing {parsed.station} for date {market_date}")
         print(f"[SNIPER] 6hr max: {parsed.six_hour_max_f_rounded}°F, 6hr min: {parsed.six_hour_min_f_rounded}°F")
         
-        # Check for HIGH temperature trade
+        # Check for HIGH temperature trades (NO on brackets exceeded by 6hr max)
         if parsed.six_hour_max_f_rounded is not None:
             high_ticker_base = station_config.get('kalshi_high_ticker')
             if high_ticker_base:
-                result = self._attempt_trade(
+                high_results = self._find_locked_no_trades(
                     station=parsed.station,
                     signal_type='high',
-                    temperature_f=parsed.six_hour_max_f_rounded,
+                    observed_temp_f=parsed.six_hour_max_f_rounded,
                     ticker_base=high_ticker_base,
                     market_date=market_date,
                     metar_time=parsed.observation_time
                 )
-                results.append(result)
+                results.extend(high_results)
         
-        # Check for LOW temperature trade
+        # Check for LOW temperature trades (NO on brackets below 6hr min)
         if parsed.six_hour_min_f_rounded is not None:
             low_ticker_base = station_config.get('kalshi_low_ticker')
             if low_ticker_base:
-                result = self._attempt_trade(
+                low_results = self._find_locked_no_trades(
                     station=parsed.station,
                     signal_type='low', 
-                    temperature_f=parsed.six_hour_min_f_rounded,
+                    observed_temp_f=parsed.six_hour_min_f_rounded,
                     ticker_base=low_ticker_base,
                     market_date=market_date,
                     metar_time=parsed.observation_time
                 )
-                results.append(result)
+                results.extend(low_results)
         
         if not results:
             results.append(TradeResult(
                 signal=None,
                 success=False,
-                error="No 6-hour temperature groups found in METAR"
+                error="No 6-hour temperature groups found in METAR or no locked NO trades available"
             ))
         
         return results
     
     def _get_market_date(self, parsed: MetarTemps) -> str:
         """
-        Get the market date string (e.g., '29JAN26') for a METAR.
+        Get the market date string (e.g., '26JAN29') for a METAR.
         
         CRITICAL: Kalshi markets are in LOCAL TIME, METARs are in UTC!
-        We need to convert based on station timezone WITH DST AWARENESS.
         """
         try:
-            from zoneinfo import ZoneInfo  # Python 3.9+
+            from zoneinfo import ZoneInfo
         except ImportError:
-            from backports.zoneinfo import ZoneInfo  # Fallback
+            from backports.zoneinfo import ZoneInfo
         
         if parsed.observation_time:
-            # Make sure it's UTC aware
             obs_utc = parsed.observation_time.replace(tzinfo=ZoneInfo('UTC'))
         else:
-            from datetime import datetime, timezone
             obs_utc = datetime.now(timezone.utc)
         
-        # Station timezone mapping (IANA timezone names handle DST automatically)
+        # Station timezone mapping (IANA names handle DST automatically)
         station_timezones = {
             'KSFO': 'America/Los_Angeles',
             'KLAS': 'America/Los_Angeles',
@@ -177,220 +184,312 @@ class WXSniper:
         local_tz = ZoneInfo(tz_name)
         local_time = obs_utc.astimezone(local_tz)
         
-        # Format as Kalshi expects: 26jan28 = YY + MON + DD (lowercase)
-        return local_time.strftime("%y%b%d").lower()
+        # Format as Kalshi expects: 26JAN29 (uppercase)
+        return local_time.strftime("%y%b%d").upper()
     
-    def _attempt_trade(
+    def _find_locked_no_trades(
         self,
         station: str,
-        signal_type: str,
-        temperature_f: int,
+        signal_type: str,  # 'high' or 'low'
+        observed_temp_f: int,
         ticker_base: str,
         market_date: str,
         metar_time: datetime
-    ) -> TradeResult:
+    ) -> List[TradeResult]:
         """
-        Attempt to find and execute a trade for a confirmed temperature.
+        Find all brackets where NO is LOCKED and execute trades.
         
-        NEW LOGIC: Consider BOTH YES and NO on ALL brackets!
-        - If temp IS in bracket → YES wins at $1.00
-        - If temp is NOT in bracket → NO wins at $1.00
+        For HIGH markets (observed temp is 6hr max so far):
+            - NO is locked on brackets where observed_temp > cap_strike
+            - Because temp can't go back DOWN
+            
+        For LOW markets (observed temp is 6hr min so far):
+            - NO is locked on brackets where observed_temp < floor_strike
+            - Because temp can't go back UP
         
-        Buy whichever has the best edge (lowest price for confirmed winner)
+        Returns list of TradeResults for all executed trades.
         """
+        results = []
+        
         signal = TradeSignal(
             station=station,
             signal_type=signal_type,
-            temperature_f=temperature_f,
+            temperature_f=observed_temp_f,
             metar_time=metar_time,
             market_date=market_date
         )
         
-        print(f"[SNIPER] Looking for trades on {signal_type} with confirmed temp {temperature_f}°F")
+        print(f"\n[SNIPER] === Finding locked NO trades for {signal_type.upper()} ===")
+        print(f"[SNIPER] Observed temp: {observed_temp_f}°F")
         print(f"[SNIPER] Ticker base: {ticker_base}, date: {market_date}")
         
         try:
-            # Find the BEST trade across ALL brackets
-            best_trade = self._find_best_trade(
-                ticker_base=ticker_base,
-                market_date=market_date,
-                temperature_f=temperature_f,
-                signal_type=signal_type
-            )
+            # Fetch all markets for this event
+            markets = self._fetch_markets_for_date(ticker_base, market_date)
             
-            if not best_trade:
-                return TradeResult(
+            if not markets:
+                return [TradeResult(
                     signal=signal,
                     success=False,
-                    error=f"No profitable trade found for {temperature_f}°F"
+                    error=f"No markets found for {ticker_base} on {market_date}"
+                )]
+            
+            print(f"[SNIPER] Found {len(markets)} brackets, checking for locked NOs...")
+            
+            # Analyze each bracket
+            locked_trades = []
+            
+            for market in markets:
+                ticker = market.get('ticker', '')
+                floor_strike = market.get('floor_strike')
+                cap_strike = market.get('cap_strike')
+                strike_type = market.get('strike_type', '')
+                yes_sub = market.get('yes_sub_title', '')
+                no_ask = self._parse_price(market.get('no_ask'), market.get('no_ask_dollars'))
+                
+                # Determine if NO is locked
+                no_locked, reason = self._is_no_locked(
+                    signal_type=signal_type,
+                    observed_temp=observed_temp_f,
+                    floor_strike=floor_strike,
+                    cap_strike=cap_strike,
+                    strike_type=strike_type
                 )
+                
+                if no_locked:
+                    edge = 100 - no_ask if no_ask else 0
+                    print(f"  ✅ LOCKED: {yes_sub:<15} | NO @ {no_ask}¢ | Edge: {edge}¢ | {reason}")
+                    
+                    if no_ask and no_ask <= self.max_price_cents:
+                        locked_trades.append({
+                            'ticker': ticker,
+                            'subtitle': yes_sub,
+                            'no_ask': no_ask,
+                            'edge': edge,
+                            'reason': reason
+                        })
+                    elif no_ask and no_ask > self.max_price_cents:
+                        print(f"      → Price {no_ask}¢ exceeds max {self.max_price_cents}¢, skipping")
+                else:
+                    print(f"  ❌ NOT LOCKED: {yes_sub:<15} | {reason}")
             
-            market_ticker, bracket_range, side, price_cents, edge_cents = best_trade
+            # Execute trades on locked brackets (best edge first)
+            locked_trades.sort(key=lambda x: x['edge'], reverse=True)
             
-            print(f"[SNIPER] Best trade: {side.upper()} on {market_ticker}")
-            print(f"[SNIPER] Range: {bracket_range}, Price: {price_cents}¢, Edge: {edge_cents}¢")
+            for trade in locked_trades:
+                result = self._execute_no_trade(
+                    signal=signal,
+                    ticker=trade['ticker'],
+                    subtitle=trade['subtitle'],
+                    price_cents=trade['no_ask']
+                )
+                results.append(result)
             
-            # Check if price is acceptable
-            if price_cents > self.max_price_cents:
-                return TradeResult(
+            if not locked_trades:
+                results.append(TradeResult(
                     signal=signal,
                     success=False,
-                    market_ticker=market_ticker,
-                    bracket_range=bracket_range,
-                    price_paid_cents=price_cents,
-                    error=f"Price {price_cents}¢ exceeds max {self.max_price_cents}¢"
-                )
+                    error=f"No locked NO trades under {self.max_price_cents}¢"
+                ))
             
-            # Execute the trade!
-            if self.dry_run:
-                print(f"[SNIPER] 🧪 DRY RUN - Would buy {side.upper()} on {market_ticker} at {price_cents}¢")
-                return TradeResult(
-                    signal=signal,
-                    success=True,
-                    market_ticker=market_ticker,
-                    bracket_range=f"{bracket_range} ({side.upper()})",
-                    price_paid_cents=price_cents,
-                    contracts=1,
-                    error=f"DRY RUN - {edge_cents}¢ edge"
-                )
-            else:
-                # LIVE TRADE - Use limit order at ask price for predictable fills
-                print(f"[SNIPER] 🔴 LIVE TRADE - Buying {side.upper()} on {market_ticker} at {price_cents}¢")
-                order = self.kalshi.create_order(
-                    ticker=market_ticker,
-                    side=side,  # 'yes' or 'no'
-                    action='buy',
-                    count=1,
-                    price_cents=price_cents,
-                    order_type='limit'  # Use limit at ask for predictable fills
-                )
-                
-                buy_order_id = order.get('order_id') if order else None
-                sell_order_id = None
-                
-                # QC HEDGE: Immediately place a sell limit at 99¢
-                # If there's a QC flip, we exit at 99¢ instead of losing at settlement
-                if buy_order_id:
-                    try:
-                        print(f"[SNIPER] 🛡️ HEDGE - Placing sell limit at 99¢ for QC protection")
-                        sell_order = self.kalshi.create_order(
-                            ticker=market_ticker,
-                            side=side,  # Same side we bought
-                            action='sell',
-                            count=1,
-                            price_cents=99,  # Sell at 99¢
-                            order_type='limit'
-                        )
-                        sell_order_id = sell_order.get('order_id') if sell_order else None
-                        print(f"[SNIPER] ✓ Hedge order placed: {sell_order_id}")
-                    except Exception as hedge_err:
-                        print(f"[SNIPER] ⚠️ Failed to place hedge: {hedge_err}")
-                
-                return TradeResult(
-                    signal=signal,
-                    success=True,
-                    market_ticker=market_ticker,
-                    bracket_range=f"{bracket_range} ({side.upper()})",
-                    price_paid_cents=price_cents,
-                    contracts=1,
-                    order_id=buy_order_id,
-                    error=f"Hedge order: {sell_order_id}" if sell_order_id else "No hedge placed"
-                )
-                
         except Exception as e:
             print(f"[SNIPER] Error: {e}")
             import traceback
             traceback.print_exc()
-            return TradeResult(
+            results.append(TradeResult(
                 signal=signal,
                 success=False,
                 error=str(e)
-            )
-    
-    def _find_best_trade(
-        self,
-        ticker_base: str,
-        market_date: str,
-        temperature_f: int,
-        signal_type: str
-    ) -> Optional[Tuple[str, str, str, int, int]]:
-        """
-        Find the BEST trade across all brackets for a confirmed temperature.
+            ))
         
-        For each bracket:
-        - If temp IS in bracket → YES wins, check YES ask price
-        - If temp is NOT in bracket → NO wins, check NO ask price
+        return results
+    
+    def _is_no_locked(
+        self,
+        signal_type: str,  # 'high' or 'low'
+        observed_temp: int,
+        floor_strike: Optional[float],
+        cap_strike: Optional[float],
+        strike_type: str
+    ) -> Tuple[bool, str]:
+        """
+        Determine if NO is locked for a given bracket.
+        
+        Uses floor_strike, cap_strike, and strike_type from Kalshi API.
         
         Returns:
-            Tuple of (market_ticker, bracket_range, side, price_cents, edge_cents) or None
-            side is 'yes' or 'no'
+            Tuple of (is_locked: bool, reason: str)
         """
-        # Query by series_ticker (e.g., KXHIGHTSFO) and filter by date
-        series_ticker = ticker_base  # Already uppercase like KXHIGHTSFO
+        # Convert strikes to int for comparison (they come as float)
+        floor = int(floor_strike) if floor_strike is not None else None
+        cap = int(cap_strike) if cap_strike is not None else None
         
-        print(f"[SNIPER] Fetching markets for series: {series_ticker}, filtering for date: {market_date}")
+        if signal_type == 'high':
+            # HIGH market: YES wins if final high meets condition
+            # NO is locked when observed temp has ALREADY exceeded what YES needs
+            
+            if strike_type == 'between':
+                # YES wins if floor <= high <= cap
+                # NO wins if high < floor OR high > cap
+                # NO is locked if observed > cap (already above range, can't go down)
+                if cap is not None and observed_temp > cap:
+                    return True, f"observed {observed_temp}°F > cap {cap}°F, can't go down"
+                else:
+                    return False, f"could still land in {floor}-{cap} range"
+                    
+            elif strike_type == 'less':
+                # YES wins if high < cap
+                # NO wins if high >= cap
+                # NO is locked if observed >= cap (already at/above threshold)
+                if cap is not None and observed_temp >= cap:
+                    return True, f"observed {observed_temp}°F >= cap {cap}°F"
+                else:
+                    return False, f"high could still stay below {cap}"
+                    
+            elif strike_type == 'greater':
+                # YES wins if high > floor
+                # NO wins if high <= floor
+                # For HIGH markets, if current temp already > floor, YES might win
+                # NO is NEVER locked for 'greater' on HIGH (temp could keep rising)
+                return False, f"temp could still exceed {floor}"
+                
+        elif signal_type == 'low':
+            # LOW market: YES wins if final low meets condition
+            # NO is locked when observed temp has ALREADY gone below what YES needs
+            
+            if strike_type == 'between':
+                # YES wins if floor <= low <= cap
+                # NO wins if low < floor OR low > cap
+                # NO is locked if observed < floor (already below range, can't go up)
+                if floor is not None and observed_temp < floor:
+                    return True, f"observed {observed_temp}°F < floor {floor}°F, can't go up"
+                else:
+                    return False, f"could still land in {floor}-{cap} range"
+                    
+            elif strike_type == 'greater':
+                # YES wins if low > floor (i.e., low >= floor+1)
+                # NO wins if low <= floor
+                # NO is locked if observed <= floor (already at/below threshold, can't go up)
+                if floor is not None and observed_temp <= floor:
+                    return True, f"observed {observed_temp}°F <= floor {floor}°F, can't go up"
+                else:
+                    return False, f"low could still stay above {floor}"
+                    
+            elif strike_type == 'less':
+                # YES wins if low < cap
+                # NO wins if low >= cap
+                # For LOW markets, if current temp already < cap, YES might win
+                # NO is NEVER locked for 'less' on LOW (temp could keep dropping)
+                return False, f"temp could still drop below {cap}"
+        
+        return False, "unknown strike_type or signal_type"
+    
+    def _fetch_markets_for_date(self, ticker_base: str, market_date: str) -> List[Dict]:
+        """
+        Fetch all markets for a given ticker base and date.
+        
+        Args:
+            ticker_base: e.g., 'KXLOWTNYC' or 'KXHIGHNY'
+            market_date: e.g., '26JAN29'
+            
+        Returns:
+            List of market dicts from Kalshi API
+        """
+        # Build event ticker: KXLOWTNYC-26JAN29
+        event_ticker = f"{ticker_base}-{market_date}"
+        
+        print(f"[SNIPER] Fetching markets for event: {event_ticker}")
         
         try:
-            all_markets = self.kalshi.get_markets(series_ticker=series_ticker, status='open')
-            
-            if not all_markets:
-                print(f"[SNIPER] No open markets found for series {series_ticker}")
-                return None
-            
-            # Filter to only TODAY's markets based on ticker containing the date
-            # Market tickers look like: KXHIGHTSFO-26JAN28-B60.5
-            date_upper = market_date.upper()  # 26JAN28
-            markets = [m for m in all_markets if date_upper in m.get('ticker', '').upper()]
-            
-            if not markets:
-                print(f"[SNIPER] No markets found for date {date_upper} (had {len(all_markets)} total)")
-                return None
-            
-            print(f"[SNIPER] Found {len(markets)} brackets for {date_upper}, analyzing all...")
-            
-            best_trade = None
-            best_edge = -100  # Worst possible
-            
-            for market in markets:
-                ticker = market.get('ticker', '')
-                subtitle = market.get('yes_sub_title', '') or market.get('subtitle', '')
-                
-                # Get prices - handle different formats
-                yes_ask = self._parse_price(market.get('yes_ask'), market.get('yes_ask_dollars'))
-                no_ask = self._parse_price(market.get('no_ask'), market.get('no_ask_dollars'))
-                
-                # Determine if temp is IN this bracket
-                temp_in_bracket = self._temp_in_bracket(subtitle, ticker, temperature_f)
-                
-                if temp_in_bracket:
-                    # YES wins - check YES price
-                    if yes_ask is not None and yes_ask <= self.max_price_cents:
-                        edge = 100 - yes_ask  # Profit potential
-                        print(f"  [YES] {ticker}: {subtitle} @ {yes_ask}¢ → {edge}¢ edge (temp IN bracket)")
-                        if edge > best_edge:
-                            best_edge = edge
-                            best_trade = (ticker, subtitle, 'yes', yes_ask, edge)
-                else:
-                    # NO wins - check NO price
-                    if no_ask is not None and no_ask <= self.max_price_cents:
-                        edge = 100 - no_ask  # Profit potential
-                        print(f"  [NO]  {ticker}: {subtitle} @ {no_ask}¢ → {edge}¢ edge (temp NOT in bracket)")
-                        if edge > best_edge:
-                            best_edge = edge
-                            best_trade = (ticker, subtitle, 'no', no_ask, edge)
-            
-            if best_trade:
-                print(f"[SNIPER] ✓ Best trade: {best_trade[2].upper()} on {best_trade[0]} @ {best_trade[3]}¢ ({best_trade[4]}¢ edge)")
-            else:
-                print(f"[SNIPER] No trade found under {self.max_price_cents}¢ threshold")
-            
-            return best_trade
-            
+            markets = self.kalshi.get_markets(event_ticker=event_ticker)
+            return markets if markets else []
         except Exception as e:
             print(f"[SNIPER] Error fetching markets: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+            return []
+    
+    def _execute_no_trade(
+        self,
+        signal: TradeSignal,
+        ticker: str,
+        subtitle: str,
+        price_cents: int
+    ) -> TradeResult:
+        """
+        Execute a NO trade on a locked bracket.
+        
+        1. Buy NO at ask price
+        2. Immediately place 99¢ sell limit as hedge
+        """
+        print(f"\n[SNIPER] 🎯 EXECUTING NO TRADE: {ticker}")
+        print(f"[SNIPER] Bracket: {subtitle}, Price: {price_cents}¢")
+        
+        if self.dry_run:
+            print(f"[SNIPER] 🧪 DRY RUN - Would buy NO on {ticker} at {price_cents}¢")
+            return TradeResult(
+                signal=signal,
+                success=True,
+                market_ticker=ticker,
+                bracket_range=f"{subtitle} (NO)",
+                price_paid_cents=price_cents,
+                contracts=1,
+                order_id="DRY_RUN",
+                error="Dry run - no real trade"
+            )
+        
+        try:
+            # BUY NO
+            print(f"[SNIPER] 💰 Buying NO at {price_cents}¢...")
+            order = self.kalshi.create_order(
+                ticker=ticker,
+                side='no',
+                action='buy',
+                count=1,
+                price_cents=price_cents,
+                order_type='limit'
+            )
+            
+            buy_order_id = order.get('order_id') if order else None
+            print(f"[SNIPER] ✓ Buy order placed: {buy_order_id}")
+            
+            # HEDGE: Place 99¢ sell limit
+            sell_order_id = None
+            if buy_order_id:
+                try:
+                    print(f"[SNIPER] 🛡️ Placing hedge sell at 99¢...")
+                    sell_order = self.kalshi.create_order(
+                        ticker=ticker,
+                        side='no',
+                        action='sell',
+                        count=1,
+                        price_cents=99,
+                        order_type='limit'
+                    )
+                    sell_order_id = sell_order.get('order_id') if sell_order else None
+                    print(f"[SNIPER] ✓ Hedge order placed: {sell_order_id}")
+                except Exception as hedge_err:
+                    print(f"[SNIPER] ⚠️ Failed to place hedge: {hedge_err}")
+            
+            return TradeResult(
+                signal=signal,
+                success=True,
+                market_ticker=ticker,
+                bracket_range=f"{subtitle} (NO)",
+                price_paid_cents=price_cents,
+                contracts=1,
+                order_id=buy_order_id,
+                error=f"Hedge: {sell_order_id}" if sell_order_id else "No hedge"
+            )
+            
+        except Exception as e:
+            print(f"[SNIPER] ❌ Trade failed: {e}")
+            return TradeResult(
+                signal=signal,
+                success=False,
+                market_ticker=ticker,
+                bracket_range=f"{subtitle} (NO)",
+                price_paid_cents=price_cents,
+                error=str(e)
+            )
     
     def _parse_price(self, price_raw, price_dollars) -> Optional[int]:
         """Parse price from various Kalshi formats to cents"""
@@ -410,44 +509,6 @@ class WXSniper:
             except:
                 pass
         return None
-    
-    def _temp_in_bracket(self, subtitle: str, ticker: str, temperature_f: int) -> bool:
-        """
-        Check if a temperature falls within a bracket.
-        
-        Bracket formats:
-        - "60° to 61°" → temp 60 or 61 is IN
-        - "57° or below" → temp <= 57 is IN  
-        - "66° or above" → temp >= 66 is IN
-        """
-        subtitle_lower = subtitle.lower() if subtitle else ''
-        
-        # Range: "60° to 61°"
-        range_match = re.search(r'(\d+)°?\s*to\s*(\d+)°?', subtitle_lower)
-        if range_match:
-            low = int(range_match.group(1))
-            high = int(range_match.group(2))
-            return low <= temperature_f <= high
-        
-        # Below: "57° or below"
-        below_match = re.search(r'(\d+)°?\s*or\s*below', subtitle_lower)
-        if below_match:
-            threshold = int(below_match.group(1))
-            return temperature_f <= threshold
-        
-        # Above: "66° or above"
-        above_match = re.search(r'(\d+)°?\s*or\s*above', subtitle_lower)
-        if above_match:
-            threshold = int(above_match.group(1))
-            return temperature_f >= threshold
-        
-        # Fallback: parse from ticker (e.g., -T60 means 60-61)
-        ticker_match = re.search(r'-T?(\d+)$', ticker)
-        if ticker_match:
-            bracket_temp = int(ticker_match.group(1))
-            return bracket_temp <= temperature_f <= bracket_temp + 1
-        
-        return False
 
 
 # Global sniper instance
