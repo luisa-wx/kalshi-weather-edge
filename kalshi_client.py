@@ -26,15 +26,46 @@ class KalshiClient:
         
     def _load_private_key(self):
         """Load RSA private key from PEM string"""
-        # Handle escaped newlines from environment variables
         key_str = KALSHI_PRIVATE_KEY
+        
+        # Debug: print first/last chars to diagnose
+        print(f"[KALSHI] Key length: {len(key_str)}")
+        print(f"[KALSHI] Key starts with: {key_str[:50]}...")
+        
+        # Handle various escaped newline formats
         if '\\n' in key_str:
             key_str = key_str.replace('\\n', '\n')
-        return serialization.load_pem_private_key(
-            key_str.encode(),
-            password=None,
-            backend=default_backend()
-        )
+        if '\\r' in key_str:
+            key_str = key_str.replace('\\r', '')
+            
+        # If key doesn't start with proper header, it might be base64 only
+        if not key_str.strip().startswith('-----BEGIN'):
+            # Try wrapping as RSA private key
+            key_str = f"-----BEGIN RSA PRIVATE KEY-----\n{key_str.strip()}\n-----END RSA PRIVATE KEY-----"
+        
+        # Ensure proper line breaks in PEM (every 64 chars)
+        # This helps if the key was pasted without line breaks
+        lines = key_str.strip().split('\n')
+        if len(lines) == 3:  # Header, single long line, footer
+            header = lines[0]
+            body = lines[1]
+            footer = lines[2]
+            # Split body into 64-char lines
+            body_lines = [body[i:i+64] for i in range(0, len(body), 64)]
+            key_str = header + '\n' + '\n'.join(body_lines) + '\n' + footer
+        
+        print(f"[KALSHI] Processed key starts with: {key_str[:80]}...")
+        
+        try:
+            return serialization.load_pem_private_key(
+                key_str.encode(),
+                password=None,
+                backend=default_backend()
+            )
+        except Exception as e:
+            print(f"[KALSHI] Failed to load key: {e}")
+            print(f"[KALSHI] Full key:\n{key_str}")
+            raise
     
     def _sign_request(self, timestamp_ms: int, method: str, path: str) -> str:
         """
