@@ -13,7 +13,10 @@ from datetime import datetime, date
 from typing import Dict, Optional, Set
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-import pytz
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 from config import STATIONS
 
@@ -96,7 +99,7 @@ class StateManager:
     def _get_local_date(self, station: str) -> str:
         """Get current date in station's local timezone"""
         tz_name = STATIONS.get(station, {}).get("timezone", "America/New_York")
-        tz = pytz.timezone(tz_name)
+        tz = ZoneInfo(tz_name)
         return datetime.now(tz).strftime("%Y-%m-%d")
     
     def get_state(self, station: str) -> StationState:
