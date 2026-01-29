@@ -570,8 +570,18 @@ class SmartPoller:
                         time.sleep(30)
                     continue
                 
-                # Outside windows - sleep
-                sleep_mins = min(s['minutes_to_hot'], 5)
+                # Outside windows - sleep, but not past prep window
+                if self.hourly_mode:
+                    # In hourly mode, prep is at :48 every hour
+                    minute = s['current_minute']
+                    if minute < 48:
+                        sleep_mins = min(48 - minute, 5)
+                    else:
+                        # We're past :48 but not in prep/hot? Shouldn't happen, but sleep short
+                        sleep_mins = 1
+                else:
+                    sleep_mins = min(s['minutes_to_hot'], 5)
+                
                 print(f"[{now_str}] 🔴 Next hot in {s['minutes_to_hot']}min, sleeping {sleep_mins}min")
                 time.sleep(sleep_mins * 60)
                 
