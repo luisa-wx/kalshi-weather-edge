@@ -265,6 +265,27 @@ class WXSniper:
                     order_type='limit'  # Use limit at ask for predictable fills
                 )
                 
+                buy_order_id = order.get('order_id') if order else None
+                sell_order_id = None
+                
+                # QC HEDGE: Immediately place a sell limit at 99¢
+                # If there's a QC flip, we exit at 99¢ instead of losing at settlement
+                if buy_order_id:
+                    try:
+                        print(f"[SNIPER] 🛡️ HEDGE - Placing sell limit at 99¢ for QC protection")
+                        sell_order = self.kalshi.create_order(
+                            ticker=market_ticker,
+                            side=side,  # Same side we bought
+                            action='sell',
+                            count=1,
+                            price_cents=99,  # Sell at 99¢
+                            order_type='limit'
+                        )
+                        sell_order_id = sell_order.get('order_id') if sell_order else None
+                        print(f"[SNIPER] ✓ Hedge order placed: {sell_order_id}")
+                    except Exception as hedge_err:
+                        print(f"[SNIPER] ⚠️ Failed to place hedge: {hedge_err}")
+                
                 return TradeResult(
                     signal=signal,
                     success=True,
@@ -272,8 +293,8 @@ class WXSniper:
                     bracket_range=f"{bracket_range} ({side.upper()})",
                     price_paid_cents=price_cents,
                     contracts=1,
-                    order_id=order.get('order_id') if order else None,
-                    error=None
+                    order_id=buy_order_id,
+                    error=f"Hedge order: {sell_order_id}" if sell_order_id else "No hedge placed"
                 )
                 
         except Exception as e:

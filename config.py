@@ -77,8 +77,8 @@ STATIONS = {
         "name": "Miami"
     },
     "KAUS": {
-        "kalshi_high_ticker": "KXHIGHAUS",
-        "kalshi_low_ticker": "KXLOWTAUS",
+        "kalshi_high_ticker": "KXHIGHAUT",
+        "kalshi_low_ticker": "KXLOWTAUT",
         "timezone": "America/Chicago",
         "name": "Austin"
     },
@@ -114,7 +114,7 @@ STATIONS = {
     },
     "KDEN": {
         "kalshi_high_ticker": "KXHIGHDEN",
-        "kalshi_low_ticker": None,  # Spreadsheet shows Y but no ticker listed
+        "kalshi_low_ticker": "KXLOWTDEN",
         "timezone": "America/Denver",
         "name": "Denver"
     }
