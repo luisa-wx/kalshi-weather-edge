@@ -1,340 +1,488 @@
+#!/usr/bin/env python3
 """
-Smart Poller - Pre-scan Kalshi, then target specific stations
+WX Sniper - Smart Poller (V3 - Efficient Scheduling)
 
-Strategy:
-1. At :50 - Scan ALL Kalshi markets for opportunities (brackets ≤ threshold)
-2. At :52 - Start polling ONLY stations with opportunities  
-3. Stop polling a station once we get its synoptic METAR
-4. At :02 - Stop all polling
+Schedule:
+1. 12:30 AM local time → Ingest brackets for each market (once per day)
+2. XX:48 (8 min before synoptic) → Check prices, build watchlist
+3. XX:52-:02 (hot window) → Poll METARs every 5s, execute trades
+4. Rest of time → Sleep, no API calls
 
-This minimizes aviationweather.gov API calls (100/min limit)
+Synoptic times (UTC): 00Z, 06Z, 12Z, 18Z
+- METARs with 6-hour temps drop around :53 past the hour
 """
 
+import os
+import sys
 import time
-import requests
-from datetime import datetime, timezone
-from typing import Dict, List, Set, Optional, Tuple
-from dataclasses import dataclass
+import threading
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
 
-from config import STATIONS, SYNOPTIC_HOURS_UTC, MAX_BRACKET_PRICE_CENTS
-from kalshi_client import KalshiClient
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from aviation_weather import AviationWeatherPoller
 from metar_parser import parse_metar
+from kalshi_client import KalshiClient
+from config import STATIONS
 
 
 @dataclass
-class Opportunity:
-    """A potential trading opportunity"""
+class BracketInfo:
+    """Info about a tradeable bracket"""
+    ticker: str
+    event_ticker: str
+    subtitle: str  # "8° to 9°"
+    floor_strike: Optional[int]
+    cap_strike: Optional[int]
+    strike_type: str  # 'between', 'greater', 'less'
+    signal_type: str  # 'high' or 'low'
+    no_ask: int  # Current NO price in cents
+    station: str  # ICAO code
+
+
+@dataclass
+class MarketState:
+    """State for a single station's markets"""
     station: str
-    market_type: str  # 'high' or 'low'
-    series_ticker: str
-    best_bracket: str
-    best_price: int
-    side: str  # 'yes' or 'no'
-
-
-@dataclass  
-class ScanResult:
-    """Result of pre-scanning Kalshi"""
-    opportunities: List[Opportunity]
-    stations_to_watch: Set[str]
-    scan_time: datetime
+    high_ticker_base: str
+    low_ticker_base: str
+    timezone: str
+    brackets_ingested: bool = False
+    last_bracket_ingest: Optional[datetime] = None
+    watchlist: List[BracketInfo] = field(default_factory=list)
 
 
 class SmartPoller:
     """
-    Intelligent poller that:
-    1. Pre-scans Kalshi for opportunities
-    2. Only polls aviationweather for stations with opportunities
-    3. Stops polling each station once synoptic METAR received
+    Efficient polling scheduler for weather trading.
+    
+    Minimizes API calls by only polling when needed:
+    - Bracket ingest: once per day at 12:30 AM local
+    - Price check: 8 min before each synoptic time
+    - METAR polling: only during hot windows with watchlist items
     """
     
-    def __init__(self, kalshi: KalshiClient, threshold_cents: int = 93):
-        self.kalshi = kalshi
-        self.threshold = threshold_cents
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "WXSniper/1.0 (weather-trading-bot)"
-        })
+    def __init__(self, dry_run: bool = True, max_price_cents: int = 93):
+        self.dry_run = dry_run
+        self.max_price_cents = max_price_cents
+        self.kalshi = KalshiClient()
+        self.aviation = AviationWeatherPoller()
+        self.running = False
         
-        # Track which stations have received synoptic METARs this cycle
-        self.stations_done: Set[str] = set()
+        # Station timezones
+        self.station_timezones = {
+            'KJFK': 'America/New_York',
+            'KNYC': 'America/New_York',
+            'KSFO': 'America/Los_Angeles',
+            'KDEN': 'America/Denver',
+            'KORD': 'America/Chicago',
+            'KMDW': 'America/Chicago',
+        }
         
-        # Track last observation time per station
-        self.last_obs_time: Dict[str, datetime] = {}
-        
-    def pre_scan_kalshi(self) -> ScanResult:
-        """
-        Scan all Kalshi markets to find opportunities.
-        Returns list of opportunities and set of stations to watch.
-        """
-        print(f"\n[SCAN] 🔍 Pre-scanning Kalshi markets...")
-        opportunities = []
-        stations_to_watch = set()
-        
-        # Get today's date for each timezone
-        now_utc = datetime.now(timezone.utc)
-        
+        # Initialize market states
+        self.market_states: Dict[str, MarketState] = {}
         for station, config in STATIONS.items():
-            # Check HIGH market
-            high_ticker = config.get('kalshi_high_ticker')
-            if high_ticker:
-                opp = self._check_series_for_opportunity(
-                    station, high_ticker, 'high', config['timezone']
-                )
-                if opp:
-                    opportunities.append(opp)
-                    stations_to_watch.add(station)
-            
-            # Check LOW market
-            low_ticker = config.get('kalshi_low_ticker')
-            if low_ticker:
-                opp = self._check_series_for_opportunity(
-                    station, low_ticker, 'low', config['timezone']
-                )
-                if opp:
-                    opportunities.append(opp)
-                    stations_to_watch.add(station)
+            self.market_states[station] = MarketState(
+                station=station,
+                high_ticker_base=config.get('kalshi_high_ticker', ''),
+                low_ticker_base=config.get('kalshi_low_ticker', ''),
+                timezone=self.station_timezones.get(station, 'America/New_York')
+            )
         
-        print(f"[SCAN] Found {len(opportunities)} opportunities across {len(stations_to_watch)} stations")
-        for opp in opportunities:
-            print(f"[SCAN]   {opp.station} {opp.market_type.upper()}: {opp.best_bracket} @ {opp.best_price}¢ ({opp.side})")
+        # Track executed trades to avoid duplicates
+        self.executed_trades: set = set()
         
-        return ScanResult(
-            opportunities=opportunities,
-            stations_to_watch=stations_to_watch,
-            scan_time=now_utc
-        )
+        print(f"[POLLER] Initialized - dry_run={dry_run}, max_price={max_price_cents}¢")
+        print(f"[POLLER] Stations: {list(self.market_states.keys())}")
     
-    def _check_series_for_opportunity(
-        self, 
-        station: str, 
-        series_ticker: str, 
-        market_type: str,
-        tz_name: str
-    ) -> Optional[Opportunity]:
-        """Check if a series has any brackets under threshold"""
+    def _get_local_time(self, tz_name: str) -> datetime:
+        """Get current time in a specific timezone"""
         try:
             from zoneinfo import ZoneInfo
-            
-            # Get local date for market filtering
-            now_utc = datetime.now(timezone.utc)
-            local_tz = ZoneInfo(tz_name)
-            local_time = now_utc.astimezone(local_tz)
-            date_str = local_time.strftime("%y%b%d").upper()  # e.g., "26JAN29"
-            
-            # Query Kalshi
-            markets = self.kalshi.get_markets(series_ticker=series_ticker, status='open')
-            
-            if not markets:
-                return None
-            
-            # Filter to today's markets
-            today_markets = [m for m in markets if date_str in m.get('ticker', '')]
-            
-            if not today_markets:
-                return None
-            
-            # Find best opportunity (lowest price that could win)
-            best_opp = None
-            best_price = 100
-            
-            for market in today_markets:
-                ticker = market.get('ticker', '')
-                yes_ask = market.get('yes_ask', 100)
-                no_ask = market.get('no_ask', 100)
-                
-                # Check YES side
-                if yes_ask and yes_ask <= self.threshold and yes_ask < best_price:
-                    best_price = yes_ask
-                    best_opp = Opportunity(
-                        station=station,
-                        market_type=market_type,
-                        series_ticker=series_ticker,
-                        best_bracket=ticker,
-                        best_price=yes_ask,
-                        side='yes'
-                    )
-                
-                # Check NO side
-                if no_ask and no_ask <= self.threshold and no_ask < best_price:
-                    best_price = no_ask
-                    best_opp = Opportunity(
-                        station=station,
-                        market_type=market_type,
-                        series_ticker=series_ticker,
-                        best_bracket=ticker,
-                        best_price=no_ask,
-                        side='no'
-                    )
-            
-            return best_opp
-            
-        except Exception as e:
-            print(f"[SCAN] Error checking {series_ticker}: {e}")
-            return None
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz_name))
     
-    def fetch_metar(self, station: str) -> Optional[Tuple[str, datetime]]:
-        """
-        Fetch single station METAR from aviationweather.gov
-        Returns (raw_text, obs_time) or None
-        """
-        try:
-            url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            
-            raw_text = response.text.strip()
-            if not raw_text or 'error' in raw_text.lower():
-                return None
-            
-            # Parse observation time
-            obs_time = self._parse_obs_time(raw_text)
-            
-            return (raw_text, obs_time)
-            
-        except Exception as e:
-            print(f"[POLL] Error fetching {station}: {e}")
-            return None
+    def _get_market_date(self, tz_name: str) -> str:
+        """Get today's market date string in Kalshi format (26JAN29)"""
+        local = self._get_local_time(tz_name)
+        return local.strftime("%y%b%d").upper()
     
-    def _parse_obs_time(self, metar_text: str) -> Optional[datetime]:
-        """Parse observation time from METAR"""
-        try:
-            parts = metar_text.split()
-            if len(parts) < 2:
-                return None
-            
-            time_part = parts[1]  # e.g., "281853Z"
-            if not time_part.endswith('Z') or len(time_part) != 7:
-                return None
-            
-            day = int(time_part[0:2])
-            hour = int(time_part[2:4])
-            minute = int(time_part[4:6])
-            
-            now = datetime.now(timezone.utc)
-            return now.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
-            
-        except:
-            return None
+    def _is_bracket_ingest_time(self, tz_name: str) -> bool:
+        """Check if it's 12:30 AM local time (±2 min window)"""
+        local = self._get_local_time(tz_name)
+        target_minutes = 12 * 60 + 30  # 12:30 AM = 30 minutes after midnight
+        current_minutes = local.hour * 60 + local.minute
+        return abs(current_minutes - target_minutes) <= 2
     
-    def is_synoptic_metar(self, metar_text: str) -> bool:
-        """Check if METAR contains 6-hour temperature groups"""
-        import re
-        # Look for T-group: T followed by 8 digits (temp + dewpoint in tenths C)
-        # AND 6-hour groups: 10xxx (max) or 20xxx (min)
-        has_t_group = bool(re.search(r'\bT\d{8}\b', metar_text))
-        has_6hr_group = bool(re.search(r'\b[12]0\d{3}\b', metar_text))
-        return has_t_group and has_6hr_group
-    
-    def poll_targeted_stations(
-        self, 
-        stations: Set[str], 
-        callback,
-        poll_interval: int = 5,
-        max_duration: int = 600  # 10 minutes max
-    ):
+    def _get_synoptic_state(self) -> dict:
         """
-        Poll only specified stations until all have synoptic METARs
+        Determine current synoptic state.
         
-        Args:
-            stations: Set of station codes to poll
-            callback: Function to call with (station, metar_text) when synoptic found
-            poll_interval: Seconds between polls (default 5)
-            max_duration: Maximum polling duration in seconds
+        Returns dict with:
+        - is_prep_window: True if XX:48-XX:51 (time to check prices)
+        - is_hot_window: True if XX:52-XX:02 (time to poll METARs)
+        - synoptic_hour: Which synoptic hour we're near (0, 6, 12, 18)
+        - minutes_to_hot: Minutes until hot window starts
         """
-        self.stations_done = set()
-        remaining = stations.copy()
-        start_time = time.time()
+        now = datetime.now(timezone.utc)
+        minute = now.minute
+        hour = now.hour
         
-        print(f"\n[POLL] 🎯 Targeting {len(remaining)} stations: {', '.join(remaining)}")
+        synoptic_hours = [0, 6, 12, 18]
         
-        while remaining and (time.time() - start_time) < max_duration:
-            now = datetime.now(timezone.utc)
-            print(f"[POLL] {now.strftime('%H:%M:%S')}Z | Checking {len(remaining)} stations...")
-            
-            for station in list(remaining):
-                result = self.fetch_metar(station)
-                
-                if result:
-                    raw_text, obs_time = result
-                    
-                    # Check if this is a NEW metar
-                    last_time = self.last_obs_time.get(station)
-                    if last_time and obs_time and obs_time <= last_time:
-                        continue  # Already seen this one
-                    
-                    if obs_time:
-                        self.last_obs_time[station] = obs_time
-                    
-                    # Check if it's synoptic
-                    if self.is_synoptic_metar(raw_text):
-                        print(f"[POLL] ✅ SYNOPTIC METAR: {station}")
-                        remaining.discard(station)
-                        self.stations_done.add(station)
-                        
-                        # Call the callback
-                        try:
-                            callback(station, raw_text)
-                        except Exception as e:
-                            print(f"[POLL] Callback error for {station}: {e}")
-            
-            if remaining:
-                time.sleep(poll_interval)
+        # Prep window: XX:48-XX:51 of a synoptic hour
+        is_prep_window = 48 <= minute <= 51 and hour in synoptic_hours
         
-        if remaining:
-            print(f"[POLL] ⏰ Timeout - missing synoptics from: {', '.join(remaining)}")
+        # Hot window: XX:52-XX:59 of synoptic hour OR XX:00-XX:02 of next hour
+        is_hot_window = False
+        synoptic_hour = None
+        
+        if minute >= 52 and hour in synoptic_hours:
+            is_hot_window = True
+            synoptic_hour = hour
+        elif minute <= 2:
+            prev_hour = (hour - 1) % 24
+            if prev_hour in synoptic_hours:
+                is_hot_window = True
+                synoptic_hour = prev_hour
+        
+        # Calculate minutes to next hot window
+        if is_hot_window:
+            minutes_to_hot = 0
+        elif is_prep_window:
+            minutes_to_hot = 52 - minute
         else:
-            print(f"[POLL] ✅ All {len(self.stations_done)} synoptic METARs received!")
-    
-    def reset_cycle(self):
-        """Reset for new synoptic cycle"""
-        self.stations_done = set()
-
-
-def run_smart_cycle(sniper, dry_run: bool = True):
-    """
-    Run a complete smart polling cycle:
-    1. Pre-scan Kalshi at :50
-    2. Poll targeted stations :52 to :02
-    3. Execute trades as synoptic METARs arrive
-    """
-    from trader import WXSniper
-    
-    kalshi = KalshiClient()
-    poller = SmartPoller(kalshi)
-    
-    # Pre-scan
-    scan = poller.pre_scan_kalshi()
-    
-    if not scan.stations_to_watch:
-        print("[SMART] No opportunities found - skipping this cycle")
-        return
-    
-    # Define callback for when synoptic METAR arrives
-    def on_synoptic_metar(station: str, metar_text: str):
-        print(f"\n[SMART] Processing {station}...")
-        results = sniper.process_metar(metar_text)
-        for r in results:
-            if r.success:
-                print(f"[SMART] ✅ TRADE: {r.market_ticker} @ {r.price_paid_cents}¢")
+            # Find next synoptic :52
+            for h in synoptic_hours:
+                if h > hour or (h == hour and minute < 48):
+                    next_synoptic = h
+                    break
             else:
-                print(f"[SMART] ⏭️ No trade: {r.error}")
+                next_synoptic = synoptic_hours[0]  # Tomorrow's 00Z
+            
+            if next_synoptic > hour:
+                minutes_to_hot = (next_synoptic - hour - 1) * 60 + (52 - minute)
+            else:
+                minutes_to_hot = (24 - hour + next_synoptic - 1) * 60 + (52 - minute)
+            
+            if minutes_to_hot < 0:
+                minutes_to_hot += 24 * 60
+        
+        return {
+            'now_utc': now,
+            'is_prep_window': is_prep_window,
+            'is_hot_window': is_hot_window,
+            'synoptic_hour': synoptic_hour,
+            'minutes_to_hot': minutes_to_hot,
+            'current_hour': hour,
+            'current_minute': minute
+        }
     
-    # Poll targeted stations
-    poller.poll_targeted_stations(
-        stations=scan.stations_to_watch,
-        callback=on_synoptic_metar,
-        poll_interval=5,
-        max_duration=600  # 10 minutes
-    )
+    def ingest_brackets(self, state: MarketState) -> int:
+        """
+        Ingest all brackets for a station's markets.
+        Called once per day at 12:30 AM local time.
+        
+        Returns number of brackets ingested.
+        """
+        print(f"\n[INGEST] Ingesting brackets for {state.station}...")
+        
+        date_str = self._get_market_date(state.timezone)
+        count = 0
+        
+        # Ingest HIGH brackets
+        if state.high_ticker_base:
+            event_ticker = f"{state.high_ticker_base}-{date_str}"
+            try:
+                markets = self.kalshi.get_markets(event_ticker=event_ticker)
+                print(f"[INGEST] {event_ticker}: {len(markets)} brackets")
+                count += len(markets)
+            except Exception as e:
+                print(f"[INGEST] Error fetching {event_ticker}: {e}")
+        
+        # Ingest LOW brackets
+        if state.low_ticker_base:
+            event_ticker = f"{state.low_ticker_base}-{date_str}"
+            try:
+                markets = self.kalshi.get_markets(event_ticker=event_ticker)
+                print(f"[INGEST] {event_ticker}: {len(markets)} brackets")
+                count += len(markets)
+            except Exception as e:
+                print(f"[INGEST] Error fetching {event_ticker}: {e}")
+        
+        state.brackets_ingested = True
+        state.last_bracket_ingest = datetime.now(timezone.utc)
+        
+        return count
+    
+    def build_watchlist(self, state: MarketState) -> List[BracketInfo]:
+        """
+        Build watchlist of brackets with NOs under our price threshold.
+        Called at XX:48 before synoptic times.
+        """
+        print(f"\n[WATCHLIST] Building watchlist for {state.station}...")
+        
+        watchlist = []
+        date_str = self._get_market_date(state.timezone)
+        
+        for signal_type, ticker_base in [('high', state.high_ticker_base), ('low', state.low_ticker_base)]:
+            if not ticker_base:
+                continue
+                
+            event_ticker = f"{ticker_base}-{date_str}"
+            
+            try:
+                markets = self.kalshi.get_markets(event_ticker=event_ticker)
+                
+                for m in markets:
+                    no_ask_dollars = m.get('no_ask_dollars')
+                    if not no_ask_dollars:
+                        continue
+                    
+                    no_ask = int(float(no_ask_dollars) * 100)
+                    
+                    # Only add to watchlist if NO is under our threshold
+                    if no_ask <= self.max_price_cents:
+                        floor = m.get('floor_strike')
+                        cap = m.get('cap_strike')
+                        
+                        bracket = BracketInfo(
+                            ticker=m.get('ticker'),
+                            event_ticker=event_ticker,
+                            subtitle=m.get('yes_sub_title', ''),
+                            floor_strike=int(floor) if floor else None,
+                            cap_strike=int(cap) if cap else None,
+                            strike_type=m.get('strike_type', ''),
+                            signal_type=signal_type,
+                            no_ask=no_ask,
+                            station=state.station
+                        )
+                        watchlist.append(bracket)
+                        print(f"  ✓ {bracket.subtitle:<15} ({signal_type}) NO @ {no_ask}¢")
+                        
+            except Exception as e:
+                print(f"[WATCHLIST] Error: {e}")
+        
+        state.watchlist = watchlist
+        print(f"[WATCHLIST] {state.station}: {len(watchlist)} brackets under {self.max_price_cents}¢")
+        
+        return watchlist
+    
+    def check_and_trade(self, state: MarketState, metar_text: str) -> List[dict]:
+        """
+        Parse METAR, check for locked NOs, execute trades.
+        
+        Returns list of trade results.
+        """
+        results = []
+        parsed = parse_metar(metar_text)
+        
+        if not parsed.station:
+            return results
+        
+        # Check 6-hour max for HIGH markets
+        if parsed.six_hour_max_f_rounded is not None:
+            observed = parsed.six_hour_max_f_rounded
+            print(f"[TRADE] {state.station} 6hr MAX: {observed}°F")
+            
+            for bracket in state.watchlist:
+                if bracket.signal_type != 'high':
+                    continue
+                
+                # Check if NO is locked
+                is_locked = self._is_no_locked_for_high(observed, bracket)
+                
+                if is_locked and bracket.ticker not in self.executed_trades:
+                    result = self._execute_trade(bracket)
+                    results.append(result)
+        
+        # Check 6-hour min for LOW markets
+        if parsed.six_hour_min_f_rounded is not None:
+            observed = parsed.six_hour_min_f_rounded
+            print(f"[TRADE] {state.station} 6hr MIN: {observed}°F")
+            
+            for bracket in state.watchlist:
+                if bracket.signal_type != 'low':
+                    continue
+                
+                # Check if NO is locked
+                is_locked = self._is_no_locked_for_low(observed, bracket)
+                
+                if is_locked and bracket.ticker not in self.executed_trades:
+                    result = self._execute_trade(bracket)
+                    results.append(result)
+        
+        return results
+    
+    def _is_no_locked_for_high(self, observed_temp: int, bracket: BracketInfo) -> bool:
+        """Check if NO is locked for a HIGH market bracket"""
+        if bracket.strike_type == 'between':
+            # NO locked if observed > cap (already above range)
+            return bracket.cap_strike is not None and observed_temp > bracket.cap_strike
+        elif bracket.strike_type == 'less':
+            # NO locked if observed >= cap
+            return bracket.cap_strike is not None and observed_temp >= bracket.cap_strike
+        elif bracket.strike_type == 'greater':
+            # Never locked for HIGH (temp could keep rising)
+            return False
+        return False
+    
+    def _is_no_locked_for_low(self, observed_temp: int, bracket: BracketInfo) -> bool:
+        """Check if NO is locked for a LOW market bracket"""
+        if bracket.strike_type == 'between':
+            # NO locked if observed < floor (already below range)
+            return bracket.floor_strike is not None and observed_temp < bracket.floor_strike
+        elif bracket.strike_type == 'greater':
+            # NO locked if observed <= floor
+            return bracket.floor_strike is not None and observed_temp <= bracket.floor_strike
+        elif bracket.strike_type == 'less':
+            # Never locked for LOW (temp could keep dropping)
+            return False
+        return False
+    
+    def _execute_trade(self, bracket: BracketInfo) -> dict:
+        """Execute a NO trade on a locked bracket"""
+        print(f"\n[EXECUTE] 🎯 LOCKED NO: {bracket.ticker}")
+        print(f"[EXECUTE] {bracket.subtitle} @ {bracket.no_ask}¢")
+        
+        if self.dry_run:
+            print(f"[EXECUTE] 🧪 DRY RUN - Would buy NO")
+            self.executed_trades.add(bracket.ticker)
+            return {'success': True, 'dry_run': True, 'ticker': bracket.ticker}
+        
+        try:
+            # Buy NO
+            order = self.kalshi.create_order(
+                ticker=bracket.ticker,
+                side='no',
+                action='buy',
+                count=1,
+                price_cents=bracket.no_ask,
+                order_type='limit'
+            )
+            buy_id = order.get('order', {}).get('order_id')
+            print(f"[EXECUTE] ✅ Buy order: {buy_id}")
+            
+            # Hedge at 99¢
+            hedge = self.kalshi.create_order(
+                ticker=bracket.ticker,
+                side='no',
+                action='sell',
+                count=1,
+                price_cents=99,
+                order_type='limit'
+            )
+            hedge_id = hedge.get('order', {}).get('order_id')
+            print(f"[EXECUTE] 🛡️ Hedge order: {hedge_id}")
+            
+            self.executed_trades.add(bracket.ticker)
+            
+            return {
+                'success': True,
+                'ticker': bracket.ticker,
+                'buy_order': buy_id,
+                'hedge_order': hedge_id,
+                'price': bracket.no_ask
+            }
+            
+        except Exception as e:
+            print(f"[EXECUTE] ❌ Failed: {e}")
+            return {'success': False, 'error': str(e), 'ticker': bracket.ticker}
+    
+    def run(self):
+        """Main polling loop"""
+        self.running = True
+        print("\n" + "="*70)
+        print("WX SNIPER - SMART POLLER STARTED")
+        print("="*70)
+        print(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE TRADING'}")
+        print(f"Max NO price: {self.max_price_cents}¢")
+        print("="*70 + "\n")
+        
+        while self.running:
+            try:
+                synoptic = self._get_synoptic_state()
+                
+                # Status display
+                status = "🔴 WAITING"
+                if synoptic['is_hot_window']:
+                    status = "🟢 HOT WINDOW - POLLING"
+                elif synoptic['is_prep_window']:
+                    status = "🟡 PREP - CHECKING PRICES"
+                
+                # Check for bracket ingest time (12:30 AM local for each station)
+                for station, state in self.market_states.items():
+                    if self._is_bracket_ingest_time(state.timezone):
+                        if not state.brackets_ingested or (datetime.now(timezone.utc) - state.last_bracket_ingest).total_seconds() > 3600:
+                            self.ingest_brackets(state)
+                
+                # Prep window: Build watchlists
+                if synoptic['is_prep_window']:
+                    print(f"\n[STATUS] {status} ({synoptic['current_hour']:02d}:{synoptic['current_minute']:02d}Z)")
+                    for station, state in self.market_states.items():
+                        if not state.watchlist or synoptic['current_minute'] == 48:
+                            self.build_watchlist(state)
+                    time.sleep(60)  # Check every minute during prep
+                    continue
+                
+                # Hot window: Poll METARs
+                if synoptic['is_hot_window']:
+                    # Check if any station has watchlist items
+                    has_watchlist = any(state.watchlist for state in self.market_states.values())
+                    
+                    if has_watchlist:
+                        print(f"\n[STATUS] {status} ({synoptic['current_hour']:02d}:{synoptic['current_minute']:02d}Z)")
+                        
+                        for station, state in self.market_states.items():
+                            if not state.watchlist:
+                                continue
+                            
+                            # Fetch METAR
+                            metar_response = self.aviation.fetch_metar(station)
+                            if metar_response and metar_response.raw_text:
+                                metar = metar_response.raw_text
+                                print(f"[METAR] {station}: {metar[:60]}...")
+                                self.check_and_trade(state, metar)
+                        
+                        time.sleep(5)  # Poll every 5s during hot window
+                    else:
+                        print(f"[STATUS] Hot window but no watchlist items, sleeping...")
+                        time.sleep(30)
+                    continue
+                
+                # Outside windows: Sleep until next event
+                sleep_time = min(synoptic['minutes_to_hot'] * 60, 300)  # Max 5 min sleep
+                print(f"[STATUS] {status} - Next hot window in {synoptic['minutes_to_hot']} min, sleeping {sleep_time}s")
+                time.sleep(sleep_time)
+                
+            except KeyboardInterrupt:
+                print("\n[POLLER] Shutting down...")
+                self.running = False
+            except Exception as e:
+                print(f"[POLLER] Error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(60)
+    
+    def stop(self):
+        """Stop the poller"""
+        self.running = False
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="WX Sniper Smart Poller")
+    parser.add_argument("--live", action="store_true", help="Enable live trading (default is dry run)")
+    parser.add_argument("--max-price", type=int, default=93, help="Max NO price in cents (default 93)")
+    args = parser.parse_args()
+    
+    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price)
+    poller.run()
 
 
 if __name__ == "__main__":
-    # Test the pre-scan
-    from kalshi_client import KalshiClient
-    
-    kalshi = KalshiClient()
-    poller = SmartPoller(kalshi, threshold_cents=97)
-    
-    scan = poller.pre_scan_kalshi()
-    print(f"\nStations to watch: {scan.stations_to_watch}")
+    main()
