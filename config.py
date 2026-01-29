@@ -126,23 +126,71 @@ MIN_EDGE_THRESHOLD = 0.10  # Only trade if bracket price < 90 cents (10+ cent ed
 MAX_BRACKET_PRICE_CENTS = 90  # Don't buy brackets priced above 90 cents
 
 # Synoptic times (UTC hours when 6-hour groups are reported)
-# METARs drop at :53 past these hours
-# NOTE: These are ALWAYS in UTC - they don't change with DST
-SYNOPTIC_HOURS_UTC = [23, 5, 11, 17]  # 23:53, 05:53, 11:53, 17:53 UTC
+# METARs with 6-hour groups drop at ~:53 past these hours
+SYNOPTIC_HOURS_UTC = [23, 5, 11, 17]  # Actually 2353Z, 0553Z, 1153Z, 1753Z
 
-# What these mean in local time:
+# Detailed breakdown:
 # 
-# STANDARD TIME (Nov-Mar):
-#   EST (UTC-5): 6:53 PM, 12:53 AM, 6:53 AM, 12:53 PM
-#   CST (UTC-6): 5:53 PM, 11:53 PM, 5:53 AM, 11:53 AM
-#   MST (UTC-7): 4:53 PM, 10:53 PM, 4:53 AM, 10:53 AM
-#   PST (UTC-8): 3:53 PM, 9:53 PM, 3:53 AM, 9:53 AM
+# | Synoptic Period | METAR Time | Covers       |
+# |-----------------|------------|--------------|
+# | 0000Z           | ~2353Z     | 1800Z-0000Z  |
+# | 0600Z           | ~0553Z     | 0000Z-0600Z  |
+# | 1200Z           | ~1153Z     | 0600Z-1200Z  |
+# | 1800Z           | ~1753Z     | 1200Z-1800Z  |
 #
-# DAYLIGHT TIME (Mar-Nov):
-#   EDT (UTC-4): 7:53 PM, 1:53 AM, 7:53 AM, 1:53 PM
-#   CDT (UTC-5): 6:53 PM, 12:53 AM, 6:53 AM, 12:53 PM
-#   MDT (UTC-6): 5:53 PM, 11:53 PM, 5:53 AM, 11:53 AM
-#   PDT (UTC-7): 4:53 PM, 10:53 PM, 4:53 AM, 10:53 AM
+# ============================================================
+# WINTER (Standard Time, Nov - Mar)
+# ============================================================
+# EST (UTC-5):
+#   2353Z = 6:53 PM EST
+#   0553Z = 12:53 AM EST  
+#   1153Z = 6:53 AM EST
+#   1753Z = 12:53 PM EST
+#
+# CST (UTC-6):
+#   2353Z = 5:53 PM CST
+#   0553Z = 11:53 PM CST (previous day)
+#   1153Z = 5:53 AM CST
+#   1753Z = 11:53 AM CST
+#
+# MST (UTC-7):
+#   2353Z = 4:53 PM MST
+#   0553Z = 10:53 PM MST (previous day)
+#   1153Z = 4:53 AM MST
+#   1753Z = 10:53 AM MST
+#
+# PST (UTC-8):
+#   2353Z = 3:53 PM PST
+#   0553Z = 9:53 PM PST (previous day)
+#   1153Z = 3:53 AM PST
+#   1753Z = 9:53 AM PST
+#
+# ============================================================
+# SUMMER (Daylight Time, Mar - Nov)
+# ============================================================
+# EDT (UTC-4):
+#   2353Z = 7:53 PM EDT
+#   0553Z = 1:53 AM EDT
+#   1153Z = 7:53 AM EDT
+#   1753Z = 1:53 PM EDT
+#
+# CDT (UTC-5):
+#   2353Z = 6:53 PM CDT
+#   0553Z = 12:53 AM CDT
+#   1153Z = 6:53 AM CDT
+#   1753Z = 12:53 PM CDT
+#
+# MDT (UTC-6):
+#   2353Z = 5:53 PM MDT
+#   0553Z = 11:53 PM MDT (previous day)
+#   1153Z = 5:53 AM MDT
+#   1753Z = 11:53 AM MDT
+#
+# PDT (UTC-7):
+#   2353Z = 4:53 PM PDT
+#   0553Z = 10:53 PM PDT (previous day)
+#   1153Z = 4:53 AM PDT
+#   1753Z = 10:53 AM PDT
 #
 # DST CHANGES 2026:
 #   Spring forward: March 8, 2026 at 2:00 AM local
