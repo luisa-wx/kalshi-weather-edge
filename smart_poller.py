@@ -362,14 +362,20 @@ class SmartPoller:
             return bracket.cap_strike is not None and observed_temp > bracket.cap_strike
         elif bracket.strike_type == 'less':
             return bracket.cap_strike is not None and observed_temp >= bracket.cap_strike
-        return False  # 'greater' never locked for HIGH
+        # 'greater' type (e.g., "71° or above"): NO wins if high < 71
+        # But high can only go UP during the day, so NO can never be locked
+        return False
     
     def _is_no_locked_for_low(self, observed_temp: int, bracket: BracketInfo) -> bool:
         if bracket.strike_type == 'between':
             return bracket.floor_strike is not None and observed_temp < bracket.floor_strike
         elif bracket.strike_type == 'greater':
+            # "10° or above" has floor=9, NO wins if low < 10 (i.e., <= 9)
+            # NO locked if observed <= floor (temp already below threshold)
             return bracket.floor_strike is not None and observed_temp <= bracket.floor_strike
-        return False  # 'less' never locked for LOW
+        # 'less' type (e.g., "1° or below"): NO wins if low > 1
+        # But low can only go DOWN during the day, so NO can never be locked
+        return False
     
     def check_and_trade(self, state: MarketState, metar_text: str) -> List[dict]:
         results = []
