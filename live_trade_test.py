@@ -28,7 +28,6 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import Settings
 from kalshi_client import KalshiClient
 
 # Colors
@@ -239,19 +238,28 @@ def main():
     args = parser.parse_args()
     
     # Check for API credentials
-    if not os.environ.get("KALSHI_API_KEY"):
-        print(f"{RED}Error: KALSHI_API_KEY environment variable not set{RESET}")
-        print("Set it with: export KALSHI_API_KEY=your_key_here")
+    # Can use either KALSHI_API_KEY or KALSHI_API_KEY_ID
+    api_key = os.environ.get("KALSHI_API_KEY_ID") or os.environ.get("KALSHI_API_KEY")
+    if not api_key:
+        print(f"{RED}Error: KALSHI_API_KEY_ID environment variable not set{RESET}")
+        print("Set it with: export KALSHI_API_KEY_ID=your_key_id_here")
         return 1
     
-    if not os.environ.get("KALSHI_PRIVATE_KEY_PATH"):
-        print(f"{RED}Error: KALSHI_PRIVATE_KEY_PATH environment variable not set{RESET}")
-        print("Set it with: export KALSHI_PRIVATE_KEY_PATH=/path/to/key.pem")
+    # Can use either KALSHI_PRIVATE_KEY (content) or KALSHI_PRIVATE_KEY_PATH (file)
+    private_key = os.environ.get("KALSHI_PRIVATE_KEY")
+    key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    
+    if not private_key and not key_path:
+        print(f"{RED}Error: No private key found{RESET}")
+        print("Set KALSHI_PRIVATE_KEY with the key content, or")
+        print("Set KALSHI_PRIVATE_KEY_PATH with path to .pem file")
         return 1
     
-    # Initialize client
-    settings = Settings()
-    client = KalshiClient(settings)
+    print(f"  API Key ID: {api_key[:8]}...")
+    print(f"  Private Key: {'from env var' if private_key else f'from file {key_path}'}")
+    
+    # Initialize client (no Settings class needed - it reads from env/config directly)
+    client = KalshiClient()
     
     print("\n" + "="*60)
     print(f" LIVE TRADE TEST - {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S %Z')}")

@@ -99,7 +99,7 @@ def create_app():
             <strong>Status:</strong> <span id="status">Ready</span><br>
             <strong>Last Update:</strong> <span id="lastUpdate">-</span><br>
             <strong>Mode:</strong> ''' + ("DRY RUN 🧪" if dry_run else "🔴 LIVE TRADING") + '''<br>
-            <strong>Polling:</strong> Normal=60s, Hot window (:51-:58)=5s
+            <strong>Polling:</strong> Normal=60s, Hot window (:52-:02)=5s
         </div>
         
         <script>
@@ -641,7 +641,7 @@ def run_hybrid_server(host: str = "0.0.0.0", port: int = 5000, dry_run: bool = T
         
         print(f"[POLL] Starting adaptive polling:")
         print(f"       Normal: every {POLL_INTERVAL_NORMAL_SECONDS}s")
-        print(f"       Hot window (:51-:58 on synoptic hours): every {POLL_INTERVAL_HOT_SECONDS}s")
+        print(f"       Hot window (:52-:02 on synoptic hours): every {POLL_INTERVAL_HOT_SECONDS}s")
         
         while True:
             try:

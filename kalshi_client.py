@@ -25,7 +25,7 @@ class KalshiClient:
         self.private_key = self._load_private_key()
         
     def _load_private_key(self):
-        """Load RSA private key from PEM string"""
+        """Load RSA private key from PEM string or raw base64"""
         key_str = KALSHI_PRIVATE_KEY
         
         # Debug: print first/last chars to diagnose
@@ -38,23 +38,29 @@ class KalshiClient:
         if '\\r' in key_str:
             key_str = key_str.replace('\\r', '')
             
-        # If key doesn't start with proper header, it might be base64 only
+        # If key doesn't start with proper header, it's raw base64
         if not key_str.strip().startswith('-----BEGIN'):
-            # Try wrapping as RSA private key
-            key_str = f"-----BEGIN RSA PRIVATE KEY-----\n{key_str.strip()}\n-----END RSA PRIVATE KEY-----"
+            # Remove any spaces (common when copying from env vars)
+            key_clean = key_str.replace(' ', '').replace('\n', '').replace('\t', '').strip()
+            
+            # Build proper PEM format with 64-char lines
+            pem_lines = ["-----BEGIN RSA PRIVATE KEY-----"]
+            for i in range(0, len(key_clean), 64):
+                pem_lines.append(key_clean[i:i+64])
+            pem_lines.append("-----END RSA PRIVATE KEY-----")
+            key_str = '\n'.join(pem_lines)
+        else:
+            # Already has headers - ensure proper line breaks
+            lines = key_str.strip().split('\n')
+            if len(lines) == 3:  # Header, single long line, footer
+                header = lines[0]
+                body = lines[1].replace(' ', '')  # Remove any spaces
+                footer = lines[2]
+                # Split body into 64-char lines
+                body_lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                key_str = header + '\n' + '\n'.join(body_lines) + '\n' + footer
         
-        # Ensure proper line breaks in PEM (every 64 chars)
-        # This helps if the key was pasted without line breaks
-        lines = key_str.strip().split('\n')
-        if len(lines) == 3:  # Header, single long line, footer
-            header = lines[0]
-            body = lines[1]
-            footer = lines[2]
-            # Split body into 64-char lines
-            body_lines = [body[i:i+64] for i in range(0, len(body), 64)]
-            key_str = header + '\n' + '\n'.join(body_lines) + '\n' + footer
-        
-        print(f"[KALSHI] Processed key starts with: {key_str[:80]}...")
+        print(f"[KALSHI] Processed key (first 100 chars): {key_str[:100]}...")
         
         try:
             return serialization.load_pem_private_key(
@@ -87,7 +93,9 @@ class KalshiClient:
     def _make_request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
         """Make authenticated request to Kalshi API"""
         timestamp_ms = int(time.time() * 1000)
-        path = endpoint
+        
+        # IMPORTANT: Signature must include the full path with /trade-api/v2 prefix
+        sign_path = f"/trade-api/v2{endpoint}"
         
         # Build full URL
         url = f"{self.base_url}{endpoint}"
@@ -95,11 +103,11 @@ class KalshiClient:
         # Add query params to path for signature if present
         if params:
             query_string = "&".join(f"{k}={v}" for k, v in params.items())
-            path = f"{endpoint}?{query_string}"
-            url = f"{self.base_url}{path}"
+            sign_path = f"/trade-api/v2{endpoint}?{query_string}"
+            url = f"{self.base_url}{endpoint}?{query_string}"
         
-        # Create signature
-        signature = self._sign_request(timestamp_ms, method.upper(), path)
+        # Create signature with full path
+        signature = self._sign_request(timestamp_ms, method.upper(), sign_path)
         
         headers = {
             "KALSHI-ACCESS-KEY": self.api_key_id,
