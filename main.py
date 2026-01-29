@@ -183,6 +183,60 @@ def create_app():
             }
         })
     
+    @app.route('/api/discover')
+    def api_discover():
+        """Discover Kalshi temperature market tickers"""
+        from kalshi_client import KalshiClient
+        
+        results = {}
+        try:
+            client = KalshiClient()
+            
+            # Search for temperature markets
+            search_terms = ['HIGHTSFO', 'HIGHTLV', 'HIGHNY', 'KXHIGH', 'temperature', 'temp']
+            
+            for term in search_terms:
+                try:
+                    events = client.get_events(series_ticker=term, limit=5)
+                    if events:
+                        results[term] = []
+                        for event in events[:3]:
+                            event_info = {
+                                'event_ticker': event.get('event_ticker'),
+                                'title': event.get('title'),
+                                'markets': []
+                            }
+                            # Get markets for this event
+                            markets = event.get('markets', [])
+                            for m in markets[:5]:
+                                event_info['markets'].append({
+                                    'ticker': m.get('ticker'),
+                                    'subtitle': m.get('yes_sub_title', m.get('subtitle')),
+                                    'yes_bid': m.get('yes_bid'),
+                                    'yes_ask': m.get('yes_ask')
+                                })
+                            results[term].append(event_info)
+                except Exception as e:
+                    results[term] = f"Error: {str(e)}"
+            
+            # Also try to get markets directly
+            try:
+                all_markets = client.get_markets(limit=50)
+                temp_markets = [m for m in all_markets if 'temp' in m.get('ticker', '').lower() or 'high' in m.get('ticker', '').lower()]
+                results['direct_market_search'] = [
+                    {'ticker': m.get('ticker'), 'title': m.get('title', m.get('yes_sub_title', ''))} 
+                    for m in temp_markets[:20]
+                ]
+            except Exception as e:
+                results['direct_market_search'] = f"Error: {str(e)}"
+                
+        except Exception as e:
+            results['error'] = str(e)
+        
+        return jsonify(results)
+    
+    # Note: /health route is defined in twilio_handler.py's create_webhook_app()
+    
     # Background polling thread
     def poll_aviation_weather():
         """Poll aviationweather.gov with adaptive rate"""
