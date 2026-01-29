@@ -1,1 +1,1 @@
-web: python run.py
+worker: python3 smart_poller.py --live
