@@ -143,6 +143,13 @@ def parse_metar(metar_text: str) -> MetarTemps:
     
     # Clean up the METAR text
     metar_text = metar_text.strip().upper()
+    
+    # Remove "METAR" or "SPECI" prefix if present
+    if metar_text.startswith("METAR "):
+        metar_text = metar_text[6:]
+    elif metar_text.startswith("SPECI "):
+        metar_text = metar_text[6:]
+    
     parts = metar_text.split()
     
     if not parts:
