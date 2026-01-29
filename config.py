@@ -122,8 +122,8 @@ STATIONS = {
 
 # Trading Configuration
 MAX_TRADE_AMOUNT_CENTS = 200  # $2 max per trade
-MIN_EDGE_THRESHOLD = 0.10  # Only trade if bracket price < 90 cents (10+ cent edge)
-MAX_BRACKET_PRICE_CENTS = 90  # Don't buy brackets priced above 90 cents
+MIN_EDGE_THRESHOLD = 0.07  # Only trade if bracket price < 93 cents (7+ cent edge)
+MAX_BRACKET_PRICE_CENTS = 93  # Don't buy brackets priced above 93 cents
 
 # Synoptic times (UTC hours when 6-hour groups are reported)
 # METARs with 6-hour groups drop at ~:53 past these hours
