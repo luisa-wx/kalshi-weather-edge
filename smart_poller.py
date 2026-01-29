@@ -52,6 +52,20 @@ class SmartPoller:
     # METARs drop at :53 of these hours (UTC)
     SYNOPTIC_HOURS = [5, 11, 17, 23]  # SORTED for loop logic
     
+    # At certain synoptic times, some markets span midnight and we can't trade them
+    # because the 6hr min/max might include previous day's temps
+    # 
+    # 11Z (6:53 AM EST) - 6hr period is ~06Z-12Z:
+    #   EST (UTC-5): 1AM-7AM = same day ✅
+    #   CST (UTC-6): 12AM-6AM = same day ✅
+    #   MST (UTC-7): 11PM-5AM = spans midnight ❌
+    #   PST (UTC-8): 10PM-4AM = spans midnight ❌
+    #
+    # For now, only restrict 11Z. Other windows need analysis for DST.
+    EXCLUDED_STATIONS_BY_HOUR = {
+        11: ['KLAX', 'KSFO', 'KSEA', 'KLAS', 'KDEN'],  # PST + MST
+    }
+    
     def __init__(self, dry_run: bool = True, max_price_cents: int = 93):
         self.dry_run = dry_run
         self.max_price_cents = max_price_cents
@@ -315,11 +329,22 @@ class SmartPoller:
                 if s['is_hot_window']:
                     has_watchlist = any(st.watchlist for st in self.market_states.values())
                     
+                    # Determine which synoptic hour we're in
+                    current_synoptic = s['current_hour'] if s['current_minute'] >= 52 else (s['current_hour'] - 1) % 24
+                    excluded = self.EXCLUDED_STATIONS_BY_HOUR.get(current_synoptic, [])
+                    
                     if has_watchlist:
                         print(f"\n[{now_str}] 🟢 HOT - Polling METARs")
+                        if excluded:
+                            print(f"[{now_str}] ⚠️ Excluding {excluded} (midnight span)")
                         
                         for station, state in self.market_states.items():
                             if not state.watchlist:
+                                continue
+                            
+                            # Skip stations that span midnight at this synoptic time
+                            if station in excluded:
+                                print(f"[METAR] {station} ⏭️ SKIPPED (midnight span)")
                                 continue
                             
                             resp = self.aviation.fetch_metar(station)
