@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import re
 
-from metar_parser import parse_metar, ParsedMETAR
+from metar_parser import parse_metar, MetarTemps
 from kalshi_client import KalshiClient
 from config import STATIONS
 
@@ -137,38 +137,45 @@ class WXSniper:
         
         return results
     
-    def _get_market_date(self, parsed: ParsedMETAR) -> str:
+    def _get_market_date(self, parsed: MetarTemps) -> str:
         """
         Get the market date string (e.g., '29JAN26') for a METAR.
         
         CRITICAL: Kalshi markets are in LOCAL TIME, METARs are in UTC!
-        We need to convert based on station timezone.
+        We need to convert based on station timezone WITH DST AWARENESS.
         """
+        try:
+            from zoneinfo import ZoneInfo  # Python 3.9+
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo  # Fallback
+        
         if parsed.observation_time:
-            obs_utc = parsed.observation_time
+            # Make sure it's UTC aware
+            obs_utc = parsed.observation_time.replace(tzinfo=ZoneInfo('UTC'))
         else:
+            from datetime import datetime, timezone
             obs_utc = datetime.now(timezone.utc)
         
-        # Get station timezone offset (simplified - should use proper tz)
-        # Most US stations are UTC-5 to UTC-8
-        station_offsets = {
-            'KSFO': -8,  # PST
-            'KLAS': -8,  # PST  
-            'KSEA': -8,  # PST
-            'KLAX': -8,  # PST
-            'KDEN': -7,  # MST
-            'KAUS': -6,  # CST
-            'KMDW': -6,  # CST
-            'KMSY': -6,  # CST
-            'KNYC': -5,  # EST (Note: usually KJFK, KLGA, KNYC)
-            'KJFK': -5,  # EST
-            'KPHL': -5,  # EST
-            'KMIA': -5,  # EST
-            'KDCA': -5,  # EST
+        # Station timezone mapping (IANA timezone names handle DST automatically)
+        station_timezones = {
+            'KSFO': 'America/Los_Angeles',
+            'KLAS': 'America/Los_Angeles',
+            'KSEA': 'America/Los_Angeles',
+            'KLAX': 'America/Los_Angeles',
+            'KDEN': 'America/Denver',
+            'KAUS': 'America/Chicago',
+            'KMDW': 'America/Chicago',
+            'KMSY': 'America/Chicago',
+            'KNYC': 'America/New_York',
+            'KJFK': 'America/New_York',
+            'KPHL': 'America/New_York',
+            'KMIA': 'America/New_York',
+            'KDCA': 'America/New_York',
         }
         
-        offset_hours = station_offsets.get(parsed.station, -5)  # Default EST
-        local_time = obs_utc + timedelta(hours=offset_hours)
+        tz_name = station_timezones.get(parsed.station, 'America/New_York')
+        local_tz = ZoneInfo(tz_name)
+        local_time = obs_utc.astimezone(local_tz)
         
         # Format as Kalshi expects: 29JAN26 (day + month + 2-digit year)
         return local_time.strftime("%d%b%y").upper()

@@ -126,7 +126,27 @@ MIN_EDGE_THRESHOLD = 0.10  # Only trade if bracket price < 90 cents (10+ cent ed
 MAX_BRACKET_PRICE_CENTS = 90  # Don't buy brackets priced above 90 cents
 
 # Synoptic times (UTC hours when 6-hour groups are reported)
-SYNOPTIC_HOURS_UTC = [0, 6, 12, 18]
+# METARs drop at :53 past these hours
+# NOTE: These are ALWAYS in UTC - they don't change with DST
+SYNOPTIC_HOURS_UTC = [23, 5, 11, 17]  # 23:53, 05:53, 11:53, 17:53 UTC
+
+# What these mean in local time:
+# 
+# STANDARD TIME (Nov-Mar):
+#   EST (UTC-5): 6:53 PM, 12:53 AM, 6:53 AM, 12:53 PM
+#   CST (UTC-6): 5:53 PM, 11:53 PM, 5:53 AM, 11:53 AM
+#   MST (UTC-7): 4:53 PM, 10:53 PM, 4:53 AM, 10:53 AM
+#   PST (UTC-8): 3:53 PM, 9:53 PM, 3:53 AM, 9:53 AM
+#
+# DAYLIGHT TIME (Mar-Nov):
+#   EDT (UTC-4): 7:53 PM, 1:53 AM, 7:53 AM, 1:53 PM
+#   CDT (UTC-5): 6:53 PM, 12:53 AM, 6:53 AM, 12:53 PM
+#   MDT (UTC-6): 5:53 PM, 11:53 PM, 5:53 AM, 11:53 AM
+#   PDT (UTC-7): 4:53 PM, 10:53 PM, 4:53 AM, 10:53 AM
+#
+# DST CHANGES 2026:
+#   Spring forward: March 8, 2026 at 2:00 AM local
+#   Fall back: November 1, 2026 at 2:00 AM local
 
 # SMS polling configuration (for manual forward approach)
 SMS_POLL_START_SECONDS_BEFORE = 90  # Start polling 1.5 min before :53
