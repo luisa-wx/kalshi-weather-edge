@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-WX Sniper v4.0 - Corrected and Audited
-======================================
+WX Sniper v4.1 - Bug Fixes
+==========================
+
+Changes from v4.0:
+- Fixed metar_data reference bug (variable didn't exist in context)
+- Added immediate METAR poll on startup so dashboard shows data right away
+- Fixed price parsing to show 0¢ instead of 100¢ for missing data
 
 STRATEGY SUMMARY:
 We're a LATENCY SNIPER. When a METAR drops showing a new temperature reading,
@@ -598,20 +603,25 @@ class WXSniper:
         """Parse price from Kalshi API response."""
         if price_dollars:
             try:
-                return int(float(price_dollars) * 100)
+                val = int(float(price_dollars) * 100)
+                if val > 0:
+                    return val
             except:
                 pass
         if price_raw is not None:
             try:
                 if isinstance(price_raw, str):
-                    return int(float(price_raw) * 100)
+                    val = int(float(price_raw) * 100)
                 elif price_raw < 2:
-                    return int(price_raw * 100)
+                    val = int(price_raw * 100)
                 else:
-                    return int(price_raw)
+                    val = int(price_raw)
+                if val > 0:
+                    return val
             except:
                 pass
-        return 100
+        # Return 0 to indicate "no data" - display will show 0¢
+        return 0
     
     def fetch_historical_temps(self):
         """Fetch historical METARs to get accurate daily high/low."""
@@ -804,31 +814,22 @@ class WXSniper:
                 state.latest_metar = raw
                 
                 # Parse observation time from METAR string (e.g., "301853Z" = day 30, 18:53 UTC)
-                # Or use API's obsTime field
-                obs_time_str = metar_data.get('obsTime') or metar_data.get('reportTime')
-                if obs_time_str:
+                # Match pattern like "301853Z" (DDHHMMZ)
+                time_match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', raw)
+                if time_match:
+                    day = int(time_match.group(1))
+                    hour = int(time_match.group(2))
+                    minute = int(time_match.group(3))
+                    # Use current year/month, adjust day
+                    now_utc = datetime.now(timezone.utc)
                     try:
-                        # API returns ISO format like "2026-01-30T18:53:00Z"
-                        state.metar_time = datetime.fromisoformat(obs_time_str.replace('Z', '+00:00'))
-                    except:
-                        pass
-                
-                # Fallback: parse from raw METAR string if API time not available
-                if state.metar_time is None or obs_time_str is None:
-                    import re
-                    # Match pattern like "301853Z" (DDHHMMZ)
-                    time_match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', raw)
-                    if time_match:
-                        day = int(time_match.group(1))
-                        hour = int(time_match.group(2))
-                        minute = int(time_match.group(3))
-                        # Use current year/month, adjust day
-                        now_utc = datetime.now(timezone.utc)
-                        try:
-                            state.metar_time = now_utc.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
-                        except ValueError:
-                            # Day might be from previous month
-                            state.metar_time = now_utc
+                        state.metar_time = now_utc.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
+                    except ValueError:
+                        # Day might be from previous month - use now as fallback
+                        state.metar_time = now_utc
+                else:
+                    # No time found in METAR, use current time
+                    state.metar_time = datetime.now(timezone.utc)
                 
                 # Track changes
                 old_high = state.observed_high
@@ -1018,7 +1019,7 @@ class WXSniper:
     def run(self):
         """Main entry point."""
         print("=" * 60)
-        print("WX SNIPER v4.0 - CORRECTED & AUDITED")
+        print("WX SNIPER v4.1 - BUG FIXES")
         print("=" * 60)
         print(f"Mode: {'LIVE 🔴' if self.live_mode else 'DRY RUN 🧪'}")
         print(f"Max price: {self.max_price}¢")
@@ -1033,6 +1034,10 @@ class WXSniper:
         self.init_watchlists()
         self.fetch_historical_temps()
         self.prune_watchlists()
+        
+        # Do an immediate METAR poll so dashboard has data right away
+        print("\n[INIT] Initial METAR poll...")
+        self.poll_and_snipe()
         
         print("\n[RUNNING] Starting main loop...")
         last_price_refresh = time.time()
@@ -1109,7 +1114,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>WX Sniper v4.0</title>
+<title>WX Sniper v4.1</title>
 <meta http-equiv="refresh" content="{'10' if is_hot else '30'}">
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 20px; }}
@@ -1138,7 +1143,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
 .current-temp {{ font-size: 18px; color: #f0f6fc; }}
 </style>
 </head><body>
-<h1>&#127919; WX Sniper v4.0</h1>
+<h1>&#127919; WX Sniper v4.1</h1>
 <p>
     Mode: <strong>{"LIVE &#128308;" if s.live_mode else "DRY RUN &#129514;"}</strong> |
     Max price: <strong>{s.max_price}&#162;</strong> |
