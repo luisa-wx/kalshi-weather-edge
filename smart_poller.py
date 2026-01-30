@@ -744,12 +744,12 @@ body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-se
 h1 {{ color: #58a6ff; }}
 h2 {{ color: #8b949e; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-top: 30px; }}
 h3 {{ color: #58a6ff; margin-top: 20px; }}
-table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+table {{ border-collapse: collapse; width: 100%; max-width: 700px; margin: 10px 0; }}
 th, td {{ padding: 6px 10px; text-align: left; border: 1px solid #30363d; }}
 th {{ background: #161b22; }}
-.dead {{ color: #f85149; }}
+.dead {{ color: #6e7681; }}
 .locked {{ color: #3fb950; }}
-.open {{ color: #d29922; }}
+.open {{ color: #3fb950; font-weight: bold; }}
 .hot {{ background: #3d1c1c; padding: 5px 10px; border-radius: 4px; }}
 .snipe {{ background: #1c3d1c; }}
 .metar {{ font-family: monospace; font-size: 11px; color: #8b949e; }}
@@ -758,6 +758,9 @@ th {{ background: #161b22; }}
 .stat {{ background: #161b22; padding: 10px 15px; border-radius: 6px; }}
 .stat-value {{ font-size: 24px; font-weight: bold; color: #58a6ff; }}
 .stat-label {{ font-size: 12px; color: #8b949e; }}
+.resolved-row {{ opacity: 0.6; }}
+details {{ margin: 10px 0; }}
+summary {{ cursor: pointer; color: #8b949e; }}
 </style>
 </head><body>
 <h1>&#127919; WX Sniper v3.8</h1>
@@ -830,42 +833,65 @@ th {{ background: #161b22; }}
             # HIGH watchlist
             if state.high_watchlist:
                 html += '<p><strong>HIGH Watchlist:</strong></p>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th></tr>'
+                html += '''<table>
+                <tr>
+                    <th style="width:180px">Bracket</th>
+                    <th style="width:70px;text-align:right">Floor</th>
+                    <th style="width:70px;text-align:right">Cap</th>
+                    <th style="width:80px;text-align:right">NO Ask</th>
+                    <th style="width:80px;text-align:right">YES Ask</th>
+                    <th style="width:80px;text-align:center">Status</th>
+                </tr>'''
                 for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike or 0, reverse=True):
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "&#8212;"}</td>
-                        <td>{b.cap_strike or "&#8212;"}</td>
-                        <td>{b.no_ask}&#162;</td>
-                        <td>{b.yes_ask}&#162;</td>
+                        <td style="text-align:right">{b.floor_strike or "&#8212;"}</td>
+                        <td style="text-align:right">{b.cap_strike or "&#8212;"}</td>
+                        <td style="text-align:right">{b.no_ask}&#162;</td>
+                        <td style="text-align:right">{b.yes_ask}&#162;</td>
+                        <td style="text-align:center" class="open">OPEN</td>
                     </tr>'''
                 html += '</table>'
             
             # LOW watchlist
             if state.low_watchlist:
                 html += '<p><strong>LOW Watchlist:</strong></p>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th></tr>'
+                html += '''<table>
+                <tr>
+                    <th style="width:180px">Bracket</th>
+                    <th style="width:70px;text-align:right">Floor</th>
+                    <th style="width:70px;text-align:right">Cap</th>
+                    <th style="width:80px;text-align:right">NO Ask</th>
+                    <th style="width:80px;text-align:right">YES Ask</th>
+                    <th style="width:80px;text-align:center">Status</th>
+                </tr>'''
                 for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike or 999):
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "&#8212;"}</td>
-                        <td>{b.cap_strike or "&#8212;"}</td>
-                        <td>{b.no_ask}&#162;</td>
-                        <td>{b.yes_ask}&#162;</td>
+                        <td style="text-align:right">{b.floor_strike or "&#8212;"}</td>
+                        <td style="text-align:right">{b.cap_strike or "&#8212;"}</td>
+                        <td style="text-align:right">{b.no_ask}&#162;</td>
+                        <td style="text-align:right">{b.yes_ask}&#162;</td>
+                        <td style="text-align:center" class="open">OPEN</td>
                     </tr>'''
                 html += '</table>'
             
             # Show resolved brackets (collapsed by default)
             if state.resolved_brackets:
                 html += f'<details><summary>Resolved ({len(state.resolved_brackets)})</summary>'
-                html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                html += '''<table>
+                <tr>
+                    <th style="width:180px">Bracket</th>
+                    <th style="width:80px;text-align:center">Status</th>
+                    <th style="width:80px;text-align:center">Traded?</th>
+                </tr>'''
                 for b in state.resolved_brackets[-20:]:
                     status_class = "locked" if b.status == 'locked' else "dead"
                     traded = "&#9989;" if b.traded else "&#8212;"
-                    html += f'''<tr>
-                        <td>{b.subtitle}</td>
-                        <td class="{status_class}">{b.status.upper()}</td>
-                        <td>{traded}</td>
+                    html += f'''<tr class="resolved-row">
+                        <td style="color:#6e7681">{b.subtitle}</td>
+                        <td style="text-align:center" class="{status_class}">{b.status.upper()}</td>
+                        <td style="text-align:center">{traded}</td>
                     </tr>'''
                 html += '</table></details>'
         
