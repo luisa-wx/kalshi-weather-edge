@@ -278,54 +278,80 @@ class WXSniper:
         self.last_price_poll = datetime.now(timezone.utc)
     
     def fetch_historical_temps(self):
-        """Fetch historical METARs to get accurate daily high/low."""
+        """
+        Fetch historical METARs to get accurate daily high/low.
+        Uses batched request to minimize API calls.
+        """
         print(f"[INIT] Fetching historical temps...")
         
-        for station, state in self.states.items():
-            try:
+        # Calculate hours needed (from midnight local to now)
+        # Use max across all stations to be safe
+        max_hours = 1
+        for station in self.states.keys():
+            cfg = STATIONS.get(station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            tz = ZoneInfo(tz_name)
+            now_local = datetime.now(tz)
+            hours = max(1, now_local.hour + 1)
+            max_hours = max(max_hours, hours)
+        
+        # BATCHED REQUEST: All stations in one API call
+        try:
+            ids_param = ','.join(self.states.keys())
+            url = f"https://aviationweather.gov/api/data/metar?ids={ids_param}&format=json&hours={max_hours}"
+            headers = {'User-Agent': 'WXSniper/3.8 (weather-trading-bot)'}
+            
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                print(f"  [HIST] HTTP {resp.status_code}")
+                return
+            
+            metars = resp.json()
+            if not isinstance(metars, list):
+                metars = [metars] if metars else []
+            
+            # Initialize all states
+            for station, state in self.states.items():
                 cfg = STATIONS.get(station, {})
                 tz_name = cfg.get('timezone', 'America/New_York')
                 tz = ZoneInfo(tz_name)
-                
-                now_local = datetime.now(tz)
-                hours = max(1, now_local.hour + 1)
-                
-                url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours={hours}"
-                resp = requests.get(url, timeout=15)
-                if resp.status_code != 200:
-                    continue
-                
-                state.current_local_date = now_local.strftime('%Y-%m-%d')
+                state.current_local_date = datetime.now(tz).strftime('%Y-%m-%d')
                 state.observed_high = None
                 state.observed_low = None
+            
+            # Process all METARs
+            for metar_data in metars:
+                station = metar_data.get('icaoId') or metar_data.get('stationId')
+                if not station or station not in self.states:
+                    continue
                 
-                for line in resp.text.strip().split('\n'):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    parsed = parse_metar(line)
-                    
-                    if parsed.temp_f is not None:
-                        if state.observed_high is None or parsed.temp_f > state.observed_high:
-                            state.observed_high = parsed.temp_f
-                        if state.observed_low is None or parsed.temp_f < state.observed_low:
-                            state.observed_low = parsed.temp_f
-                    
-                    if parsed.six_hr_max_c is not None:
-                        max_f = c_to_f_nws(parsed.six_hr_max_c)
-                        if state.observed_high is None or max_f > state.observed_high:
-                            state.observed_high = max_f
-                    
-                    if parsed.six_hr_min_c is not None:
-                        min_f = c_to_f_nws(parsed.six_hr_min_c)
-                        if state.observed_low is None or min_f < state.observed_low:
-                            state.observed_low = min_f
+                state = self.states[station]
+                raw = metar_data.get('rawOb', '')
                 
+                parsed = parse_metar(raw)
+                
+                if parsed.temp_f is not None:
+                    if state.observed_high is None or parsed.temp_f > state.observed_high:
+                        state.observed_high = parsed.temp_f
+                    if state.observed_low is None or parsed.temp_f < state.observed_low:
+                        state.observed_low = parsed.temp_f
+                
+                if parsed.six_hr_max_c is not None:
+                    max_f = c_to_f_nws(parsed.six_hr_max_c)
+                    if state.observed_high is None or max_f > state.observed_high:
+                        state.observed_high = max_f
+                
+                if parsed.six_hr_min_c is not None:
+                    min_f = c_to_f_nws(parsed.six_hr_min_c)
+                    if state.observed_low is None or min_f < state.observed_low:
+                        state.observed_low = min_f
+            
+            # Print results
+            for station, state in self.states.items():
                 print(f"  [{station}] HIGH={state.observed_high}°F LOW={state.observed_low}°F")
-                
-            except Exception as e:
-                print(f"  [{station}] Error: {e}")
+            
+        except Exception as e:
+            print(f"  [HIST] Batch fetch error: {e}")
     
     def prune_watchlists(self):
         """
@@ -370,22 +396,57 @@ class WXSniper:
         """
         Fetch METARs, update observations, detect transitions, execute snipes.
         This is the hot loop.
+        
+        IMPORTANT: Uses batched request to stay under 100 req/min limit.
+        One request fetches all stations at once.
         """
-        for station, state in self.states.items():
-            # Skip if nothing to watch
-            if not state.high_watchlist and not state.low_watchlist:
-                continue
+        # Get list of stations still being watched
+        active_stations = [
+            station for station, state in self.states.items()
+            if state.high_watchlist or state.low_watchlist
+        ]
+        
+        if not active_stations:
+            return
+        
+        # BATCHED REQUEST: All stations in one API call
+        try:
+            ids_param = ','.join(active_stations)
+            url = f"https://aviationweather.gov/api/data/metar?ids={ids_param}&format=json"
+            headers = {'User-Agent': 'WXSniper/3.8 (weather-trading-bot)'}
             
-            try:
-                metar = self.weather.fetch_metar(station)
-                if not metar:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 204:
+                return  # No data
+            if resp.status_code != 200:
+                print(f"  [METAR] HTTP {resp.status_code}")
+                return
+            
+            metars = resp.json()
+            if not isinstance(metars, list):
+                metars = [metars]
+            
+            # Process each METAR
+            for metar_data in metars:
+                station = metar_data.get('icaoId') or metar_data.get('stationId')
+                if not station or station not in self.states:
                     continue
                 
-                raw = metar.raw_text if hasattr(metar, 'raw_text') else str(metar)
+                state = self.states[station]
+                raw = metar_data.get('rawOb', '')
+                
                 parsed = parse_metar(raw)
                 
                 state.latest_metar = raw
-                state.metar_time = metar.observation_time if hasattr(metar, 'observation_time') else datetime.now(timezone.utc)
+                # Parse observation time
+                obs_time_str = metar_data.get('obsTime') or metar_data.get('reportTime')
+                if obs_time_str:
+                    try:
+                        state.metar_time = datetime.fromisoformat(obs_time_str.replace('Z', '+00:00'))
+                    except:
+                        state.metar_time = datetime.now(timezone.utc)
+                else:
+                    state.metar_time = datetime.now(timezone.utc)
                 
                 # Track if observations changed
                 old_high = state.observed_high
@@ -418,9 +479,9 @@ class WXSniper:
                     
                     # Check for transitions and snipe!
                     self._check_transitions(state)
-                
-            except Exception as e:
-                print(f"  [{station}] Poll error: {e}")
+        
+        except Exception as e:
+            print(f"  [METAR] Batch poll error: {e}")
         
         self.last_metar_poll = datetime.now(timezone.utc)
     
@@ -594,32 +655,39 @@ class WXSniper:
         # Initialize
         print("\n[STARTUP]")
         self.init_watchlists()
+        time.sleep(1)  # Rate limit pause
         self.fetch_historical_temps()
         self.prune_watchlists()
         
         # Main loop
+        # API limits: 100 req/min total, 1 req/min per endpoint recommended
+        # Our batched approach: 1 METAR request for ALL stations
+        # Hot window: poll every 10s = 6 req/min (safe)
+        # Normal: poll every 60s = 1 req/min (safe)
         print("\n[RUNNING] Sniper active...")
+        print("[RATE LIMITS] Using batched requests: ~6 req/min hot, ~1 req/min normal")
+        
         while True:
             try:
                 now = datetime.now(timezone.utc)
                 minute = now.minute
                 
-                # Hot window: :52-:02 - poll fast
+                # Hot window: :52-:02 - poll every 10s (6 req/min)
                 if minute >= 52 or minute <= 2:
                     self.poll_and_snipe()
-                    time.sleep(5)  # Poll every 5s
+                    time.sleep(10)
                 
                 # Prep window: :50-:51 - refresh prices
                 elif minute in (50, 51):
-                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 120:
+                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 60:
                         self.refresh_prices()
-                    time.sleep(10)
+                    time.sleep(15)
                 
-                # Normal time - light polling
+                # Normal time - light polling (every 60s)
                 else:
-                    if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 300:
+                    if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 60:
                         self.poll_and_snipe()
-                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 600:
+                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 300:
                         self.refresh_prices()
                     time.sleep(30)
                     
