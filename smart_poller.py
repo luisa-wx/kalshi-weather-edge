@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-WX Sniper - Smart Poller v3.3 (FIXED)
+WX Sniper - Smart Poller v3.4
 
-FIXES in this version:
-1. Line ~430: Corrected lock logic for 'greater' type on LOW markets
-   - OLD (WRONG): observed <= bracket.floor_strike  
-   - NEW (CORRECT): observed < bracket.floor_strike (hard lock), == floor (soft lock)
-   
-2. Lines ~460, ~500: Use nws_round() instead of Python round()
-   - NWS uses "round half away from zero" (symmetric rounding)
-   - Python uses "round half to even" (banker's rounding)
+NEW IN v3.4:
+- YES logic for edge brackets (lowest "X or below", highest "X or above")
+- When temp hits the edge bracket, YES is locked because there's nowhere else to go
 
-Schedule:
-- XX:48 → Build watchlist (check prices)
-- XX:52-:02 → Poll METARs every 5s, execute trades
-- Rest of time → Sleep
+FIXES from v3.3:
+- Corrected lock logic for 'greater' type on LOW markets
+- Use nws_round() instead of Python round()
+
+Edge bracket examples:
+- LOW "6° or below" at 6°F → YES locked (can't go lower than lowest bracket)
+- HIGH "85° or above" at 85°F → YES locked (can't go higher than highest bracket)
 """
 
 import os
@@ -40,10 +38,7 @@ OVERRIDES_FILE = "lock_overrides.json"
 
 
 def nws_round(value: float) -> int:
-    """
-    NWS-style rounding: round half away from zero (symmetric rounding).
-    Python's round() uses banker's rounding which differs for .5 values.
-    """
+    """NWS-style rounding: round half away from zero."""
     if value >= 0:
         return int(math.floor(value + 0.5))
     else:
@@ -189,8 +184,10 @@ table {{ border-collapse: collapse; margin: 10px 0; }}
 th, td {{ border: 1px solid #444; padding: 8px; text-align: left; }}
 th {{ background: #333; }}
 .cheap {{ color: #ffaa00; }}
+.yes {{ color: #00ff88; }}
+.no {{ color: #ff4444; }}
 </style></head><body>
-<h1>🎯 WX Sniper v3.3 (FIXED)</h1>
+<h1>🎯 WX Sniper v3.4 (YES+NO)</h1>
 <p>Mode: {"LIVE 💰" if p.live_mode else "DRY RUN 🧪"} | Hourly: {"YES" if p.hourly_mode else "NO"} | Max: {p.max_no_price}¢</p>
 <p>Time: {now.strftime("%Y-%m-%d %H:%M:%SZ")}</p>
 <p><a href="/config" style="color: #00ff88;">⚙️ Configure Lock Overrides</a></p>
@@ -200,9 +197,10 @@ th {{ background: #333; }}
         for station, state in p.market_states.items():
             if not state.watchlist:
                 continue
-            html += f"<h3>{station}</h3><table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>Floor</th><th>Cap</th></tr>"
+            html += f"<h3>{station}</h3><table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Floor</th><th>Cap</th><th>Edge?</th></tr>"
             for b in state.watchlist:
-                html += f'<tr><td>{b.subtitle}</td><td>{b.signal_type.upper()}</td><td class="{"cheap" if b.no_ask<=70 else ""}">{b.no_ask}¢</td><td>{b.floor_strike or "-"}</td><td>{b.cap_strike or "-"}</td></tr>'
+                edge = "🎯" if b.is_edge_bracket else ""
+                html += f'<tr><td>{b.subtitle}</td><td>{b.signal_type.upper()}</td><td class="no">{b.no_ask}¢</td><td class="yes">{b.yes_ask}¢</td><td>{b.floor_strike or "-"}</td><td>{b.cap_strike or "-"}</td><td>{edge}</td></tr>'
             html += "</table>"
         
         if p.latest_metars:
@@ -212,12 +210,13 @@ th {{ background: #333; }}
             html += "</table>"
         
         if p.trade_log:
-            html += "<h2>💰 Trades</h2><table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Price</th><th>Status</th></tr>"
+            html += "<h2>💰 Trades</h2><table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Side</th><th>Price</th><th>Status</th></tr>"
             for t in reversed(p.trade_log[-10:]):
                 st = "✅" if t.get('success') else "❌"
                 if t.get('dry_run'): st = "🧪"
                 if t.get('soft_lock'): st += "⏰"
-                html += f'<tr><td>{t.get("time","?")}</td><td>{t.get("station","?")}</td><td>{t.get("subtitle",t.get("ticker","?"))}</td><td>{t.get("price","?")}¢</td><td>{st}</td></tr>'
+                side_class = "yes" if t.get('side') == 'yes' else "no"
+                html += f'<tr><td>{t.get("time","?")}</td><td>{t.get("station","?")}</td><td>{t.get("subtitle",t.get("ticker","?"))}</td><td class="{side_class}">{t.get("side","?").upper()}</td><td>{t.get("price","?")}¢</td><td>{st}</td></tr>'
             html += "</table>"
         
         html += '<br><small>Refreshes every 30s</small></body></html>'
@@ -241,10 +240,12 @@ class BracketInfo:
     subtitle: str
     floor_strike: Optional[int]
     cap_strike: Optional[int]
-    strike_type: str
-    signal_type: str
+    strike_type: str  # 'between', 'greater', 'less'
+    signal_type: str  # 'high' or 'low'
     no_ask: int
+    yes_ask: int
     station: str
+    is_edge_bracket: bool = False  # True if this is the lowest/highest bracket
 
 
 @dataclass
@@ -259,9 +260,10 @@ class MarketState:
 
 
 class SmartPoller:
-    def __init__(self, live_mode=False, max_no_price=93, hourly_mode=False):
+    def __init__(self, live_mode=False, max_no_price=93, max_yes_price=93, hourly_mode=False):
         self.live_mode = live_mode
         self.max_no_price = max_no_price
+        self.max_yes_price = max_yes_price
         self.hourly_mode = hourly_mode
         
         self.kalshi = KalshiClient()
@@ -288,6 +290,7 @@ class SmartPoller:
             
             # HIGH markets
             high_event = f"{state.high_ticker_base}-{today}"
+            high_brackets = []
             try:
                 markets = self.kalshi.get_markets_for_event(high_event)
                 for m in markets:
@@ -302,23 +305,35 @@ class SmartPoller:
                     
                     orderbook = self.kalshi.get_orderbook(ticker)
                     no_asks = orderbook.get('no', {}).get('asks', [])
+                    yes_asks = orderbook.get('yes', {}).get('asks', [])
                     no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                    yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
                     
-                    if no_ask <= self.max_no_price:
-                        bracket = BracketInfo(
-                            ticker=ticker, event_ticker=high_event, subtitle=subtitle,
-                            floor_strike=int(floor) if floor else None,
-                            cap_strike=int(cap) if cap else None,
-                            strike_type=strike_type, signal_type='high',
-                            no_ask=no_ask, station=station
-                        )
-                        state.watchlist.append(bracket)
-                        print(f"  ✓ {subtitle:<18} (high) NO @ {no_ask}¢")
+                    bracket = BracketInfo(
+                        ticker=ticker, event_ticker=high_event, subtitle=subtitle,
+                        floor_strike=int(floor) if floor else None,
+                        cap_strike=int(cap) if cap else None,
+                        strike_type=strike_type, signal_type='high',
+                        no_ask=no_ask, yes_ask=yes_ask, station=station
+                    )
+                    high_brackets.append(bracket)
+                
+                # Mark edge brackets for HIGH (the "X or above" bracket is the edge)
+                for b in high_brackets:
+                    if b.strike_type == 'greater':
+                        b.is_edge_bracket = True
+                    # Add to watchlist if price is good for either side
+                    if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
+                        state.watchlist.append(b)
+                        edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
+                        print(f"  ✓ {b.subtitle:<18} (high) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+                        
             except Exception as e:
                 print(f"[ERROR] {station} high: {e}")
             
             # LOW markets
             low_event = f"{state.low_ticker_base}-{today}"
+            low_brackets = []
             try:
                 markets = self.kalshi.get_markets_for_event(low_event)
                 for m in markets:
@@ -333,18 +348,29 @@ class SmartPoller:
                     
                     orderbook = self.kalshi.get_orderbook(ticker)
                     no_asks = orderbook.get('no', {}).get('asks', [])
+                    yes_asks = orderbook.get('yes', {}).get('asks', [])
                     no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                    yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
                     
-                    if no_ask <= self.max_no_price:
-                        bracket = BracketInfo(
-                            ticker=ticker, event_ticker=low_event, subtitle=subtitle,
-                            floor_strike=int(floor) if floor else None,
-                            cap_strike=int(cap) if cap else None,
-                            strike_type=strike_type, signal_type='low',
-                            no_ask=no_ask, station=station
-                        )
-                        state.watchlist.append(bracket)
-                        print(f"  ✓ {subtitle:<18} (low) NO @ {no_ask}¢")
+                    bracket = BracketInfo(
+                        ticker=ticker, event_ticker=low_event, subtitle=subtitle,
+                        floor_strike=int(floor) if floor else None,
+                        cap_strike=int(cap) if cap else None,
+                        strike_type=strike_type, signal_type='low',
+                        no_ask=no_ask, yes_ask=yes_ask, station=station
+                    )
+                    low_brackets.append(bracket)
+                
+                # Mark edge brackets for LOW (the "X or below" bracket is the edge)
+                for b in low_brackets:
+                    if b.strike_type == 'less':
+                        b.is_edge_bracket = True
+                    # Add to watchlist if price is good for either side
+                    if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
+                        state.watchlist.append(b)
+                        edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
+                        print(f"  ✓ {b.subtitle:<18} (low) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+                        
             except Exception as e:
                 print(f"[ERROR] {station} low: {e}")
             
@@ -368,6 +394,8 @@ class SmartPoller:
         except:
             return False
     
+    # ============ NO LOCK LOGIC ============
+    
     def _is_no_locked_for_high(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
         """Check if NO is locked for a HIGH bracket."""
         if bracket.strike_type == 'between':
@@ -379,19 +407,12 @@ class SmartPoller:
                 return True  # Soft lock
             return False
         elif bracket.strike_type == 'less':
+            # "X or below" - NO locked if observed >= cap
             return bracket.cap_strike is not None and observed >= bracket.cap_strike
-        return False
+        return False  # 'greater' can never lock NO for HIGH
     
     def _is_no_locked_for_low(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
-        """
-        Check if NO is locked for a LOW bracket.
-        
-        FIXED BUG: For 'greater' type (e.g., "7° or above"):
-        - YES wins if low >= 7
-        - NO wins if low < 7
-        - NO is locked ONLY when observed < 7 (temp already dropped below threshold)
-        - OLD WRONG CODE: observed <= bracket.floor_strike
-        """
+        """Check if NO is locked for a LOW bracket."""
         if bracket.strike_type == 'between':
             if bracket.floor_strike is None:
                 return False
@@ -401,14 +422,60 @@ class SmartPoller:
                 return True  # Soft lock
             return False
         elif bracket.strike_type == 'greater':
-            # FIXED: was "observed <= floor" which caused false locks!
+            # "X or above" - NO locked if observed < floor
             if bracket.floor_strike is None:
                 return False
             if observed < bracket.floor_strike:
-                return True  # Hard lock - temp already below threshold
+                return True  # Hard lock
             if soft and observed == bracket.floor_strike:
-                return True  # Soft lock - at exact threshold
+                return True  # Soft lock
             return False
+        return False  # 'less' can never lock NO for LOW
+    
+    # ============ YES LOCK LOGIC (NEW!) ============
+    
+    def _is_yes_locked_for_high(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
+        """
+        Check if YES is locked for a HIGH bracket.
+        
+        YES locks on edge brackets when temp hits/exceeds the threshold:
+        - "85° or above" (greater): YES locked if observed >= 85 (it's the highest bracket)
+        """
+        if not bracket.is_edge_bracket:
+            return False
+        
+        if bracket.strike_type == 'greater':
+            # "X or above" - YES locked if observed >= floor (highest bracket, can't go higher)
+            if bracket.floor_strike is None:
+                return False
+            if observed > bracket.floor_strike:
+                return True  # Hard lock
+            if soft and observed == bracket.floor_strike:
+                return True  # Soft lock
+            return False
+        
+        return False
+    
+    def _is_yes_locked_for_low(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
+        """
+        Check if YES is locked for a LOW bracket.
+        
+        YES locks on edge brackets when temp hits/drops below the threshold:
+        - "6° or below" (less): YES locked if observed <= 6 (it's the lowest bracket)
+        """
+        if not bracket.is_edge_bracket:
+            return False
+        
+        if bracket.strike_type == 'less':
+            # "X or below" - YES locked if observed <= cap (lowest bracket, can't go lower)
+            if bracket.cap_strike is None:
+                return False
+            if observed < bracket.cap_strike:
+                return True  # Hard lock
+            if soft and observed == bracket.cap_strike:
+                return True  # Soft lock
+            return False
+        
         return False
     
     def check_and_trade(self, state: MarketState, metar_text: str) -> List[dict]:
@@ -428,7 +495,6 @@ class SmartPoller:
         if self.hourly_mode:
             if parsed.t_group_temp_c is not None:
                 temp_c = parsed.t_group_temp_c
-                # FIXED: Use nws_round instead of Python round
                 current_temp = nws_round(temp_c * 9/5 + 32)
                 print(f"[SIGNAL] {state.station} HOURLY: {current_temp}°F (T-group {temp_c}°C)")
                 
@@ -442,11 +508,25 @@ class SmartPoller:
                         continue
                     
                     if bracket.signal_type == 'high':
-                        if self._is_no_locked_for_high(current_temp, bracket, soft=high_override):
-                            results.append(self._execute_trade(bracket, current_temp, state, soft_lock=high_override))
-                    else:
-                        if self._is_no_locked_for_low(current_temp, bracket, soft=low_override):
-                            results.append(self._execute_trade(bracket, current_temp, state, soft_lock=low_override))
+                        # Check NO lock
+                        if bracket.no_ask <= self.max_no_price:
+                            if self._is_no_locked_for_high(current_temp, bracket, soft=high_override):
+                                results.append(self._execute_trade(bracket, current_temp, state, side='no', soft_lock=high_override))
+                                continue
+                        # Check YES lock (edge brackets only)
+                        if bracket.is_edge_bracket and bracket.yes_ask <= self.max_yes_price:
+                            if self._is_yes_locked_for_high(current_temp, bracket, soft=high_override):
+                                results.append(self._execute_trade(bracket, current_temp, state, side='yes', soft_lock=high_override))
+                    else:  # low
+                        # Check NO lock
+                        if bracket.no_ask <= self.max_no_price:
+                            if self._is_no_locked_for_low(current_temp, bracket, soft=low_override):
+                                results.append(self._execute_trade(bracket, current_temp, state, side='no', soft_lock=low_override))
+                                continue
+                        # Check YES lock (edge brackets only)
+                        if bracket.is_edge_bracket and bracket.yes_ask <= self.max_yes_price:
+                            if self._is_yes_locked_for_low(current_temp, bracket, soft=low_override):
+                                results.append(self._execute_trade(bracket, current_temp, state, side='yes', soft_lock=low_override))
         
         # 6-hourly max/min
         if parsed.six_hour_max_c is not None:
@@ -457,8 +537,13 @@ class SmartPoller:
                 if bracket.ticker in state.traded_tickers:
                     continue
                 if bracket.signal_type == 'high':
-                    if self._is_no_locked_for_high(observed, bracket, soft=high_override):
-                        results.append(self._execute_trade(bracket, observed, state, soft_lock=high_override))
+                    if bracket.no_ask <= self.max_no_price:
+                        if self._is_no_locked_for_high(observed, bracket, soft=high_override):
+                            results.append(self._execute_trade(bracket, observed, state, side='no', soft_lock=high_override))
+                            continue
+                    if bracket.is_edge_bracket and bracket.yes_ask <= self.max_yes_price:
+                        if self._is_yes_locked_for_high(observed, bracket, soft=high_override):
+                            results.append(self._execute_trade(bracket, observed, state, side='yes', soft_lock=high_override))
         
         if parsed.six_hour_min_c is not None:
             observed = nws_round(parsed.six_hour_min_c * 9/5 + 32)
@@ -468,20 +553,28 @@ class SmartPoller:
                 if bracket.ticker in state.traded_tickers:
                     continue
                 if bracket.signal_type == 'low':
-                    if self._is_no_locked_for_low(observed, bracket, soft=low_override):
-                        results.append(self._execute_trade(bracket, observed, state, soft_lock=low_override))
+                    if bracket.no_ask <= self.max_no_price:
+                        if self._is_no_locked_for_low(observed, bracket, soft=low_override):
+                            results.append(self._execute_trade(bracket, observed, state, side='no', soft_lock=low_override))
+                            continue
+                    if bracket.is_edge_bracket and bracket.yes_ask <= self.max_yes_price:
+                        if self._is_yes_locked_for_low(observed, bracket, soft=low_override):
+                            results.append(self._execute_trade(bracket, observed, state, side='yes', soft_lock=low_override))
         
         return results
     
-    def _execute_trade(self, bracket: BracketInfo, observed: int, state: MarketState, soft_lock: bool = False) -> dict:
+    def _execute_trade(self, bracket: BracketInfo, observed: int, state: MarketState, side: str, soft_lock: bool = False) -> dict:
         now = datetime.now(timezone.utc)
+        
+        price = bracket.yes_ask if side == 'yes' else bracket.no_ask
         
         trade_info = {
             'time': now.strftime("%H:%M:%SZ"),
             'station': bracket.station,
             'ticker': bracket.ticker,
             'subtitle': bracket.subtitle,
-            'price': bracket.no_ask,
+            'side': side,
+            'price': price,
             'observed': observed,
             'signal_type': bracket.signal_type,
             'soft_lock': soft_lock,
@@ -490,13 +583,14 @@ class SmartPoller:
         }
         
         lock_type = "⏰ SOFT" if soft_lock else "🔒 HARD"
-        print(f"[TRADE] {lock_type} LOCK: {bracket.station} {bracket.subtitle} ({bracket.signal_type}) - Observed: {observed}°F - NO @ {bracket.no_ask}¢")
+        side_emoji = "🟢" if side == 'yes' else "🔴"
+        print(f"[TRADE] {lock_type} LOCK {side_emoji} {side.upper()}: {bracket.station} {bracket.subtitle} ({bracket.signal_type}) - Observed: {observed}°F - {side.upper()} @ {price}¢")
         
         if self.live_mode:
             try:
                 result = self.kalshi.place_order(
                     ticker=bracket.ticker,
-                    side='no',
+                    side=side,
                     action='buy',
                     count=1,
                     order_type='market'
@@ -508,7 +602,7 @@ class SmartPoller:
                 print(f"[TRADE] ❌ Failed: {e}")
                 trade_info['error'] = str(e)
         else:
-            print(f"[TRADE] 🧪 DRY RUN - would buy NO @ {bracket.no_ask}¢")
+            print(f"[TRADE] 🧪 DRY RUN - would buy {side.upper()} @ {price}¢")
             trade_info['success'] = True
         
         state.traded_tickers.add(bracket.ticker)
@@ -543,8 +637,9 @@ class SmartPoller:
                 print(f"[ERROR] {station}: {e}")
     
     def run(self):
-        print(f"[START] WX Sniper v3.3 (FIXED)")
-        print(f"[CONFIG] Live: {self.live_mode} | Hourly: {self.hourly_mode} | Max: {self.max_no_price}¢")
+        print(f"[START] WX Sniper v3.4 (YES+NO)")
+        print(f"[CONFIG] Live: {self.live_mode} | Hourly: {self.hourly_mode}")
+        print(f"[CONFIG] Max NO: {self.max_no_price}¢ | Max YES: {self.max_yes_price}¢")
         print(f"[CONFIG] Stations: {list(self.market_states.keys())}")
         
         HealthHandler.poller = self
@@ -569,13 +664,15 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='WX Sniper Smart Poller')
     parser.add_argument('--live', action='store_true', help='Enable live trading')
-    parser.add_argument('--max-price', type=int, default=93, help='Max NO price in cents')
+    parser.add_argument('--max-no-price', type=int, default=93, help='Max NO price in cents')
+    parser.add_argument('--max-yes-price', type=int, default=93, help='Max YES price in cents (edge brackets)')
     parser.add_argument('--hourly', action='store_true', help='Use hourly T-group temps')
     args = parser.parse_args()
     
     poller = SmartPoller(
         live_mode=args.live,
-        max_no_price=args.max_price,
+        max_no_price=args.max_no_price,
+        max_yes_price=args.max_yes_price,
         hourly_mode=args.hourly
     )
     poller.run()
