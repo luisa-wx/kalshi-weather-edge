@@ -1130,8 +1130,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
             
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
             <div class="metar-info">
-                <strong>Latest METAR:</strong> {metar_local_str} local | 
-                <span class="current-temp">Current: {current_temp_str}</span> |
+                <strong>Latest METAR:</strong> {metar_local_str} local — <span class="current-temp">{current_temp_str}</span> |
                 <strong>Day's Range:</strong> HIGH={state.observed_high or "?"}&#176;F, LOW={state.observed_low or "?"}&#176;F
             </div>'''
             
