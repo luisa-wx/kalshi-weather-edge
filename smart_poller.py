@@ -179,6 +179,7 @@ tr:hover {{ background: #161b22; }}
 }}
 .lock-btn.locked {{ background: #238636; color: white; }}
 .lock-btn.unlocked {{ background: #21262d; color: #8b949e; border: 1px solid #30363d; }}
+.lock-btn.active {{ background: #238636; color: white; }}
 .lock-btn:hover {{ opacity: 0.8; }}
 .station-card {{
     background: #161b22;
@@ -303,14 +304,56 @@ tr:hover {{ background: #161b22; }}
             high_locked = is_locked(station, 'high')
             low_locked = is_locked(station, 'low')
             
+            # Show observed temps
+            obs_high = state.observed_high if state.observed_high else "?"
+            obs_low = state.observed_low if state.observed_low else "?"
+            
             html += f'''<h3>{city_name} ({len(state.watchlist)} brackets)
-                <span class="status-badge {"active" if high_locked else "inactive"}">HIGH {"🔒" if high_locked else "🔓"}</span>
-                <span class="status-badge {"active" if low_locked else "inactive"}">LOW {"🔒" if low_locked else "🔓"}</span>
-            </h3>'''
-            html += '<table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Floor</th><th>Cap</th><th>Edge</th></tr>'
+                <span style="margin-left:10px; color:#8b949e;">Obs: ↑{obs_high}°F ↓{obs_low}°F</span>
+            </h3>
+            <div style="margin-bottom:10px;">
+                <form method="POST" style="display:inline;">
+                    <input type="hidden" name="action" value="toggle_lock">
+                    <input type="hidden" name="station" value="{station}">
+                    <input type="hidden" name="type" value="high">
+                    <button type="submit" class="lock-btn {"active" if high_locked else ""}">
+                        {"🔒 HIGH LOCKED" if high_locked else "🔓 Lock HIGH"}
+                    </button>
+                </form>
+                <form method="POST" style="display:inline;">
+                    <input type="hidden" name="action" value="toggle_lock">
+                    <input type="hidden" name="station" value="{station}">
+                    <input type="hidden" name="type" value="low">
+                    <button type="submit" class="lock-btn {"active" if low_locked else ""}">
+                        {"🔒 LOW LOCKED" if low_locked else "🔓 Lock LOW"}
+                    </button>
+                </form>
+            </div>'''
+            html += '<table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Floor</th><th>Cap</th><th>Status</th></tr>'
             
             for b in state.watchlist:
                 edge = '<span class="edge">🎯 EDGE</span>' if b.is_edge_bracket else ""
+                
+                # Determine bracket lock status based on observed temps
+                bracket_status = ""
+                if b.signal_type == 'high':
+                    if state.observed_high is not None and b.cap_strike is not None:
+                        if state.observed_high > b.cap_strike:
+                            bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
+                        elif state.observed_high >= b.floor_strike if b.floor_strike else True:
+                            bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                elif b.signal_type == 'low':
+                    if state.observed_low is not None and b.floor_strike is not None:
+                        if state.observed_low < b.floor_strike:
+                            bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
+                        elif state.observed_low <= b.cap_strike if b.cap_strike else True:
+                            bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                
+                if not bracket_status:
+                    bracket_status = edge if edge else "—"
+                elif edge:
+                    bracket_status += f" {edge}"
+                
                 html += f'''<tr>
                     <td>{b.subtitle}</td>
                     <td>{b.signal_type.upper()}</td>
@@ -318,7 +361,7 @@ tr:hover {{ background: #161b22; }}
                     <td class="yes">{b.yes_ask}¢</td>
                     <td>{b.floor_strike or "—"}</td>
                     <td>{b.cap_strike or "—"}</td>
-                    <td>{edge}</td>
+                    <td>{bracket_status}</td>
                 </tr>'''
             html += "</table>"
         
@@ -447,19 +490,19 @@ class SmartPoller:
                         cap = m.get('cap_strike')
                         strike_type = m.get('strike_type', 'between')
                         
-                        orderbook = self.kalshi.get_market_orderbook(ticker)
-                        ob = orderbook.get('orderbook', {})
-                        no_data = ob.get('no', [])
-                        yes_data = ob.get('yes', [])
-                        no_ask = min([lvl[0] for lvl in no_data], default=100) if no_data else 100
-                        yes_ask = min([lvl[0] for lvl in yes_data], default=100) if yes_data else 100
+                        # Get prices directly from market object (more reliable than orderbook)
+                        no_ask = m.get('no_ask', 100)
+                        yes_ask = m.get('yes_ask', 100)
+                        # Handle None values
+                        if no_ask is None: no_ask = 100
+                        if yes_ask is None: yes_ask = 100
                         
                         bracket = BracketInfo(
                             ticker=ticker, event_ticker=high_event, subtitle=subtitle,
                             floor_strike=int(floor) if floor else None,
                             cap_strike=int(cap) if cap else None,
                             strike_type=strike_type, signal_type='high',
-                            no_ask=no_ask, yes_ask=yes_ask, station=station
+                            no_ask=int(no_ask), yes_ask=int(yes_ask), station=station
                         )
                         high_brackets.append(bracket)
                     
@@ -491,19 +534,19 @@ class SmartPoller:
                         cap = m.get('cap_strike')
                         strike_type = m.get('strike_type', 'between')
                         
-                        orderbook = self.kalshi.get_market_orderbook(ticker)
-                        ob = orderbook.get('orderbook', {})
-                        no_data = ob.get('no', [])
-                        yes_data = ob.get('yes', [])
-                        no_ask = min([lvl[0] for lvl in no_data], default=100) if no_data else 100
-                        yes_ask = min([lvl[0] for lvl in yes_data], default=100) if yes_data else 100
+                        # Get prices directly from market object (more reliable than orderbook)
+                        no_ask = m.get('no_ask', 100)
+                        yes_ask = m.get('yes_ask', 100)
+                        # Handle None values
+                        if no_ask is None: no_ask = 100
+                        if yes_ask is None: yes_ask = 100
                         
                         bracket = BracketInfo(
                             ticker=ticker, event_ticker=low_event, subtitle=subtitle,
                             floor_strike=int(floor) if floor else None,
                             cap_strike=int(cap) if cap else None,
                             strike_type=strike_type, signal_type='low',
-                            no_ask=no_ask, yes_ask=yes_ask, station=station
+                            no_ask=int(no_ask), yes_ask=int(yes_ask), station=station
                         )
                         low_brackets.append(bracket)
                     
@@ -752,6 +795,33 @@ class SmartPoller:
             except Exception as e:
                 print(f"[ERROR] {station}: {e}")
     
+    def initial_fetch(self):
+        """Fetch METARs for all stations on startup to populate UI."""
+        print(f"\n[STARTUP] Fetching initial METARs...")
+        for station in self.market_states.keys():
+            try:
+                metar = self.weather.fetch_metar(station)
+                if metar:
+                    raw_text = metar.raw_text if hasattr(metar, 'raw_text') else str(metar)
+                    self.latest_metars[station] = raw_text
+                    
+                    parsed = parse_metar(raw_text)
+                    if parsed.t_group_temp_c is not None:
+                        temp_f = nws_round(parsed.t_group_temp_c * 9/5 + 32)
+                        self.latest_temps[station] = temp_f
+                        
+                        # Update observed temps
+                        state = self.market_states[station]
+                        if state.observed_high is None or temp_f > state.observed_high:
+                            state.observed_high = temp_f
+                        if state.observed_low is None or temp_f < state.observed_low:
+                            state.observed_low = temp_f
+                    
+                    print(f"[STARTUP] {station}: {self.latest_temps.get(station, '?')}°F")
+            except Exception as e:
+                print(f"[STARTUP] {station} error: {e}")
+        print(f"[STARTUP] Done - fetched {len(self.latest_metars)} METARs\n")
+    
     def run(self):
         print(f"[START] WX Sniper v3.5")
         print(f"[CONFIG] Live: {self.live_mode} | Hourly: {self.hourly_mode}")
@@ -763,6 +833,7 @@ class SmartPoller:
         health_thread.start()
         
         self.build_watchlist()
+        self.initial_fetch()  # Fetch METARs immediately on startup
         last_watchlist_build = datetime.now(timezone.utc)
         
         while True:
