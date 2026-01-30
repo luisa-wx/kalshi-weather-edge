@@ -743,6 +743,11 @@ class WXSniper:
                 
                 state = self.states[station]
                 raw = metar_data.get('rawOb', '')
+                
+                # Debug: log if METAR changed
+                if raw != state.latest_metar:
+                    print(f"  [{station}] NEW METAR: {raw[:80]}")
+                
                 parsed = parse_metar(raw)
                 
                 state.latest_metar = raw
