@@ -241,31 +241,104 @@ class WXSniper:
                             state.observed_low = parsed.temp_f
                     
                     # Check for 6-hour extremes in synoptic METARs
-                    # IMPORTANT: Only use these if they're from today's local date
-                    # The 6-hr max/min could span midnight, so we're conservative here
-                    # and only use the current temp reading for now
-                    # TODO: Parse METAR timestamp and validate it's from today
                     if parsed.six_hr_max_c is not None:
                         max_f = c_to_f_nws(parsed.six_hr_max_c)
-                        # Only update if this would raise the high
-                        # (synoptic values are 6hr periods, could include yesterday)
                         if state.observed_high is None or max_f > state.observed_high:
                             state.observed_high = max_f
-                            print(f"  [SYNOPTIC] {station} 6hr max: {max_f}F")
+                            print(f"  [SYNOPTIC] {station} 6hr max: {max_f}°F")
                     
                     if parsed.six_hr_min_c is not None:
                         min_f = c_to_f_nws(parsed.six_hr_min_c)
                         if state.observed_low is None or min_f < state.observed_low:
                             state.observed_low = min_f
-                            print(f"  [SYNOPTIC] {station} 6hr min: {min_f}F")
+                            print(f"  [SYNOPTIC] {station} 6hr min: {min_f}°F")
                     
-                    print(f"  {station}: {state.latest_temp_f}F (high={state.observed_high}, low={state.observed_low})")
+                    print(f"  {station}: {state.latest_temp_f}°F (high={state.observed_high}, low={state.observed_low})")
                     
             except Exception as e:
                 print(f"  {station}: ERROR - {e}")
         
         self.last_metar_poll = datetime.now(timezone.utc)
         print(f"[METAR] Done\n")
+
+    def fetch_historical_metars(self):
+        """
+        Fetch historical METARs for today (since local midnight) to establish 
+        accurate daily high/low on startup.
+        """
+        print(f"[HISTORY] Fetching today's historical METARs...")
+        
+        for station, state in self.states.items():
+            try:
+                cfg = STATIONS.get(station, {})
+                tz_name = cfg.get('timezone', 'America/New_York')
+                tz = ZoneInfo(tz_name)
+                
+                # Get local midnight for this station
+                now_local = datetime.now(tz)
+                local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                # Calculate hours since local midnight
+                hours_since_midnight = (now_local - local_midnight).total_seconds() / 3600
+                hours_to_fetch = max(1, min(24, int(hours_since_midnight) + 1))
+                
+                # Fetch historical METARs
+                url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours={hours_to_fetch}"
+                response = self.weather.session.get(url, timeout=15)
+                response.raise_for_status()
+                
+                metars = response.text.strip().split('\n')
+                print(f"  {station}: Fetched {len(metars)} METARs for past {hours_to_fetch}h")
+                
+                # Set current local date
+                state.current_local_date = now_local.strftime('%Y-%m-%d')
+                state.observed_high = None
+                state.observed_low = None
+                
+                for raw in metars:
+                    raw = raw.strip()
+                    if not raw or raw.startswith('#'):
+                        continue
+                    
+                    parsed = parse_metar(raw)
+                    
+                    # Parse METAR time to check if it's from today (local time)
+                    obs_time = self.weather._parse_obs_time(raw)
+                    if obs_time:
+                        obs_local = obs_time.astimezone(tz)
+                        # Skip if not from today
+                        if obs_local.date() != now_local.date():
+                            continue
+                    
+                    if parsed.temp_f is not None:
+                        if state.observed_high is None or parsed.temp_f > state.observed_high:
+                            state.observed_high = parsed.temp_f
+                        if state.observed_low is None or parsed.temp_f < state.observed_low:
+                            state.observed_low = parsed.temp_f
+                    
+                    # Also check 6-hour extremes
+                    if parsed.six_hr_max_c is not None:
+                        max_f = c_to_f_nws(parsed.six_hr_max_c)
+                        if state.observed_high is None or max_f > state.observed_high:
+                            state.observed_high = max_f
+                    
+                    if parsed.six_hr_min_c is not None:
+                        min_f = c_to_f_nws(parsed.six_hr_min_c)
+                        if state.observed_low is None or min_f < state.observed_low:
+                            state.observed_low = min_f
+                    
+                    # Store the most recent METAR
+                    state.latest_metar = raw
+                    state.latest_temp_f = parsed.temp_f
+                    if obs_time:
+                        state.metar_time = obs_time
+                
+                print(f"    -> Today's HIGH={state.observed_high}°F, LOW={state.observed_low}°F")
+                
+            except Exception as e:
+                print(f"  {station}: ERROR fetching history - {e}")
+        
+        print(f"[HISTORY] Done\n")
 
     # ============================================================
     # PRICE FETCHING
@@ -513,11 +586,16 @@ class WXSniper:
         time.sleep(1)
         print(f"[HTTP] Health server ready")
         
-        # Now do initial fetches (can take a while)
+        # Fetch HISTORICAL METARs first to get accurate daily high/low
         try:
-            self.fetch_all_metars()
+            self.fetch_historical_metars()
         except Exception as e:
-            print(f"[WARN] Initial METAR fetch failed: {e}")
+            print(f"[WARN] Historical METAR fetch failed: {e}")
+            # Fall back to just current METARs
+            try:
+                self.fetch_all_metars()
+            except Exception as e2:
+                print(f"[WARN] Current METAR fetch also failed: {e2}")
         
         try:
             self.fetch_all_prices()
