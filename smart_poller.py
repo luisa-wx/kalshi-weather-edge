@@ -189,13 +189,13 @@ class WXSniper:
         
     def get_local_date(self, station: str) -> str:
         """Get today's date in station's local timezone."""
-        tz_name = STATIONS.get(station, {}).get('tz', 'America/New_York')
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
         tz = ZoneInfo(tz_name)
         return datetime.now(tz).strftime('%Y-%m-%d')
     
     def get_local_time_str(self, station: str) -> str:
         """Get current time string in station's local timezone."""
-        tz_name = STATIONS.get(station, {}).get('tz', 'America/New_York')
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
         tz = ZoneInfo(tz_name)
         return datetime.now(tz).strftime('%H:%M %Z')
 
