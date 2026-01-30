@@ -367,7 +367,9 @@ class KalshiClient:
         key_str = self.private_key_str.strip()
         
         # Debug: show what we received
-        print(f"[KALSHI] Raw key length: {len(key_str)}, contains newlines: {chr(10) in key_str}, contains backslash-n: {'\\\\n' in repr(key_str)}")
+        has_newlines = '\n' in key_str
+        has_escaped_n = '\\n' in key_str
+        print(f"[KALSHI] Raw key length: {len(key_str)}, contains newlines: {has_newlines}, contains backslash-n: {has_escaped_n}")
         
         # Handle literal \n from environment variables (very common in DO/Heroku)
         # This handles both \\n (escaped) and cases where shell passed literal backslash-n
