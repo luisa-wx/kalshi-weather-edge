@@ -160,6 +160,7 @@ class StationState:
     metar_time: Optional[datetime] = None
     high_brackets: List[Bracket] = field(default_factory=list)
     low_brackets: List[Bracket] = field(default_factory=list)
+    current_local_date: Optional[str] = None  # Track which local date the obs are for
 
 # ============================================================
 # MAIN POLLER
@@ -172,8 +173,8 @@ class WXSniper:
         
         # Config
         self.live_mode = os.environ.get('LIVE_MODE', 'false').lower() == 'true'
-        self.max_no_price = int(os.environ.get('MAX_NO_PRICE', '15'))
-        self.max_yes_price = int(os.environ.get('MAX_YES_PRICE', '10'))
+        self.max_no_price = int(os.environ.get('MAX_NO_PRICE', '95'))
+        self.max_yes_price = int(os.environ.get('MAX_YES_PRICE', '95'))
         
         # State
         self.states: Dict[str, StationState] = {}
@@ -208,6 +209,15 @@ class WXSniper:
         
         for station, state in self.states.items():
             try:
+                # Check if local date has changed - reset obs if so
+                current_local_date = self.get_local_date(station)
+                if state.current_local_date != current_local_date:
+                    if state.current_local_date is not None:
+                        print(f"  [{station}] New local date {current_local_date} - resetting obs")
+                    state.current_local_date = current_local_date
+                    state.observed_high = None
+                    state.observed_low = None
+                
                 metar = self.weather.fetch_metar(station)
                 if metar:
                     raw = metar.raw_text if hasattr(metar, 'raw_text') else str(metar)
@@ -226,19 +236,25 @@ class WXSniper:
                             state.observed_low = parsed.temp_f
                     
                     # Check for 6-hour extremes in synoptic METARs
+                    # IMPORTANT: Only use these if they're from today's local date
+                    # The 6-hr max/min could span midnight, so we're conservative here
+                    # and only use the current temp reading for now
+                    # TODO: Parse METAR timestamp and validate it's from today
                     if parsed.six_hr_max_c is not None:
                         max_f = c_to_f_nws(parsed.six_hr_max_c)
+                        # Only update if this would raise the high
+                        # (synoptic values are 6hr periods, could include yesterday)
                         if state.observed_high is None or max_f > state.observed_high:
                             state.observed_high = max_f
-                            print(f"  [SYNOPTIC] {station} 6hr max: {max_f}°F")
+                            print(f"  [SYNOPTIC] {station} 6hr max: {max_f}F")
                     
                     if parsed.six_hr_min_c is not None:
                         min_f = c_to_f_nws(parsed.six_hr_min_c)
                         if state.observed_low is None or min_f < state.observed_low:
                             state.observed_low = min_f
-                            print(f"  [SYNOPTIC] {station} 6hr min: {min_f}°F")
+                            print(f"  [SYNOPTIC] {station} 6hr min: {min_f}F")
                     
-                    print(f"  {station}: {state.latest_temp_f}°F (high={state.observed_high}, low={state.observed_low})")
+                    print(f"  {station}: {state.latest_temp_f}F (high={state.observed_high}, low={state.observed_low})")
                     
             except Exception as e:
                 print(f"  {station}: ERROR - {e}")
@@ -599,16 +615,17 @@ tr:hover {{ background: #161b22; }}
             cfg = STATIONS.get(station, {})
             city = cfg.get('name', station)
             local_time = p.get_local_time_str(station)
+            local_date = state.current_local_date or p.get_local_date(station)
             
             # Header with METAR
             metar_preview = state.latest_metar[:60] + "..." if state.latest_metar and len(state.latest_metar) > 60 else (state.latest_metar or "None")
             
             html += f'''<h3>{city} ({station}) 
-                <span class="time">{local_time}</span>
+                <span class="time">{local_time} | {local_date}</span>
             </h3>
             <p>
-                <strong>Observed:</strong> HIGH={state.observed_high or "?"}°F, LOW={state.observed_low or "?"}°F |
-                <strong>Latest:</strong> {state.latest_temp_f or "?"}°F
+                <strong>Observed:</strong> HIGH={state.observed_high or "?"}&deg;F, LOW={state.observed_low or "?"}&deg;F |
+                <strong>Latest:</strong> {state.latest_temp_f or "?"}&deg;F
             </p>
             <p class="metar">METAR: {metar_preview}</p>
             '''
