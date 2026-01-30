@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-WX Sniper v4.1 - Bug Fixes
-==========================
+WX Sniper v4.2 - Zero Strike Bug Fix
+====================================
+
+Changes from v4.1:
+- Fixed parsing of floor_strike/cap_strike when value is 0 (was treating 0 as None)
+  This caused brackets like "-1° to 0°" to have cap=None instead of cap=0
 
 Changes from v4.0:
 - Fixed metar_data reference bug (variable didn't exist in context)
@@ -554,11 +558,14 @@ class WXSniper:
                     markets = event_obj.get('markets', [])
                     
                     for m in markets:
+                        # Handle 0 as valid value (not None) - use explicit None check
+                        floor_val = m.get('floor_strike')
+                        cap_val = m.get('cap_strike')
                         b = BracketState(
                             ticker=m.get('ticker', ''),
                             subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
-                            floor_strike=int(m.get('floor_strike')) if m.get('floor_strike') else None,
-                            cap_strike=int(m.get('cap_strike')) if m.get('cap_strike') else None,
+                            floor_strike=int(floor_val) if floor_val is not None else None,
+                            cap_strike=int(cap_val) if cap_val is not None else None,
                             strike_type=m.get('strike_type', 'between'),
                             signal_type='high',
                             station=station
@@ -580,11 +587,14 @@ class WXSniper:
                     markets = event_obj.get('markets', [])
                     
                     for m in markets:
+                        # Handle 0 as valid value (not None) - use explicit None check
+                        floor_val = m.get('floor_strike')
+                        cap_val = m.get('cap_strike')
                         b = BracketState(
                             ticker=m.get('ticker', ''),
                             subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
-                            floor_strike=int(m.get('floor_strike')) if m.get('floor_strike') else None,
-                            cap_strike=int(m.get('cap_strike')) if m.get('cap_strike') else None,
+                            floor_strike=int(floor_val) if floor_val is not None else None,
+                            cap_strike=int(cap_val) if cap_val is not None else None,
                             strike_type=m.get('strike_type', 'between'),
                             signal_type='low',
                             station=station
@@ -1019,7 +1029,7 @@ class WXSniper:
     def run(self):
         """Main entry point."""
         print("=" * 60)
-        print("WX SNIPER v4.1 - BUG FIXES")
+        print("WX SNIPER v4.2 - ZERO STRIKE BUG FIX")
         print("=" * 60)
         print(f"Mode: {'LIVE 🔴' if self.live_mode else 'DRY RUN 🧪'}")
         print(f"Max price: {self.max_price}¢")
@@ -1114,7 +1124,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>WX Sniper v4.1</title>
+<title>WX Sniper v4.2</title>
 <meta http-equiv="refresh" content="{'10' if is_hot else '30'}">
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 20px; }}
@@ -1143,7 +1153,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
 .current-temp {{ font-size: 18px; color: #f0f6fc; }}
 </style>
 </head><body>
-<h1>&#127919; WX Sniper v4.1</h1>
+<h1>&#127919; WX Sniper v4.2</h1>
 <p>
     Mode: <strong>{"LIVE &#128308;" if s.live_mode else "DRY RUN &#129514;"}</strong> |
     Max price: <strong>{s.max_price}&#162;</strong> |
