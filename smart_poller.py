@@ -440,6 +440,9 @@ class SmartPoller:
         
         YES locks on edge brackets when temp hits/exceeds the threshold:
         - "85° or above" (greater): YES locked if observed >= 85 (it's the highest bracket)
+        
+        For edge brackets, hitting exactly the threshold IS a hard lock because
+        there's no higher bracket - YES wins regardless of further rises.
         """
         if not bracket.is_edge_bracket:
             return False
@@ -448,10 +451,8 @@ class SmartPoller:
             # "X or above" - YES locked if observed >= floor (highest bracket, can't go higher)
             if bracket.floor_strike is None:
                 return False
-            if observed > bracket.floor_strike:
-                return True  # Hard lock
-            if soft and observed == bracket.floor_strike:
-                return True  # Soft lock
+            if observed >= bracket.floor_strike:
+                return True  # Hard lock - temp is at or above threshold, nowhere else to go
             return False
         
         return False
@@ -460,8 +461,11 @@ class SmartPoller:
         """
         Check if YES is locked for a LOW bracket.
         
-        YES locks on edge brackets when temp hits/drops below the threshold:
+        YES locks on edge brackets when temp hits/drops to the threshold:
         - "6° or below" (less): YES locked if observed <= 6 (it's the lowest bracket)
+        
+        For edge brackets, hitting exactly the threshold IS a hard lock because
+        there's no lower bracket - YES wins regardless of further drops.
         """
         if not bracket.is_edge_bracket:
             return False
@@ -470,10 +474,8 @@ class SmartPoller:
             # "X or below" - YES locked if observed <= cap (lowest bracket, can't go lower)
             if bracket.cap_strike is None:
                 return False
-            if observed < bracket.cap_strike:
-                return True  # Hard lock
-            if soft and observed == bracket.cap_strike:
-                return True  # Soft lock
+            if observed <= bracket.cap_strike:
+                return True  # Hard lock - temp is at or below threshold, nowhere else to go
             return False
         
         return False
