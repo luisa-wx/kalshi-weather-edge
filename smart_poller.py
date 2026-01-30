@@ -172,7 +172,7 @@ class WXSniper:
         self.weather = AviationWeatherPoller()
         
         # Config
-        self.live_mode = os.environ.get('LIVE_MODE', 'false').lower() == 'true'
+        self.live_mode = os.environ.get('LIVE_MODE', 'true').lower() == 'true'
         self.max_no_price = int(os.environ.get('MAX_NO_PRICE', '95'))
         self.max_yes_price = int(os.environ.get('MAX_YES_PRICE', '95'))
         
@@ -224,7 +224,12 @@ class WXSniper:
                     parsed = parse_metar(raw)
                     
                     state.latest_metar = raw
-                    state.metar_time = datetime.now(timezone.utc)
+                    
+                    # Use actual observation time from METAR if available
+                    if hasattr(metar, 'observation_time') and metar.observation_time:
+                        state.metar_time = metar.observation_time
+                    else:
+                        state.metar_time = datetime.now(timezone.utc)
                     
                     if parsed.temp_f is not None:
                         state.latest_temp_f = parsed.temp_f
@@ -285,7 +290,9 @@ class WXSniper:
                 try:
                     high_event = f"{high_ticker_base}-{today_suffix}"
                     event_data = self.kalshi.get_event(high_event)
-                    markets = event_data.get('markets', [])
+                    # API returns {event: {markets: [...]}} structure
+                    event_obj = event_data.get('event', event_data)
+                    markets = event_obj.get('markets', [])
                     
                     for m in markets:
                         ticker = m.get('ticker', '')
@@ -315,7 +322,9 @@ class WXSniper:
                 try:
                     low_event = f"{low_ticker_base}-{today_suffix}"
                     event_data = self.kalshi.get_event(low_event)
-                    markets = event_data.get('markets', [])
+                    # API returns {event: {markets: [...]}} structure
+                    event_obj = event_data.get('event', event_data)
+                    markets = event_obj.get('markets', [])
                     
                     for m in markets:
                         ticker = m.get('ticker', '')
@@ -614,15 +623,21 @@ tr:hover {{ background: #161b22; }}
         for station, state in p.states.items():
             cfg = STATIONS.get(station, {})
             city = cfg.get('name', station)
-            local_time = p.get_local_time_str(station)
+            tz_name = cfg.get('timezone', 'America/New_York')
+            tz = ZoneInfo(tz_name)
             local_date = state.current_local_date or p.get_local_date(station)
+            
+            # Get METAR observation time in local time
+            if state.metar_time:
+                metar_local = state.metar_time.astimezone(tz)
+                metar_time_str = metar_local.strftime('%H:%M')
+            else:
+                metar_time_str = "?"
             
             # Header with METAR
             metar_preview = state.latest_metar[:60] + "..." if state.latest_metar and len(state.latest_metar) > 60 else (state.latest_metar or "None")
             
-            html += f'''<h3>{city} ({station}) 
-                <span class="time">{local_time} | {local_date}</span>
-            </h3>
+            html += f'''<h3>{city} ({station}) - METAR @ {metar_time_str}</h3>
             <p>
                 <strong>Observed:</strong> HIGH={state.observed_high or "?"}&deg;F, LOW={state.observed_low or "?"}&deg;F |
                 <strong>Latest:</strong> {state.latest_temp_f or "?"}&deg;F
