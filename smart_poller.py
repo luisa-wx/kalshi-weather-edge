@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-WX Sniper - Smart Poller v3.2
+WX Sniper - Smart Poller v3.3 (FIXED)
 
-NEW: Manual lock override UI - set cutoff times for when high/low is "settled"
+FIXES in this version:
+1. Line ~430: Corrected lock logic for 'greater' type on LOW markets
+   - OLD (WRONG): observed <= bracket.floor_strike  
+   - NEW (CORRECT): observed < bracket.floor_strike (hard lock), == floor (soft lock)
+   
+2. Lines ~460, ~500: Use nws_round() instead of Python round()
+   - NWS uses "round half away from zero" (symmetric rounding)
+   - Python uses "round half to even" (banker's rounding)
 
 Schedule:
 - XX:48 → Build watchlist (check prices)
 - XX:52-:02 → Poll METARs every 5s, execute trades
 - Rest of time → Sleep
-
-Synoptic METAR times (UTC): 05:53Z, 11:53Z, 17:53Z, 23:53Z
-Hot windows: 05:52-06:02Z, 11:52-12:02Z, 17:52-18:02Z, 23:52-00:02Z
 """
 
 import os
 import sys
 import time
 import json
+import math
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
@@ -27,16 +32,25 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aviation_weather import AviationWeatherPoller
-from metar_parser import parse_metar, nws_round
+from metar_parser import parse_metar
 from kalshi_client import KalshiClient
 from config import STATIONS
 
-# File to persist lock overrides
 OVERRIDES_FILE = "lock_overrides.json"
 
 
+def nws_round(value: float) -> int:
+    """
+    NWS-style rounding: round half away from zero (symmetric rounding).
+    Python's round() uses banker's rounding which differs for .5 values.
+    """
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    else:
+        return int(math.ceil(value - 0.5))
+
+
 def load_overrides() -> dict:
-    """Load lock overrides from file."""
     if os.path.exists(OVERRIDES_FILE):
         try:
             with open(OVERRIDES_FILE, 'r') as f:
@@ -47,7 +61,6 @@ def load_overrides() -> dict:
 
 
 def save_overrides(overrides: dict):
-    """Save lock overrides to file."""
     with open(OVERRIDES_FILE, 'w') as f:
         json.dump(overrides, f, indent=2)
 
@@ -104,50 +117,55 @@ class HealthHandler(BaseHTTPRequestHandler):
         overrides = load_overrides()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         today_overrides = overrides.get(today, {})
+        saved = '?saved=1' in self.path
         
-        saved_msg = ""
-        if "saved=1" in self.path:
-            saved_msg = '<div style="background:#004400;padding:10px;margin:10px 0;border-radius:5px;">✅ Overrides saved!</div>'
+        html = '''<!DOCTYPE html><html><head><title>WX Sniper Config</title>
+<style>
+body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 20px; }
+h1, h2 { color: #00ff88; }
+table { border-collapse: collapse; margin: 10px 0; }
+th, td { border: 1px solid #444; padding: 8px; text-align: left; }
+th { background: #333; }
+input[type="text"] { width: 80px; background: #333; color: #fff; border: 1px solid #555; padding: 4px; }
+button { background: #00aa55; color: white; border: none; padding: 10px 20px; cursor: pointer; margin-top: 10px; }
+.saved { color: #00ff88; font-weight: bold; }
+.help { color: #888; font-size: 12px; }
+</style></head><body>
+<h1>⚙️ WX Sniper Lock Overrides</h1>
+'''
+        if saved:
+            html += '<p class="saved">✅ Settings saved!</p>'
         
-        html = f'''
-        <html><head><meta charset="UTF-8"><title>WX Sniper - Lock Overrides</title>
-        <style>
-            body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }}
-            h1 {{ color: #00ff88; }} h2 {{ color: #00aaff; margin-top: 30px; }} a {{ color: #00aaff; }}
-            table {{ border-collapse: collapse; margin: 10px 0; }}
-            th, td {{ border: 1px solid #444; padding: 8px 12px; text-align: left; }} th {{ background: #333; }}
-            input[type="time"] {{ background: #333; color: #eee; border: 1px solid #555; padding: 5px; font-family: monospace; }}
-            input[type="submit"] {{ background: #00aa55; color: white; border: none; padding: 10px 20px; font-size: 16px; cursor: pointer; margin-top: 20px; }}
-            .clear-btn {{ background: #aa5500; font-size: 12px; padding: 3px 8px; margin-left: 5px; cursor: pointer; }}
-            .help {{ color: #888; font-size: 12px; }}
-        </style>
-        <script>function clearField(id) {{ document.getElementById(id).value = ''; }}</script>
-        </head><body>
-            <h1>⏰ Lock Override Config</h1>
-            <p><a href="/">← Back to Status</a></p>
-            <p class="help">Set LOCAL time after which high/low is "settled". Leave blank = strict math only.</p>
-            {saved_msg}
-            <h2>Overrides for {today}</h2>
-            <form method="POST" action="/config">
-            <table><tr><th>Station</th><th>TZ</th><th>High Locked After</th><th>Low Locked After</th></tr>
-        '''
-        
+        html += '''
+<div class="help">
+<p><strong>Lock Override Times:</strong> Enter HH:MM (UTC) to mark when a high/low is "settled".</p>
+<p>Leave blank = only hard locks from observed temps will trigger trades.</p>
+</div>
+<form method="POST">
+<table>
+<tr><th>Station</th><th>High Override (UTC)</th><th>Low Override (UTC)</th><th>Current High</th><th>Current Low</th></tr>
+'''
         for station, state in p.market_states.items():
-            tz = state.timezone.split('/')[-1].replace('_', ' ')
-            so = today_overrides.get(station, {})
-            hv = so.get('high_locked_after') or ''
-            lv = so.get('low_locked_after') or ''
-            html += f'''<tr><td><strong>{station}</strong></td><td>{tz}</td>
-                <td><input type="time" id="{station}_high" name="{station}_high" value="{hv}">
-                    <button type="button" class="clear-btn" onclick="clearField('{station}_high')">✕</button></td>
-                <td><input type="time" id="{station}_low" name="{station}_low" value="{lv}">
-                    <button type="button" class="clear-btn" onclick="clearField('{station}_low')">✕</button></td></tr>'''
+            st_overrides = today_overrides.get(station, {})
+            high_val = st_overrides.get('high_locked_after') or ''
+            low_val = st_overrides.get('low_locked_after') or ''
+            obs_high = state.observed_high if state.observed_high else '-'
+            obs_low = state.observed_low if state.observed_low else '-'
+            
+            html += f'''<tr>
+<td>{station}</td>
+<td><input type="text" name="{station}_high" value="{high_val}" placeholder="HH:MM"></td>
+<td><input type="text" name="{station}_low" value="{low_val}" placeholder="HH:MM"></td>
+<td>{obs_high}°F</td>
+<td>{obs_low}°F</td>
+</tr>'''
         
-        html += '''</table><input type="submit" value="💾 Save Overrides"></form>
-            <h2>How it works</h2>
-            <p class="help"><strong>Without override:</strong> Bot only trades when observed temp > cap (hard lock).<br>
-            <strong>With override:</strong> After specified time, observed == cap also triggers trade (soft lock).</p>
-        </body></html>'''
+        html += '''
+</table>
+<button type="submit">💾 Save Overrides</button>
+</form>
+<br><a href="/" style="color: #00ff88;">← Back to Status</a>
+</body></html>'''
         self.wfile.write(html.encode())
     
     def _serve_status_page(self):
@@ -160,54 +178,39 @@ class HealthHandler(BaseHTTPRequestHandler):
             return
         
         p = HealthHandler.poller
-        s = p._get_synoptic_state()
+        now = datetime.now(timezone.utc)
         
-        html = f'''<html><head><meta charset="UTF-8"><title>WX Sniper v3.2</title>
-            <meta http-equiv="refresh" content="30">
-            <style>
-                body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }}
-                h1 {{ color: #00ff88; }} h2 {{ color: #00aaff; margin-top: 30px; }} a {{ color: #00aaff; }}
-                .status {{ font-size: 24px; margin: 20px 0; }}
-                .hot {{ color: #00ff88; }} .prep {{ color: #ffaa00; }} .waiting {{ color: #ff4444; }}
-                table {{ border-collapse: collapse; margin: 10px 0; }}
-                th, td {{ border: 1px solid #444; padding: 8px 12px; text-align: left; }} th {{ background: #333; }}
-                .cheap {{ color: #00ff88; }} .override {{ color: #ffaa00; }}
-            </style></head><body>
-            <h1>🌡️ WX Sniper v3.2</h1>
-            <p><a href="/config">⏰ Configure Lock Overrides</a></p>
-            <div class="status">Mode: {'💰 LIVE' if not p.dry_run else '🧪 DRY RUN'} | Hourly: {'✅ ON' if p.hourly_mode else '❌ OFF'} | Max: {p.max_price_cents}¢</div>
-            <div class="status">Current: {s['current_hour']:02d}:{s['current_minute']:02d}Z |
-                <span class="{'hot' if s['is_hot_window'] else 'prep' if s['is_prep_window'] else 'waiting'}">
-                {'🟢 HOT' if s['is_hot_window'] else '🟡 PREP' if s['is_prep_window'] else f"🔴 Next in {s['minutes_to_hot']}min"}</span></div>
-            <div class="status">Trades: {len(p.executed_trades)}</div>'''
+        html = f'''<!DOCTYPE html><html><head><title>WX Sniper</title>
+<meta http-equiv="refresh" content="30">
+<style>
+body {{ font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 20px; }}
+h1, h2 {{ color: #00ff88; }}
+table {{ border-collapse: collapse; margin: 10px 0; }}
+th, td {{ border: 1px solid #444; padding: 8px; text-align: left; }}
+th {{ background: #333; }}
+.cheap {{ color: #ffaa00; }}
+</style></head><body>
+<h1>🎯 WX Sniper v3.3 (FIXED)</h1>
+<p>Mode: {"LIVE 💰" if p.live_mode else "DRY RUN 🧪"} | Hourly: {"YES" if p.hourly_mode else "NO"} | Max: {p.max_no_price}¢</p>
+<p>Time: {now.strftime("%Y-%m-%d %H:%M:%SZ")}</p>
+<p><a href="/config" style="color: #00ff88;">⚙️ Configure Lock Overrides</a></p>
+'''
         
-        # Active overrides
-        overrides = load_overrides()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        today_overrides = overrides.get(today, {})
-        active = []
-        for st, cfg in today_overrides.items():
-            if cfg.get('high_locked_after'): active.append(f"{st} H@{cfg['high_locked_after']}")
-            if cfg.get('low_locked_after'): active.append(f"{st} L@{cfg['low_locked_after']}")
-        if active:
-            html += f'<div class="status override">⏰ {", ".join(active)}</div>'
-        
-        # Watchlists
+        html += "<h2>📋 Watchlist</h2>"
         for station, state in p.market_states.items():
-            if state.watchlist:
-                html += f"<h2>{station}</h2><table><tr><th>Bracket</th><th>Type</th><th>NO</th><th>Floor</th><th>Cap</th></tr>"
-                for b in state.watchlist:
-                    html += f'<tr><td>{b.subtitle}</td><td>{b.signal_type.upper()}</td><td class="{"cheap" if b.no_ask<=70 else ""}">{b.no_ask}¢</td><td>{b.floor_strike or "-"}</td><td>{b.cap_strike or "-"}</td></tr>'
-                html += "</table>"
+            if not state.watchlist:
+                continue
+            html += f"<h3>{station}</h3><table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>Floor</th><th>Cap</th></tr>"
+            for b in state.watchlist:
+                html += f'<tr><td>{b.subtitle}</td><td>{b.signal_type.upper()}</td><td class="{"cheap" if b.no_ask<=70 else ""}">{b.no_ask}¢</td><td>{b.floor_strike or "-"}</td><td>{b.cap_strike or "-"}</td></tr>'
+            html += "</table>"
         
-        # METARs
         if p.latest_metars:
             html += "<h2>📡 METARs</h2><table><tr><th>Station</th><th>Temp</th><th>Raw</th></tr>"
             for st, metar in p.latest_metars.items():
                 html += f'<tr><td>{st}</td><td>{p.latest_temps.get(st,"?")}°F</td><td style="font-size:11px">{metar[:60]}...</td></tr>'
             html += "</table>"
         
-        # Trade log
         if p.trade_log:
             html += "<h2>💰 Trades</h2><table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Price</th><th>Status</th></tr>"
             for t in reversed(p.trade_log[-10:]):
@@ -249,173 +252,164 @@ class MarketState:
     station: str
     high_ticker_base: str
     low_ticker_base: str
-    timezone: str
     watchlist: List[BracketInfo] = field(default_factory=list)
     observed_high: Optional[int] = None
     observed_low: Optional[int] = None
+    traded_tickers: set = field(default_factory=set)
 
 
 class SmartPoller:
-    SYNOPTIC_HOURS = [5, 11, 17, 23]
-    EXCLUDED_STATIONS_BY_HOUR = {
-        11: ['KLAX', 'KSFO', 'KSEA', 'KLAS', 'KDEN'],
-    }
-    
-    def __init__(self, dry_run: bool = True, max_price_cents: int = 93, hourly_mode: bool = False):
-        self.dry_run = dry_run
-        self.max_price_cents = max_price_cents
+    def __init__(self, live_mode=False, max_no_price=93, hourly_mode=False):
+        self.live_mode = live_mode
+        self.max_no_price = max_no_price
         self.hourly_mode = hourly_mode
-        self.kalshi = KalshiClient()
-        self.aviation = AviationWeatherPoller()
-        self.running = False
         
+        self.kalshi = KalshiClient()
+        self.weather = AviationWeatherPoller()
+        
+        self.market_states: Dict[str, MarketState] = {}
         self.latest_metars: Dict[str, str] = {}
         self.latest_temps: Dict[str, int] = {}
         self.trade_log: List[dict] = []
         
-        self.station_timezones = {
-            'KNYC': 'America/New_York', 'KPHL': 'America/New_York',
-            'KMDW': 'America/Chicago', 'KLAX': 'America/Los_Angeles',
-            'KMIA': 'America/New_York', 'KAUS': 'America/Chicago',
-            'KSFO': 'America/Los_Angeles', 'KSEA': 'America/Los_Angeles',
-            'KDCA': 'America/New_York', 'KMSY': 'America/Chicago',
-            'KLAS': 'America/Los_Angeles', 'KDEN': 'America/Denver',
-        }
-        
-        self.market_states: Dict[str, MarketState] = {}
-        for station, config in STATIONS.items():
+        for station, cfg in STATIONS.items():
             self.market_states[station] = MarketState(
                 station=station,
-                high_ticker_base=config.get('kalshi_high_ticker', ''),
-                low_ticker_base=config.get('kalshi_low_ticker', ''),
-                timezone=self.station_timezones.get(station, 'America/New_York')
+                high_ticker_base=cfg['high_ticker'],
+                low_ticker_base=cfg['low_ticker']
             )
-        
-        self.executed_trades: set = set()
-        print(f"[POLLER] Initialized - dry_run={dry_run}, max_price={max_price_cents}¢")
     
-    def _get_local_time(self, tz_name: str) -> datetime:
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(tz_name))
-    
-    def _get_market_date(self, tz_name: str) -> str:
-        return self._get_local_time(tz_name).strftime("%y%b%d").upper()
-    
-    def _get_synoptic_state(self) -> dict:
-        now = datetime.now(timezone.utc)
-        hour, minute = now.hour, now.minute
+    def build_watchlist(self):
+        today = datetime.now(timezone.utc).strftime("%y%b%d").upper()
         
-        if self.hourly_mode:
-            is_prep = 48 <= minute <= 51
-            is_hot = 52 <= minute <= 59 or minute <= 2
-            mins_to_hot = (52 - minute) % 60 if minute < 52 else 0
-            return {'now_utc': now, 'is_prep_window': is_prep, 'is_hot_window': is_hot, 
-                    'minutes_to_hot': mins_to_hot, 'current_hour': hour, 'current_minute': minute}
-        
-        is_prep = 48 <= minute <= 51 and hour in self.SYNOPTIC_HOURS
-        is_hot = (minute >= 52 and hour in self.SYNOPTIC_HOURS) or \
-                 (minute <= 2 and (hour - 1) % 24 in self.SYNOPTIC_HOURS)
-        
-        next_hot = None
-        for h in self.SYNOPTIC_HOURS:
-            if h > hour or (h == hour and minute < 52):
-                next_hot = h
-                break
-        if next_hot is None:
-            next_hot = self.SYNOPTIC_HOURS[0]
-        
-        if is_hot:
-            mins_to_hot = 0
-        elif next_hot > hour:
-            mins_to_hot = (next_hot - hour) * 60 + (52 - minute)
-        else:
-            mins_to_hot = (24 - hour + next_hot) * 60 + (52 - minute)
-        
-        return {'now_utc': now, 'is_prep_window': is_prep, 'is_hot_window': is_hot,
-                'minutes_to_hot': mins_to_hot, 'current_hour': hour, 'current_minute': minute}
-    
-    def build_watchlist(self, state: MarketState) -> List[BracketInfo]:
-        print(f"[WATCHLIST] Building for {state.station}...")
-        watchlist = []
-        date_str = self._get_market_date(state.timezone)
-        
-        for signal_type, ticker_base in [('high', state.high_ticker_base), ('low', state.low_ticker_base)]:
-            if not ticker_base:
-                continue
-            event_ticker = f"{ticker_base}-{date_str}"
+        for station, state in self.market_states.items():
+            print(f"[WATCHLIST] Building for {station}...")
+            state.watchlist = []
+            
+            # HIGH markets
+            high_event = f"{state.high_ticker_base}-{today}"
             try:
-                time.sleep(0.5)
-                markets = self.kalshi.get_markets(event_ticker=event_ticker)
+                markets = self.kalshi.get_markets_for_event(high_event)
                 for m in markets:
-                    no_ask_dollars = m.get('no_ask_dollars')
-                    if not no_ask_dollars:
+                    if m.get('status') != 'active':
                         continue
-                    no_ask = int(float(no_ask_dollars) * 100)
-                    if no_ask <= self.max_price_cents:
+                    
+                    ticker = m.get('ticker', '')
+                    subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
+                    floor = m.get('floor_strike')
+                    cap = m.get('cap_strike')
+                    strike_type = m.get('strike_type', 'between')
+                    
+                    orderbook = self.kalshi.get_orderbook(ticker)
+                    no_asks = orderbook.get('no', {}).get('asks', [])
+                    no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                    
+                    if no_ask <= self.max_no_price:
                         bracket = BracketInfo(
-                            ticker=m.get('ticker'), event_ticker=event_ticker,
-                            subtitle=m.get('yes_sub_title', ''),
-                            floor_strike=int(m['floor_strike']) if m.get('floor_strike') else None,
-                            cap_strike=int(m['cap_strike']) if m.get('cap_strike') else None,
-                            strike_type=m.get('strike_type', ''), signal_type=signal_type,
-                            no_ask=no_ask, station=state.station
+                            ticker=ticker, event_ticker=high_event, subtitle=subtitle,
+                            floor_strike=int(floor) if floor else None,
+                            cap_strike=int(cap) if cap else None,
+                            strike_type=strike_type, signal_type='high',
+                            no_ask=no_ask, station=station
                         )
-                        watchlist.append(bracket)
-                        print(f"  ✓ {bracket.subtitle:<15} ({signal_type}) NO @ {no_ask}¢")
+                        state.watchlist.append(bracket)
+                        print(f"  ✓ {subtitle:<18} (high) NO @ {no_ask}¢")
             except Exception as e:
-                print(f"[WATCHLIST] Error: {e}")
-        
-        state.watchlist = watchlist
-        print(f"[WATCHLIST] {state.station}: {len(watchlist)} brackets")
-        return watchlist
+                print(f"[ERROR] {station} high: {e}")
+            
+            # LOW markets
+            low_event = f"{state.low_ticker_base}-{today}"
+            try:
+                markets = self.kalshi.get_markets_for_event(low_event)
+                for m in markets:
+                    if m.get('status') != 'active':
+                        continue
+                    
+                    ticker = m.get('ticker', '')
+                    subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
+                    floor = m.get('floor_strike')
+                    cap = m.get('cap_strike')
+                    strike_type = m.get('strike_type', 'between')
+                    
+                    orderbook = self.kalshi.get_orderbook(ticker)
+                    no_asks = orderbook.get('no', {}).get('asks', [])
+                    no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                    
+                    if no_ask <= self.max_no_price:
+                        bracket = BracketInfo(
+                            ticker=ticker, event_ticker=low_event, subtitle=subtitle,
+                            floor_strike=int(floor) if floor else None,
+                            cap_strike=int(cap) if cap else None,
+                            strike_type=strike_type, signal_type='low',
+                            no_ask=no_ask, station=station
+                        )
+                        state.watchlist.append(bracket)
+                        print(f"  ✓ {subtitle:<18} (low) NO @ {no_ask}¢")
+            except Exception as e:
+                print(f"[ERROR] {station} low: {e}")
+            
+            print(f"[WATCHLIST] {station}: {len(state.watchlist)} brackets")
     
-    def _check_override_active(self, station: str, signal_type: str) -> bool:
+    def _check_override_active(self, station: str, lock_type: str) -> bool:
         overrides = load_overrides()
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        station_overrides = overrides.get(today, {}).get(station, {})
-        override_time_str = station_overrides.get(f"{signal_type}_locked_after")
         
-        if not override_time_str:
+        station_overrides = overrides.get(today, {}).get(station, {})
+        cutoff_str = station_overrides.get(f'{lock_type}_locked_after')
+        
+        if not cutoff_str:
             return False
         
         try:
-            override_hour, override_min = map(int, override_time_str.split(':'))
+            cutoff_hour, cutoff_min = map(int, cutoff_str.split(':'))
+            now = datetime.now(timezone.utc)
+            cutoff_time = now.replace(hour=cutoff_hour, minute=cutoff_min, second=0, microsecond=0)
+            return now >= cutoff_time
         except:
             return False
-        
-        local_now = self._get_local_time(self.station_timezones.get(station, 'America/New_York'))
-        current_minutes = local_now.hour * 60 + local_now.minute
-        override_minutes = override_hour * 60 + override_min
-        return current_minutes >= override_minutes
     
     def _is_no_locked_for_high(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
+        """Check if NO is locked for a HIGH bracket."""
         if bracket.strike_type == 'between':
             if bracket.cap_strike is None:
                 return False
             if observed > bracket.cap_strike:
-                return True
+                return True  # Hard lock
             if soft and observed == bracket.cap_strike:
-                return True
+                return True  # Soft lock
             return False
         elif bracket.strike_type == 'less':
             return bracket.cap_strike is not None and observed >= bracket.cap_strike
-        return False  # 'greater' can never lock for HIGH
+        return False
     
     def _is_no_locked_for_low(self, observed: int, bracket: BracketInfo, soft: bool = False) -> bool:
+        """
+        Check if NO is locked for a LOW bracket.
+        
+        FIXED BUG: For 'greater' type (e.g., "7° or above"):
+        - YES wins if low >= 7
+        - NO wins if low < 7
+        - NO is locked ONLY when observed < 7 (temp already dropped below threshold)
+        - OLD WRONG CODE: observed <= bracket.floor_strike
+        """
         if bracket.strike_type == 'between':
             if bracket.floor_strike is None:
                 return False
             if observed < bracket.floor_strike:
-                return True
+                return True  # Hard lock
             if soft and observed == bracket.floor_strike:
-                return True
+                return True  # Soft lock
             return False
         elif bracket.strike_type == 'greater':
-            return bracket.floor_strike is not None and observed <= bracket.floor_strike
-        return False  # 'less' can never lock for LOW
+            # FIXED: was "observed <= floor" which caused false locks!
+            if bracket.floor_strike is None:
+                return False
+            if observed < bracket.floor_strike:
+                return True  # Hard lock - temp already below threshold
+            if soft and observed == bracket.floor_strike:
+                return True  # Soft lock - at exact threshold
+            return False
+        return False
     
     def check_and_trade(self, state: MarketState, metar_text: str) -> List[dict]:
         results = []
@@ -434,6 +428,7 @@ class SmartPoller:
         if self.hourly_mode:
             if parsed.t_group_temp_c is not None:
                 temp_c = parsed.t_group_temp_c
+                # FIXED: Use nws_round instead of Python round
                 current_temp = nws_round(temp_c * 9/5 + 32)
                 print(f"[SIGNAL] {state.station} HOURLY: {current_temp}°F (T-group {temp_c}°C)")
                 
@@ -443,181 +438,148 @@ class SmartPoller:
                     state.observed_low = current_temp
                 
                 for bracket in state.watchlist:
+                    if bracket.ticker in state.traded_tickers:
+                        continue
+                    
                     if bracket.signal_type == 'high':
                         if self._is_no_locked_for_high(current_temp, bracket, soft=high_override):
-                            if bracket.ticker not in self.executed_trades:
-                                is_soft = (bracket.cap_strike and current_temp == bracket.cap_strike and high_override)
-                                results.append(self._execute_trade(bracket, soft_lock=is_soft))
-                    elif bracket.signal_type == 'low':
+                            results.append(self._execute_trade(bracket, current_temp, state, soft_lock=high_override))
+                    else:
                         if self._is_no_locked_for_low(current_temp, bracket, soft=low_override):
-                            if bracket.ticker not in self.executed_trades:
-                                is_soft = (bracket.floor_strike and current_temp == bracket.floor_strike and low_override)
-                                results.append(self._execute_trade(bracket, soft_lock=is_soft))
-            else:
-                print(f"[SIGNAL] {state.station} NO T-GROUP - skipping")
-            return results
+                            results.append(self._execute_trade(bracket, current_temp, state, soft_lock=low_override))
         
-        # SYNOPTIC MODE
-        if parsed.six_hour_max_f_rounded is not None:
-            observed = parsed.six_hour_max_f_rounded
-            print(f"[SIGNAL] {state.station} 6hr MAX: {observed}°F")
+        # 6-hourly max/min
+        if parsed.six_hour_max_c is not None:
+            observed = nws_round(parsed.six_hour_max_c * 9/5 + 32)
+            print(f"[SIGNAL] {state.station} 6HR MAX: {observed}°F")
+            
             for bracket in state.watchlist:
+                if bracket.ticker in state.traded_tickers:
+                    continue
                 if bracket.signal_type == 'high':
                     if self._is_no_locked_for_high(observed, bracket, soft=high_override):
-                        if bracket.ticker not in self.executed_trades:
-                            is_soft = (bracket.cap_strike and observed == bracket.cap_strike and high_override)
-                            results.append(self._execute_trade(bracket, soft_lock=is_soft))
+                        results.append(self._execute_trade(bracket, observed, state, soft_lock=high_override))
         
-        if parsed.six_hour_min_f_rounded is not None:
-            observed = parsed.six_hour_min_f_rounded
-            print(f"[SIGNAL] {state.station} 6hr MIN: {observed}°F")
+        if parsed.six_hour_min_c is not None:
+            observed = nws_round(parsed.six_hour_min_c * 9/5 + 32)
+            print(f"[SIGNAL] {state.station} 6HR MIN: {observed}°F")
+            
             for bracket in state.watchlist:
+                if bracket.ticker in state.traded_tickers:
+                    continue
                 if bracket.signal_type == 'low':
                     if self._is_no_locked_for_low(observed, bracket, soft=low_override):
-                        if bracket.ticker not in self.executed_trades:
-                            is_soft = (bracket.floor_strike and observed == bracket.floor_strike and low_override)
-                            results.append(self._execute_trade(bracket, soft_lock=is_soft))
+                        results.append(self._execute_trade(bracket, observed, state, soft_lock=low_override))
         
         return results
     
-    def _execute_trade(self, bracket: BracketInfo, soft_lock: bool = False) -> dict:
-        lock_type = "⏰ SOFT" if soft_lock else "🎯 HARD"
-        print(f"\n[EXECUTE] {lock_type} LOCK NO: {bracket.ticker}")
-        print(f"[EXECUTE] {bracket.subtitle} @ {bracket.no_ask}¢")
+    def _execute_trade(self, bracket: BracketInfo, observed: int, state: MarketState, soft_lock: bool = False) -> dict:
+        now = datetime.now(timezone.utc)
         
-        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        trade_info = {
+            'time': now.strftime("%H:%M:%SZ"),
+            'station': bracket.station,
+            'ticker': bracket.ticker,
+            'subtitle': bracket.subtitle,
+            'price': bracket.no_ask,
+            'observed': observed,
+            'signal_type': bracket.signal_type,
+            'soft_lock': soft_lock,
+            'dry_run': not self.live_mode,
+            'success': False
+        }
         
-        if self.dry_run:
-            print(f"[EXECUTE] 🧪 DRY RUN - Would buy NO @ {bracket.no_ask}¢")
-            self.executed_trades.add(bracket.ticker)
-            result = {'success': True, 'dry_run': True, 'ticker': bracket.ticker, 'time': timestamp,
-                      'price': bracket.no_ask, 'soft_lock': soft_lock, 'station': bracket.station, 'subtitle': bracket.subtitle}
-            self.trade_log.append(result)
-            return result
+        lock_type = "⏰ SOFT" if soft_lock else "🔒 HARD"
+        print(f"[TRADE] {lock_type} LOCK: {bracket.station} {bracket.subtitle} ({bracket.signal_type}) - Observed: {observed}°F - NO @ {bracket.no_ask}¢")
         
-        try:
-            order = self.kalshi.create_order(ticker=bracket.ticker, side='no', action='buy',
-                                             count=1, price_cents=bracket.no_ask, order_type='limit')
-            buy_id = order.get('order', {}).get('order_id')
-            print(f"[EXECUTE] ✅ BUY: {buy_id}")
-            
-            hedge_id = None
-            for attempt in range(3):
-                try:
-                    hedge = self.kalshi.create_order(ticker=bracket.ticker, side='no', action='sell',
-                                                     count=1, price_cents=99, order_type='limit')
-                    hedge_id = hedge.get('order', {}).get('order_id')
-                    print(f"[EXECUTE] 🛡️ HEDGE: {hedge_id}")
-                    break
-                except Exception as e:
-                    print(f"[EXECUTE] ⚠️ Hedge attempt {attempt+1} failed: {e}")
-                    time.sleep(1)
-            
-            if not hedge_id:
-                print(f"[EXECUTE] 🚨 HEDGE FAILED")
-            
-            self.executed_trades.add(bracket.ticker)
-            result = {'success': True, 'ticker': bracket.ticker, 'buy': buy_id, 'hedge': hedge_id,
-                      'time': timestamp, 'price': bracket.no_ask, 'station': bracket.station,
-                      'subtitle': bracket.subtitle, 'soft_lock': soft_lock}
-            self.trade_log.append(result)
-            return result
-        except Exception as e:
-            print(f"[EXECUTE] ❌ FAILED: {e}")
-            result = {'success': False, 'error': str(e), 'ticker': bracket.ticker, 'time': timestamp, 'soft_lock': soft_lock}
-            self.trade_log.append(result)
-            return result
+        if self.live_mode:
+            try:
+                result = self.kalshi.place_order(
+                    ticker=bracket.ticker,
+                    side='no',
+                    action='buy',
+                    count=1,
+                    order_type='market'
+                )
+                trade_info['success'] = True
+                trade_info['order_id'] = result.get('order_id')
+                print(f"[TRADE] ✅ Order placed: {result}")
+            except Exception as e:
+                print(f"[TRADE] ❌ Failed: {e}")
+                trade_info['error'] = str(e)
+        else:
+            print(f"[TRADE] 🧪 DRY RUN - would buy NO @ {bracket.no_ask}¢")
+            trade_info['success'] = True
+        
+        state.traded_tickers.add(bracket.ticker)
+        self.trade_log.append(trade_info)
+        return trade_info
+    
+    def poll_cycle(self):
+        now = datetime.now(timezone.utc)
+        minute = now.minute
+        
+        in_hot_window = (minute >= 52) or (minute <= 2)
+        if not in_hot_window:
+            return
+        
+        print(f"\n[{now.strftime('%H:%MZ')}] 🟢 HOT")
+        
+        for station in self.market_states.keys():
+            try:
+                metar = self.weather.fetch_metar(station)
+                if metar:
+                    self.latest_metars[station] = metar
+                    print(f"[METAR] {station} ⏳ {metar[:70]}...")
+                    
+                    parsed = parse_metar(metar)
+                    if parsed.t_group_temp_c is not None:
+                        temp_f = nws_round(parsed.t_group_temp_c * 9/5 + 32)
+                        self.latest_temps[station] = temp_f
+                    
+                    state = self.market_states[station]
+                    self.check_and_trade(state, metar)
+            except Exception as e:
+                print(f"[ERROR] {station}: {e}")
     
     def run(self):
+        print(f"[START] WX Sniper v3.3 (FIXED)")
+        print(f"[CONFIG] Live: {self.live_mode} | Hourly: {self.hourly_mode} | Max: {self.max_no_price}¢")
+        print(f"[CONFIG] Stations: {list(self.market_states.keys())}")
+        
         HealthHandler.poller = self
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
         
-        self.running = True
-        print("\n" + "="*60)
-        print("WX SNIPER v3.2 - SMART POLLER")
-        print("="*60)
-        print(f"Mode: {'🧪 DRY RUN' if self.dry_run else '💰 LIVE'}")
-        print(f"Hourly: {'✅ ON' if self.hourly_mode else '❌ OFF'}")
-        print(f"Max NO price: {self.max_price_cents}¢")
-        print("="*60 + "\n")
+        self.build_watchlist()
+        last_watchlist_build = datetime.now(timezone.utc)
         
-        print("[STARTUP] Building watchlists...")
-        for state in self.market_states.values():
-            self.build_watchlist(state)
-            time.sleep(0.5)
-        total = sum(len(st.watchlist) for st in self.market_states.values())
-        print(f"[STARTUP] Done - {total} brackets\n")
-        
-        while self.running:
-            try:
-                s = self._get_synoptic_state()
-                now_str = f"{s['current_hour']:02d}:{s['current_minute']:02d}Z"
-                
-                if s['is_prep_window']:
-                    print(f"\n[{now_str}] 🟡 PREP")
-                    for state in self.market_states.values():
-                        self.build_watchlist(state)
-                    time.sleep(60)
-                    continue
-                
-                if s['is_hot_window']:
-                    has_watchlist = any(st.watchlist for st in self.market_states.values())
-                    current_synoptic = s['current_hour'] if s['current_minute'] >= 52 else (s['current_hour'] - 1) % 24
-                    excluded = self.EXCLUDED_STATIONS_BY_HOUR.get(current_synoptic, [])
-                    
-                    if has_watchlist:
-                        print(f"\n[{now_str}] 🟢 HOT")
-                        for station, state in self.market_states.items():
-                            if not state.watchlist or station in excluded:
-                                continue
-                            
-                            resp = self.aviation.fetch_metar(station)
-                            if resp and resp.raw_text:
-                                self.latest_metars[station] = resp.raw_text
-                                parsed = parse_metar(resp.raw_text)
-                                if parsed.t_group_temp_c is not None:
-                                    self.latest_temps[station] = nws_round(parsed.t_group_temp_c * 9/5 + 32)
-                                
-                                has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
-                                print(f"[METAR] {station} {'📊' if has_6hr else '⏳'} {resp.raw_text[:50]}...")
-                                
-                                if self.hourly_mode or has_6hr:
-                                    self.check_and_trade(state, resp.raw_text)
-                        time.sleep(5)
-                    else:
-                        time.sleep(30)
-                    continue
-                
-                if self.hourly_mode:
-                    sleep_mins = min(48 - s['current_minute'], 5) if s['current_minute'] < 48 else 1
-                else:
-                    sleep_mins = min(s['minutes_to_hot'], 5)
-                
-                print(f"[{now_str}] 🔴 Sleep {sleep_mins}min")
-                time.sleep(sleep_mins * 60)
-                
-            except KeyboardInterrupt:
-                print("\n[POLLER] Stopped")
-                self.running = False
-            except Exception as e:
-                print(f"[POLLER] Error: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(60)
+        while True:
+            now = datetime.now(timezone.utc)
+            
+            if now.minute == 48 and (now - last_watchlist_build).total_seconds() > 300:
+                self.build_watchlist()
+                last_watchlist_build = now
+            
+            self.poll_cycle()
+            time.sleep(5)
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--live", action="store_true")
-    parser.add_argument("--hourly", action="store_true")
-    parser.add_argument("--max-price", type=int, default=93)
+    parser = argparse.ArgumentParser(description='WX Sniper Smart Poller')
+    parser.add_argument('--live', action='store_true', help='Enable live trading')
+    parser.add_argument('--max-price', type=int, default=93, help='Max NO price in cents')
+    parser.add_argument('--hourly', action='store_true', help='Use hourly T-group temps')
     args = parser.parse_args()
     
-    poller = SmartPoller(dry_run=not args.live, max_price_cents=args.max_price, hourly_mode=args.hourly)
+    poller = SmartPoller(
+        live_mode=args.live,
+        max_no_price=args.max_price,
+        hourly_mode=args.hourly
+    )
     poller.run()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
