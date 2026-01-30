@@ -483,20 +483,22 @@ class WXSniper:
                             'reason': f"HIGH dead: obs {state.observed_high}°F > cap {b.cap_strike}",
                         })
                 
-                # YES opportunity: edge bracket not yet hit
-                elif b.is_edge_opportunity(state.observed_high, state.observed_low):
-                    if b.yes_ask <= self.max_yes_price:
-                        opportunities.append({
-                            'station': station,
-                            'bracket': b,
-                            'action': 'BUY_YES',
-                            'price': b.yes_ask,
-                            'reason': f"HIGH edge: obs {state.observed_high}°F < floor {b.floor_strike}",
-                        })
+                # YES opportunity: edge bracket HAS BEEN HIT (locked winner)
+                # For HIGH "X or above": buy YES if observed_high >= floor (we HIT it)
+                elif b.is_edge and b.floor_strike is not None:
+                    if state.observed_high is not None and state.observed_high >= b.floor_strike:
+                        if b.yes_ask <= self.max_yes_price:
+                            opportunities.append({
+                                'station': station,
+                                'bracket': b,
+                                'action': 'BUY_YES',
+                                'price': b.yes_ask,
+                                'reason': f"HIGH edge HIT: obs {state.observed_high}°F >= floor {b.floor_strike}",
+                            })
             
             # Check LOW brackets
             for b in state.low_brackets:
-                # NO opportunity: bracket is DEAD (observed < floor)
+                # NO opportunity: bracket is DEAD
                 if b.is_dead(state.observed_high, state.observed_low):
                     if b.no_ask <= self.max_no_price:
                         opportunities.append({
@@ -504,19 +506,21 @@ class WXSniper:
                             'bracket': b,
                             'action': 'BUY_NO',
                             'price': b.no_ask,
-                            'reason': f"LOW dead: obs {state.observed_low}°F < floor {b.floor_strike}",
+                            'reason': f"LOW dead: obs {state.observed_low}°F vs bracket",
                         })
                 
-                # YES opportunity: edge bracket not yet hit
-                elif b.is_edge_opportunity(state.observed_high, state.observed_low):
-                    if b.yes_ask <= self.max_yes_price:
-                        opportunities.append({
-                            'station': station,
-                            'bracket': b,
-                            'action': 'BUY_YES',
-                            'price': b.yes_ask,
-                            'reason': f"LOW edge: obs {state.observed_low}°F > cap {b.cap_strike}",
-                        })
+                # YES opportunity: edge bracket HAS BEEN HIT (locked winner)
+                # For LOW "X or below": buy YES if observed_low <= cap (we HIT it)
+                elif b.is_edge and b.cap_strike is not None and b.floor_strike is None:
+                    if state.observed_low is not None and state.observed_low <= b.cap_strike:
+                        if b.yes_ask <= self.max_yes_price:
+                            opportunities.append({
+                                'station': station,
+                                'bracket': b,
+                                'action': 'BUY_YES',
+                                'price': b.yes_ask,
+                                'reason': f"LOW edge HIT: obs {state.observed_low}°F <= cap {b.cap_strike}",
+                            })
         
         self.opportunities = opportunities
         return opportunities
