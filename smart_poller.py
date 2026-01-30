@@ -31,7 +31,7 @@ from typing import Optional, List, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Imports from your existing modules
-from config import STATIONS, KALSHI_SERIES_TICKERS
+from config import STATIONS
 from kalshi_client import KalshiClient
 from weather import WeatherClient
 
