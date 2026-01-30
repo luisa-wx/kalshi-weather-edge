@@ -335,6 +335,7 @@ class StationState:
     observed_high: Optional[int] = None
     observed_low: Optional[int] = None
     latest_metar: Optional[str] = None
+    latest_temp_f: Optional[int] = None  # Current temp from latest METAR
     metar_time: Optional[datetime] = None
     current_local_date: Optional[str] = None
     
@@ -751,6 +752,10 @@ class WXSniper:
                 old_high = state.observed_high
                 old_low = state.observed_low
                 
+                # Update latest temp (current reading from this METAR)
+                if parsed.temp_f is not None:
+                    state.latest_temp_f = parsed.temp_f
+                
                 # Update from current temp
                 if parsed.temp_f is not None:
                     if state.observed_high is None or parsed.temp_f > state.observed_high:
@@ -1000,11 +1005,24 @@ class HealthHandler(BaseHTTPRequestHandler):
             return "<html><body>Not initialized</body></html>"
         
         now = datetime.now(timezone.utc)
+        now_et = datetime.now(ZoneInfo('America/New_York'))
         minute = now.minute
         is_hot = minute >= 52 or minute <= 2
         
         total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) for st in s.states.values())
         total_resolved = sum(len(st.resolved_brackets) for st in s.states.values())
+        
+        # Filter snipes to only show those from today (ET midnight cutoff)
+        today_et = now_et.date()
+        todays_snipes = []
+        for snipe in s.snipes:
+            try:
+                snipe_time = datetime.fromisoformat(snipe['time'].replace('Z', '+00:00'))
+                snipe_et = snipe_time.astimezone(ZoneInfo('America/New_York'))
+                if snipe_et.date() == today_et:
+                    todays_snipes.append(snipe)
+            except:
+                todays_snipes.append(snipe)  # Include if can't parse
         
         html = f'''<!DOCTYPE html>
 <html><head>
@@ -1016,7 +1034,8 @@ body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-se
 h1 {{ color: #58a6ff; }}
 h2 {{ color: #8b949e; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-top: 30px; }}
 h3 {{ color: #58a6ff; margin-top: 20px; }}
-table {{ border-collapse: collapse; width: 100%; max-width: 800px; margin: 10px 0; }}
+h4 {{ color: #8b949e; margin: 15px 0 5px 0; font-size: 14px; }}
+table {{ border-collapse: collapse; width: 100%; max-width: 900px; margin: 10px 0; }}
 th, td {{ padding: 6px 10px; text-align: left; border: 1px solid #30363d; }}
 th {{ background: #161b22; }}
 .dead {{ color: #f85149; }}
@@ -1025,13 +1044,16 @@ th {{ background: #161b22; }}
 .hot {{ background: #3d1c1c; padding: 5px 10px; border-radius: 4px; }}
 .snipe {{ background: #1c3d1c; }}
 .time {{ color: #8b949e; font-size: 12px; }}
-.stats {{ display: flex; gap: 20px; margin: 10px 0; }}
+.stats {{ display: flex; gap: 20px; margin: 10px 0; flex-wrap: wrap; }}
 .stat {{ background: #161b22; padding: 10px 15px; border-radius: 6px; }}
 .stat-value {{ font-size: 24px; font-weight: bold; color: #58a6ff; }}
 .stat-label {{ font-size: 12px; color: #8b949e; }}
-.resolved-row {{ opacity: 0.5; }}
+.resolved-row {{ opacity: 0.6; }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: #8b949e; }}
+.metar-info {{ background: #161b22; padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-size: 13px; }}
+.metar-info strong {{ color: #58a6ff; }}
+.current-temp {{ font-size: 18px; color: #f0f6fc; }}
 </style>
 </head><body>
 <h1>&#127919; WX Sniper v4.0</h1>
@@ -1044,35 +1066,48 @@ summary {{ cursor: pointer; color: #8b949e; }}
 <div class="stats">
     <div class="stat"><div class="stat-value">{total_watching}</div><div class="stat-label">Watching</div></div>
     <div class="stat"><div class="stat-value">{total_resolved}</div><div class="stat-label">Resolved</div></div>
-    <div class="stat"><div class="stat-value">{len(s.snipes)}</div><div class="stat-label">Snipes</div></div>
+    <div class="stat"><div class="stat-value">{len(todays_snipes)}</div><div class="stat-label">Trades Today</div></div>
 </div>
 
 <p class="time">
+    ET: {now_et.strftime("%b %d, %Y %I:%M:%S %p")} |
     UTC: {now.strftime("%H:%M:%S")} |
-    Last METAR: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} |
-    Last Prices: {s.last_price_poll.strftime("%H:%M:%S") if s.last_price_poll else "Never"}
+    Last poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC
 </p>
 '''
         
-        # Snipes
-        if s.snipes:
-            html += f"<h2>&#9889; Recent Snipes ({len(s.snipes)})</h2>"
-            html += '<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Action</th><th>Price</th><th>Reason</th><th>Status</th></tr>'
-            for snipe in reversed(s.snipes[-10:]):
+        # Today's Trades section (persists until midnight ET)
+        if todays_snipes:
+            html += f"<h2>&#9889; Today's Trades ({len(todays_snipes)}) - resets at midnight ET</h2>"
+            html += '<table><tr><th>Date</th><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Bid</th><th>Reason</th><th>Status</th></tr>'
+            for snipe in reversed(todays_snipes):
+                try:
+                    snipe_time = datetime.fromisoformat(snipe['time'].replace('Z', '+00:00'))
+                    snipe_et = snipe_time.astimezone(ZoneInfo('America/New_York'))
+                    date_str = snipe_et.strftime("%m/%d")
+                    time_str = snipe_et.strftime("%I:%M %p")
+                except:
+                    date_str = "?"
+                    time_str = snipe['time'][11:19]
+                
                 status = "&#9989;" if snipe.get('success') else "&#10060;"
                 if not snipe.get('live'):
-                    status = "&#129514;"
+                    status = "&#129514; DRY"
                 action_class = "locked" if snipe['action'] == 'BUY_YES' else "dead"
+                original_ask = snipe.get('original_ask', snipe['price'])
                 html += f'''<tr class="snipe">
-                    <td class="time">{snipe['time'][11:19]}</td>
+                    <td class="time">{date_str}</td>
+                    <td class="time">{time_str}</td>
                     <td>{snipe['station']}</td>
                     <td>{snipe['subtitle']}</td>
                     <td class="{action_class}">{snipe['action']}</td>
-                    <td>{snipe['price']}&#162;</td>
-                    <td>{snipe['reason'][:40]}</td>
+                    <td>{snipe['price']}&#162; (ask: {original_ask}&#162;)</td>
+                    <td>{snipe['reason'][:50]}</td>
                     <td>{status}</td>
                 </tr>'''
             html += '</table>'
+        else:
+            html += "<h2>&#9889; Today's Trades (0)</h2><p style='color:#8b949e'>No trades yet today (ET timezone)</p>"
         
         # Watchlists
         html += "<h2>Watchlists</h2>"
@@ -1080,15 +1115,29 @@ summary {{ cursor: pointer; color: #8b949e; }}
         for station, state in s.states.items():
             cfg = STATIONS.get(station, {})
             city = cfg.get('name', station)
+            tz_name = cfg.get('timezone', 'America/New_York')
+            tz = ZoneInfo(tz_name)
             
             watching_count = len(state.high_watchlist) + len(state.low_watchlist)
             
+            # Format METAR time in local time (12-hour format)
+            metar_local_str = "?"
+            if state.metar_time:
+                metar_local = state.metar_time.astimezone(tz)
+                metar_local_str = metar_local.strftime("%I:%M %p")
+            
+            current_temp_str = f"{state.latest_temp_f}°F" if state.latest_temp_f is not None else "?"
+            
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
-            <p><strong>Observed:</strong> HIGH={state.observed_high or "?"}&#176;F, LOW={state.observed_low or "?"}&#176;F</p>'''
+            <div class="metar-info">
+                <strong>Latest METAR:</strong> {metar_local_str} local | 
+                <span class="current-temp">Current: {current_temp_str}</span> |
+                <strong>Day's Range:</strong> HIGH={state.observed_high or "?"}&#176;F, LOW={state.observed_low or "?"}&#176;F
+            </div>'''
             
             # HIGH watchlist
             if state.high_watchlist:
-                html += '<p><strong>HIGH Watchlist:</strong></p>'
+                html += '<h4>HIGH Watchlist</h4>'
                 html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
                 for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike or 0, reverse=True):
                     html += f'''<tr>
@@ -1104,7 +1153,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
             
             # LOW watchlist
             if state.low_watchlist:
-                html += '<p><strong>LOW Watchlist:</strong></p>'
+                html += '<h4>LOW Watchlist</h4>'
                 html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
                 for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike or 999):
                     html += f'''<tr>
@@ -1118,15 +1167,33 @@ summary {{ cursor: pointer; color: #8b949e; }}
                     </tr>'''
                 html += '</table>'
             
-            # Resolved
-            if state.resolved_brackets:
-                html += f'<details><summary>Resolved ({len(state.resolved_brackets)})</summary>'
-                html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
-                for b in state.resolved_brackets[-20:]:
-                    status_class = "locked" if b.status == 'locked' else "dead"
-                    traded = "&#9989;" if b.traded else "—"
-                    html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{traded}</td></tr>'
-                html += '</table></details>'
+            # Resolved - split into HIGH and LOW
+            high_resolved = [b for b in state.resolved_brackets if b.signal_type == 'high']
+            low_resolved = [b for b in state.resolved_brackets if b.signal_type == 'low']
+            
+            if high_resolved or low_resolved:
+                total_resolved_count = len(high_resolved) + len(low_resolved)
+                html += f'<details><summary>Resolved ({total_resolved_count})</summary>'
+                
+                if high_resolved:
+                    html += '<h4>HIGH Resolved</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                    for b in high_resolved[-15:]:
+                        status_class = "locked" if b.status == 'locked' else "dead"
+                        traded = "&#9989;" if b.traded else "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{traded}</td></tr>'
+                    html += '</table>'
+                
+                if low_resolved:
+                    html += '<h4>LOW Resolved</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                    for b in low_resolved[-15:]:
+                        status_class = "locked" if b.status == 'locked' else "dead"
+                        traded = "&#9989;" if b.traded else "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{traded}</td></tr>'
+                    html += '</table>'
+                
+                html += '</details>'
         
         html += "</body></html>"
         return html
