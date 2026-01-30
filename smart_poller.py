@@ -33,7 +33,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # Imports from your existing modules
 from config import STATIONS
 from kalshi_client import KalshiClient
-from weather import WeatherClient
+from aviation_weather import AviationWeatherPoller
 
 # ============================================================
 # METAR PARSING
@@ -168,7 +168,7 @@ class StationState:
 class WXSniper:
     def __init__(self):
         self.kalshi = KalshiClient()
-        self.weather = WeatherClient()
+        self.weather = AviationWeatherPoller()
         
         # Config
         self.live_mode = os.environ.get('LIVE_MODE', 'false').lower() == 'true'
