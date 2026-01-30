@@ -1095,7 +1095,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
 <p class="time">
     ET: {now_et.strftime("%b %d, %Y %I:%M:%S %p")} |
     UTC: {now.strftime("%H:%M:%S")} |
-    Last poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC
+    Last METAR poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC
 </p>
 '''
         
@@ -1154,19 +1154,18 @@ summary {{ cursor: pointer; color: #8b949e; }}
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
             <div class="metar-info">
                 <strong>Latest METAR:</strong> {metar_local_str} local — <span class="current-temp">{current_temp_str}</span> |
-                <strong>Day's Range:</strong> HIGH={state.observed_high or "?"}&#176;F, LOW={state.observed_low or "?"}&#176;F
+                <strong>Day's Range:</strong> HIGH {state.observed_high or "?"}&#176;F, LOW {state.observed_low or "?"}&#176;F
             </div>'''
             
             # HIGH watchlist
             if state.high_watchlist:
                 html += '<h4>HIGH Watchlist</h4>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
                 for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike or 0, reverse=True):
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
                         <td>{b.floor_strike or "—"}</td>
                         <td>{b.cap_strike or "—"}</td>
-                        <td>{b.strike_type}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
                         <td class="open">OPEN</td>
@@ -1176,13 +1175,12 @@ summary {{ cursor: pointer; color: #8b949e; }}
             # LOW watchlist
             if state.low_watchlist:
                 html += '<h4>LOW Watchlist</h4>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
                 for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike or 999):
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
                         <td>{b.floor_strike or "—"}</td>
                         <td>{b.cap_strike or "—"}</td>
-                        <td>{b.strike_type}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
                         <td class="open">OPEN</td>
