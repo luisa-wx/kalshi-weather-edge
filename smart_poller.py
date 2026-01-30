@@ -76,7 +76,7 @@ STATIONS = {
         "name": "NYC"
     },
     "KPHL": {
-        "kalshi_high_ticker": "KXHIGHPHL",
+        "kalshi_high_ticker": "KXHIGHPHIL",
         "kalshi_low_ticker": "KXLOWTPHIL",
         "timezone": "America/New_York",
         "name": "Philadelphia"
