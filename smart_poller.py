@@ -1095,7 +1095,8 @@ summary {{ cursor: pointer; color: #8b949e; }}
 <p class="time">
     ET: {now_et.strftime("%b %d, %Y %I:%M:%S %p")} |
     UTC: {now.strftime("%H:%M:%S")} |
-    Last METAR poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC
+    Last METAR poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC |
+    Last Kalshi poll: {s.last_price_poll.strftime("%H:%M:%S") if s.last_price_poll else "Never"} UTC
 </p>
 '''
         
@@ -1154,7 +1155,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
             <div class="metar-info">
                 <strong>Latest METAR:</strong> {metar_local_str} local — <span class="current-temp">{current_temp_str}</span> |
-                <strong>Day's Range:</strong> HIGH {state.observed_high or "?"}&#176;F, LOW {state.observed_low or "?"}&#176;F
+                <strong>Day's Range:</strong> <strong>HIGH</strong> {state.observed_high or "?"}&#176;F &nbsp; <strong>LOW</strong> {state.observed_low or "?"}&#176;F
             </div>'''
             
             # HIGH watchlist
