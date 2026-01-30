@@ -457,8 +457,8 @@ class WXSniper:
         
         # Hot window: :52-:02 - poll METARs and trade
         elif minute >= 52 or minute <= 2:
-            # Fetch METARs
-            if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 60:
+            # Fetch METARs every 20s
+            if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 20:
                 self.fetch_all_metars()
                 
                 # Re-evaluate opportunities after new METAR data
