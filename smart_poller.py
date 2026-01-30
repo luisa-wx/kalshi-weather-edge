@@ -718,7 +718,10 @@ class WXSniper:
         ]
         
         if not active_stations:
+            print("[METAR] No active watchlists to poll")
             return
+        
+        print(f"[METAR] Polling {len(active_stations)} stations...")
         
         try:
             ids_param = ','.join(active_stations)
@@ -1094,9 +1097,8 @@ summary {{ cursor: pointer; color: #8b949e; }}
 
 <p class="time">
     ET: {now_et.strftime("%b %d, %Y %I:%M:%S %p")} |
-    UTC: {now.strftime("%H:%M:%S")} |
-    Last METAR poll: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} UTC |
-    Last Kalshi poll: {s.last_price_poll.strftime("%H:%M:%S") if s.last_price_poll else "Never"} UTC
+    Last METAR: {s.last_metar_poll.astimezone(ZoneInfo('America/New_York')).strftime("%I:%M:%S %p") if s.last_metar_poll else "Never"} ET |
+    Last Kalshi: {s.last_price_poll.astimezone(ZoneInfo('America/New_York')).strftime("%I:%M:%S %p") if s.last_price_poll else "Never"} ET
 </p>
 '''
         
@@ -1154,7 +1156,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
             
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
             <div class="metar-info">
-                <strong>Latest METAR:</strong> {metar_local_str} local — <span class="current-temp">{current_temp_str}</span> |
+                <strong>Latest METAR:</strong> {metar_local_str} local &nbsp;&nbsp; <span class="current-temp">{current_temp_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp;
                 <strong>Day's Range:</strong> <strong>HIGH</strong> {state.observed_high or "?"}&#176;F &nbsp; <strong>LOW</strong> {state.observed_low or "?"}&#176;F
             </div>'''
             
@@ -1162,11 +1164,13 @@ summary {{ cursor: pointer; color: #8b949e; }}
             if state.high_watchlist:
                 html += '<h4>HIGH Watchlist</h4>'
                 html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike or 0, reverse=True):
+                for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike if x.floor_strike is not None else -999, reverse=True):
+                    floor_display = b.floor_strike if b.floor_strike is not None else "—"
+                    cap_display = b.cap_strike if b.cap_strike is not None else "—"
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "—"}</td>
-                        <td>{b.cap_strike or "—"}</td>
+                        <td>{floor_display}</td>
+                        <td>{cap_display}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
                         <td class="open">OPEN</td>
@@ -1177,11 +1181,13 @@ summary {{ cursor: pointer; color: #8b949e; }}
             if state.low_watchlist:
                 html += '<h4>LOW Watchlist</h4>'
                 html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike or 999):
+                for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike if x.cap_strike is not None else 999):
+                    floor_display = b.floor_strike if b.floor_strike is not None else "—"
+                    cap_display = b.cap_strike if b.cap_strike is not None else "—"
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "—"}</td>
-                        <td>{b.cap_strike or "—"}</td>
+                        <td>{floor_display}</td>
+                        <td>{cap_display}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
                         <td class="open">OPEN</td>
