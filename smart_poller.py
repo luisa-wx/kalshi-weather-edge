@@ -710,8 +710,44 @@ class WXSniper:
     # POLLING & SNIPE DETECTION
     # ============================================================
     
+    def _fetch_metar_nws_txt(self, station: str) -> Optional[str]:
+        """Fetch METAR from NWS TXT (often faster, no caching)."""
+        try:
+            url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                lines = resp.text.strip().split('\n')
+                # First line is timestamp, second line is METAR
+                if len(lines) >= 2:
+                    return lines[1].strip()
+        except:
+            pass
+        return None
+    
+    def _fetch_metars_aviation_api(self, stations: List[str]) -> Dict[str, str]:
+        """Fetch METARs from Aviation Weather API (batch, but can be cached)."""
+        result = {}
+        try:
+            ids_param = ','.join(stations)
+            # Add cache-buster
+            url = f"https://aviationweather.gov/api/data/metar?ids={ids_param}&format=json&_t={int(time.time())}"
+            headers = {'User-Agent': 'WXSniper/4.0'}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                metars = resp.json()
+                if not isinstance(metars, list):
+                    metars = [metars]
+                for m in metars:
+                    station = m.get('icaoId') or m.get('stationId')
+                    raw = m.get('rawOb', '')
+                    if station and raw:
+                        result[station] = raw
+        except:
+            pass
+        return result
+    
     def poll_and_snipe(self):
-        """Fetch METARs, detect transitions, execute snipes."""
+        """Fetch METARs from multiple sources, detect transitions, execute snipes."""
         active_stations = [
             station for station, state in self.states.items()
             if state.high_watchlist or state.low_watchlist
@@ -724,25 +760,40 @@ class WXSniper:
         print(f"[METAR] Polling {len(active_stations)} stations...")
         
         try:
-            ids_param = ','.join(active_stations)
-            url = f"https://aviationweather.gov/api/data/metar?ids={ids_param}&format=json"
-            headers = {'User-Agent': 'WXSniper/4.0 (weather-trading-bot)'}
+            # Strategy: Try NWS TXT first (faster), fall back to Aviation API
+            metars_found = {}
             
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 204 or resp.status_code != 200:
-                return
+            # 1. Try NWS TXT for each station IN PARALLEL
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=12) as executor:
+                futures = {executor.submit(self._fetch_metar_nws_txt, station): station 
+                          for station in active_stations}
+                for future in as_completed(futures, timeout=6):
+                    station = futures[future]
+                    try:
+                        raw = future.result()
+                        if raw:
+                            metars_found[station] = raw
+                    except:
+                        pass
             
-            metars = resp.json()
-            if not isinstance(metars, list):
-                metars = [metars]
+            nws_count = len(metars_found)
             
-            for metar_data in metars:
-                station = metar_data.get('icaoId') or metar_data.get('stationId')
-                if not station or station not in self.states:
+            # 2. Fall back to Aviation API for any missing
+            missing = [s for s in active_stations if s not in metars_found]
+            if missing:
+                api_metars = self._fetch_metars_aviation_api(missing)
+                metars_found.update(api_metars)
+            
+            api_count = len(metars_found) - nws_count
+            print(f"  [METAR] Got {nws_count} from NWS TXT, {api_count} from API")
+            
+            # Process all METARs
+            for station, raw in metars_found.items():
+                if station not in self.states:
                     continue
                 
                 state = self.states[station]
-                raw = metar_data.get('rawOb', '')
                 
                 # Debug: log if METAR changed
                 if raw != state.latest_metar:
@@ -991,7 +1042,7 @@ class WXSniper:
             minute = now.minute
             
             # Hot window: :52 to :02
-            is_hot = minute >= 52 or minute <= 2
+            is_hot = minute >= 50 or minute <= 5
             
             # Poll METARs
             self.poll_and_snipe()
@@ -1038,7 +1089,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         now = datetime.now(timezone.utc)
         now_et = datetime.now(ZoneInfo('America/New_York'))
         minute = now.minute
-        is_hot = minute >= 52 or minute <= 2
+        is_hot = minute >= 50 or minute <= 5
         
         total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) for st in s.states.values())
         total_resolved = sum(len(st.resolved_brackets) for st in s.states.values())
