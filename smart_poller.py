@@ -479,19 +479,33 @@ class WXSniper:
         print(f"[CONFIG] Max NO: {self.max_no_price}¢ | Max YES: {self.max_yes_price}¢")
         print(f"[CONFIG] Stations: {list(self.states.keys())}")
         
-        # Start health server
+        # Start health server FIRST so health checks pass
         HealthHandler.poller = self
         health_thread = threading.Thread(target=start_health_server, daemon=True)
         health_thread.start()
         
-        # Initial fetch
-        self.fetch_all_metars()
-        self.fetch_all_prices()
-        self.find_opportunities()
+        # Give the server a moment to bind
+        time.sleep(1)
+        print(f"[HTTP] Health server ready")
+        
+        # Now do initial fetches (can take a while)
+        try:
+            self.fetch_all_metars()
+        except Exception as e:
+            print(f"[WARN] Initial METAR fetch failed: {e}")
+        
+        try:
+            self.fetch_all_prices()
+            self.find_opportunities()
+        except Exception as e:
+            print(f"[WARN] Initial price fetch failed: {e}")
         
         # Main loop
         while True:
-            self.poll_cycle()
+            try:
+                self.poll_cycle()
+            except Exception as e:
+                print(f"[ERROR] Poll cycle failed: {e}")
             time.sleep(10)
 
 # ============================================================
