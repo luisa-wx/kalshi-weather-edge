@@ -526,10 +526,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'OK')
         else:
             self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
             html = self.build_dashboard()
-            self.wfile.write(html.encode())
+            self.wfile.write(html.encode('utf-8'))
     
     def build_dashboard(self) -> str:
         p = HealthHandler.poller
@@ -540,6 +540,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         
         html = f'''<!DOCTYPE html>
 <html><head>
+<meta charset="UTF-8">
 <title>WX Sniper v3.6</title>
 <meta http-equiv="refresh" content="30">
 <style>
@@ -560,11 +561,11 @@ tr:hover {{ background: #161b22; }}
 .time {{ color: #8b949e; font-size: 12px; }}
 </style>
 </head><body>
-<h1>🎯 WX Sniper v3.6</h1>
+<h1>WX Sniper v3.6</h1>
 <p>
-    Mode: <strong>{"🔴 LIVE" if p.live_mode else "🧪 DRY RUN"}</strong> |
-    Max NO: <strong>{p.max_no_price}¢</strong> |
-    Max YES: <strong>{p.max_yes_price}¢</strong>
+    Mode: <strong>{"LIVE" if p.live_mode else "DRY RUN"}</strong> |
+    Max NO: <strong>{p.max_no_price}c</strong> |
+    Max YES: <strong>{p.max_yes_price}c</strong>
 </p>
 <p class="time">
     UTC: {now.strftime("%Y-%m-%d %H:%M:%S")} |
@@ -574,7 +575,7 @@ tr:hover {{ background: #161b22; }}
 '''
         
         # Opportunities section
-        html += f"<h2>🎯 Opportunities ({len(p.opportunities)})</h2>"
+        html += f"<h2>Opportunities ({len(p.opportunities)})</h2>"
         if p.opportunities:
             html += '<table><tr><th>Station</th><th>Bracket</th><th>Action</th><th>Price</th><th>Reason</th></tr>'
             for opp in p.opportunities:
@@ -592,7 +593,7 @@ tr:hover {{ background: #161b22; }}
             html += '<p>No opportunities found at current prices.</p>'
         
         # Station data
-        html += "<h2>📊 Station Data</h2>"
+        html += "<h2>Station Data</h2>"
         
         for station, state in p.states.items():
             cfg = STATIONS.get(station, {})
@@ -603,7 +604,7 @@ tr:hover {{ background: #161b22; }}
             metar_preview = state.latest_metar[:60] + "..." if state.latest_metar and len(state.latest_metar) > 60 else (state.latest_metar or "None")
             
             html += f'''<h3>{city} ({station}) 
-                <span class="time">🕐 {local_time}</span>
+                <span class="time">{local_time}</span>
             </h3>
             <p>
                 <strong>Observed:</strong> HIGH={state.observed_high or "?"}°F, LOW={state.observed_low or "?"}°F |
@@ -680,7 +681,7 @@ tr:hover {{ background: #161b22; }}
         
         # Trade log
         if p.trade_log:
-            html += f"<h2>💰 Trade Log ({len(p.trade_log)})</h2>"
+            html += f"<h2>Trade Log ({len(p.trade_log)})</h2>"
             html += '<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Side</th><th>Price</th><th>Status</th></tr>'
             for t in reversed(p.trade_log[-20:]):
                 status = "✅" if t.get('success') else "❌"
