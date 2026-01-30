@@ -277,8 +277,8 @@ class SmartPoller:
         for station, cfg in STATIONS.items():
             self.market_states[station] = MarketState(
                 station=station,
-                high_ticker_base=cfg['high_ticker'],
-                low_ticker_base=cfg['low_ticker']
+                high_ticker_base=cfg.get('kalshi_high_ticker'),
+                low_ticker_base=cfg.get('kalshi_low_ticker')
             )
     
     def build_watchlist(self):
@@ -289,90 +289,92 @@ class SmartPoller:
             state.watchlist = []
             
             # HIGH markets
-            high_event = f"{state.high_ticker_base}-{today}"
-            high_brackets = []
-            try:
-                markets = self.kalshi.get_markets_for_event(high_event)
-                for m in markets:
-                    if m.get('status') != 'active':
-                        continue
-                    
-                    ticker = m.get('ticker', '')
-                    subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
-                    floor = m.get('floor_strike')
-                    cap = m.get('cap_strike')
-                    strike_type = m.get('strike_type', 'between')
-                    
-                    orderbook = self.kalshi.get_orderbook(ticker)
-                    no_asks = orderbook.get('no', {}).get('asks', [])
-                    yes_asks = orderbook.get('yes', {}).get('asks', [])
-                    no_ask = min([a[0] for a in no_asks]) if no_asks else 100
-                    yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
-                    
-                    bracket = BracketInfo(
-                        ticker=ticker, event_ticker=high_event, subtitle=subtitle,
-                        floor_strike=int(floor) if floor else None,
-                        cap_strike=int(cap) if cap else None,
-                        strike_type=strike_type, signal_type='high',
-                        no_ask=no_ask, yes_ask=yes_ask, station=station
-                    )
-                    high_brackets.append(bracket)
-                
-                # Mark edge brackets for HIGH (the "X or above" bracket is the edge)
-                for b in high_brackets:
-                    if b.strike_type == 'greater':
-                        b.is_edge_bracket = True
-                    # Add to watchlist if price is good for either side
-                    if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
-                        state.watchlist.append(b)
-                        edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
-                        print(f"  ✓ {b.subtitle:<18} (high) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+            if state.high_ticker_base:
+                high_event = f"{state.high_ticker_base}-{today}"
+                high_brackets = []
+                try:
+                    markets = self.kalshi.get_markets_for_event(high_event)
+                    for m in markets:
+                        if m.get('status') != 'active':
+                            continue
                         
-            except Exception as e:
-                print(f"[ERROR] {station} high: {e}")
+                        ticker = m.get('ticker', '')
+                        subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
+                        floor = m.get('floor_strike')
+                        cap = m.get('cap_strike')
+                        strike_type = m.get('strike_type', 'between')
+                        
+                        orderbook = self.kalshi.get_orderbook(ticker)
+                        no_asks = orderbook.get('no', {}).get('asks', [])
+                        yes_asks = orderbook.get('yes', {}).get('asks', [])
+                        no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                        yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
+                        
+                        bracket = BracketInfo(
+                            ticker=ticker, event_ticker=high_event, subtitle=subtitle,
+                            floor_strike=int(floor) if floor else None,
+                            cap_strike=int(cap) if cap else None,
+                            strike_type=strike_type, signal_type='high',
+                            no_ask=no_ask, yes_ask=yes_ask, station=station
+                        )
+                        high_brackets.append(bracket)
+                    
+                    # Mark edge brackets for HIGH (the "X or above" bracket is the edge)
+                    for b in high_brackets:
+                        if b.strike_type == 'greater':
+                            b.is_edge_bracket = True
+                        # Add to watchlist if price is good for either side
+                        if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
+                            state.watchlist.append(b)
+                            edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
+                            print(f"  ✓ {b.subtitle:<18} (high) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+                            
+                except Exception as e:
+                    print(f"[ERROR] {station} high: {e}")
             
             # LOW markets
-            low_event = f"{state.low_ticker_base}-{today}"
-            low_brackets = []
-            try:
-                markets = self.kalshi.get_markets_for_event(low_event)
-                for m in markets:
-                    if m.get('status') != 'active':
-                        continue
-                    
-                    ticker = m.get('ticker', '')
-                    subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
-                    floor = m.get('floor_strike')
-                    cap = m.get('cap_strike')
-                    strike_type = m.get('strike_type', 'between')
-                    
-                    orderbook = self.kalshi.get_orderbook(ticker)
-                    no_asks = orderbook.get('no', {}).get('asks', [])
-                    yes_asks = orderbook.get('yes', {}).get('asks', [])
-                    no_ask = min([a[0] for a in no_asks]) if no_asks else 100
-                    yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
-                    
-                    bracket = BracketInfo(
-                        ticker=ticker, event_ticker=low_event, subtitle=subtitle,
-                        floor_strike=int(floor) if floor else None,
-                        cap_strike=int(cap) if cap else None,
-                        strike_type=strike_type, signal_type='low',
-                        no_ask=no_ask, yes_ask=yes_ask, station=station
-                    )
-                    low_brackets.append(bracket)
-                
-                # Mark edge brackets for LOW (the "X or below" bracket is the edge)
-                for b in low_brackets:
-                    if b.strike_type == 'less':
-                        b.is_edge_bracket = True
-                    # Add to watchlist if price is good for either side
-                    if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
-                        state.watchlist.append(b)
-                        edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
-                        print(f"  ✓ {b.subtitle:<18} (low) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+            if state.low_ticker_base:
+                low_event = f"{state.low_ticker_base}-{today}"
+                low_brackets = []
+                try:
+                    markets = self.kalshi.get_markets_for_event(low_event)
+                    for m in markets:
+                        if m.get('status') != 'active':
+                            continue
                         
-            except Exception as e:
-                print(f"[ERROR] {station} low: {e}")
+                        ticker = m.get('ticker', '')
+                        subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
+                        floor = m.get('floor_strike')
+                        cap = m.get('cap_strike')
+                        strike_type = m.get('strike_type', 'between')
+                        
+                        orderbook = self.kalshi.get_orderbook(ticker)
+                        no_asks = orderbook.get('no', {}).get('asks', [])
+                        yes_asks = orderbook.get('yes', {}).get('asks', [])
+                        no_ask = min([a[0] for a in no_asks]) if no_asks else 100
+                        yes_ask = min([a[0] for a in yes_asks]) if yes_asks else 100
+                        
+                        bracket = BracketInfo(
+                            ticker=ticker, event_ticker=low_event, subtitle=subtitle,
+                            floor_strike=int(floor) if floor else None,
+                            cap_strike=int(cap) if cap else None,
+                            strike_type=strike_type, signal_type='low',
+                            no_ask=no_ask, yes_ask=yes_ask, station=station
+                        )
+                        low_brackets.append(bracket)
+                    
+                    # Mark edge brackets for LOW (the "X or below" bracket is the edge)
+                    for b in low_brackets:
+                        if b.strike_type == 'less':
+                            b.is_edge_bracket = True
+                        # Add to watchlist if price is good for either side
+                        if b.no_ask <= self.max_no_price or (b.is_edge_bracket and b.yes_ask <= self.max_yes_price):
+                            state.watchlist.append(b)
+                            edge_str = " 🎯 EDGE" if b.is_edge_bracket else ""
+                            print(f"  ✓ {b.subtitle:<18} (low) NO@{b.no_ask}¢ YES@{b.yes_ask}¢{edge_str}")
+                            
+                except Exception as e:
+                    print(f"[ERROR] {station} low: {e}")
             
             print(f"[WATCHLIST] {station}: {len(state.watchlist)} brackets")
     
