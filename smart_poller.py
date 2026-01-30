@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-WX Sniper v3.6 - Clean Rebuild
-==============================
-Simplified logic, correct bracket handling.
+WX Sniper v3.8 - Latency Sniper
+===============================
+The whole point: detect state TRANSITIONS and snipe before market reprices.
 
-Core Logic:
-- HIGH markets: "What will the daily HIGH be?"
-  - If observed temp > bracket's cap → bracket is DEAD → buy NO
-  - If edge bracket ("X or above") not yet hit → buy YES
-  
-- LOW markets: "What will the daily LOW be?"
-  - If observed temp < bracket's floor → bracket is DEAD → buy NO
-  - If edge bracket ("X or below") not yet hit → buy YES
+WATCHLIST MODEL:
+- At startup, all brackets are "open" (could go either way)
+- As METARs come in, brackets transition: OPEN → DEAD or OPEN → LOCKED
+- The INSTANT a transition happens, execute the trade
+- Remove from watchlist (no more API calls needed for that bracket)
 
-Polling:
-- METARs: Fetch on startup, then poll :52-:02 window
-- Prices: Fetch every 10 min (or on startup)
-- Watchlist: Build at :45, refresh prices until :02
+STATE TRANSITIONS:
+- OPEN → DEAD: Buy NO (bracket can never win now)
+- OPEN → LOCKED: Buy YES (bracket is guaranteed to win now)
+
+This minimizes API calls by only watching what matters.
 """
 
 import os
@@ -24,13 +22,13 @@ import re
 import time
 import json
 import threading
+import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Set
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Imports from your existing modules
 from config import STATIONS
 from kalshi_client import KalshiClient
 from aviation_weather import AviationWeatherPoller
@@ -44,145 +42,123 @@ class ParsedMETAR:
     raw: str
     temp_c: Optional[float] = None
     temp_f: Optional[int] = None
-    obs_time: Optional[datetime] = None
-    is_synoptic: bool = False  # True if this is a synoptic METAR (has 6-hr extremes)
     six_hr_max_c: Optional[float] = None
     six_hr_min_c: Optional[float] = None
 
-def parse_metar(raw: str) -> ParsedMETAR:
-    """Parse METAR string, extract T-group temp and 6-hr extremes if present."""
-    result = ParsedMETAR(raw=raw)
-    
-    # Extract T-group (high precision temp): T01061000 = +10.6°C temp, +10.0°C dewpoint
-    t_match = re.search(r'\bT(\d)(\d{3})(\d)(\d{3})\b', raw)
-    if t_match:
-        temp_sign = -1 if t_match.group(1) == '1' else 1
-        temp_val = int(t_match.group(2)) / 10.0
-        result.temp_c = temp_sign * temp_val
-        result.temp_f = nws_round(result.temp_c * 9/5 + 32)
-    
-    # Extract 6-hour max (1-group): 10170 = max 17.0°C
-    max_match = re.search(r'\b1(\d)(\d{3})\b', raw)
-    if max_match:
-        sign = -1 if max_match.group(1) == '1' else 1
-        result.six_hr_max_c = sign * int(max_match.group(2)) / 10.0
-        result.is_synoptic = True
-    
-    # Extract 6-hour min (2-group): 20046 = min 4.6°C
-    min_match = re.search(r'\b2(\d)(\d{3})\b', raw)
-    if min_match:
-        sign = -1 if min_match.group(1) == '1' else 1
-        result.six_hr_min_c = sign * int(min_match.group(2)) / 10.0
-        result.is_synoptic = True
-    
-    return result
-
 def nws_round(temp_f: float) -> int:
-    """NWS rounding: round half up (away from zero for negative)."""
-    if temp_f >= 0:
-        return int(temp_f + 0.5)
-    else:
-        return int(temp_f - 0.5)
+    """NWS rounding: round half up."""
+    import math
+    return math.floor(temp_f + 0.5)
 
 def c_to_f_nws(temp_c: float) -> int:
     """Convert Celsius to Fahrenheit with NWS rounding."""
     return nws_round(temp_c * 9/5 + 32)
 
+def parse_metar(raw: str) -> ParsedMETAR:
+    """Parse METAR string."""
+    result = ParsedMETAR(raw=raw)
+    
+    # T-group: T01061000 = +10.6°C
+    t_match = re.search(r'\bT(\d)(\d{3})(\d)(\d{3})\b', raw)
+    if t_match:
+        temp_sign = -1 if t_match.group(1) == '1' else 1
+        result.temp_c = temp_sign * int(t_match.group(2)) / 10.0
+        result.temp_f = nws_round(result.temp_c * 9/5 + 32)
+    
+    # 6-hour max (1-group)
+    max_match = re.search(r'\b1(\d)(\d{3})\b', raw)
+    if max_match:
+        sign = -1 if max_match.group(1) == '1' else 1
+        result.six_hr_max_c = sign * int(max_match.group(2)) / 10.0
+    
+    # 6-hour min (2-group)
+    min_match = re.search(r'\b2(\d)(\d{3})\b', raw)
+    if min_match:
+        sign = -1 if min_match.group(1) == '1' else 1
+        result.six_hr_min_c = sign * int(min_match.group(2)) / 10.0
+    
+    return result
+
 # ============================================================
-# DATA STRUCTURES
+# BRACKET STATE
 # ============================================================
 
-@dataclass
-class Bracket:
-    ticker: str
-    subtitle: str
-    floor_strike: Optional[int]  # Lower bound (or None for "X or below")
-    cap_strike: Optional[int]    # Upper bound (or None for "X or above")
-    strike_type: str             # 'greater', 'less', 'between'
-    signal_type: str             # 'high' or 'low'
-    station: str
-    no_ask: int = 100
-    yes_ask: int = 100
+class BracketState:
+    """Tracks state of a single bracket."""
+    
+    def __init__(self, ticker: str, subtitle: str, floor_strike: Optional[int], 
+                 cap_strike: Optional[int], strike_type: str, signal_type: str, station: str):
+        self.ticker = ticker
+        self.subtitle = subtitle
+        self.floor_strike = floor_strike
+        self.cap_strike = cap_strike
+        self.strike_type = strike_type  # 'greater', 'less', 'between'
+        self.signal_type = signal_type  # 'high' or 'low'
+        self.station = station
+        
+        # Prices (updated periodically)
+        self.no_ask: int = 100
+        self.yes_ask: int = 100
+        
+        # State tracking
+        self.status: str = 'open'  # 'open', 'dead', 'locked'
+        self.traded: bool = False  # Have we already traded this?
     
     @property
     def is_edge(self) -> bool:
-        """Edge brackets are 'X or above' (high) or 'X or below' (low)."""
         return self.strike_type in ('greater', 'less')
     
-    def is_dead(self, observed_high: Optional[int], observed_low: Optional[int]) -> bool:
+    def check_status(self, observed_high: Optional[int], observed_low: Optional[int]) -> str:
         """
-        Check if this bracket is DEAD (cannot settle YES).
-        
-        For HIGH brackets: 
-          - "X to Y" is dead if observed_high > cap (we've exceeded the range)
-          - "X or above" can never be dead (high can always go higher)
-          
-        For LOW brackets:
-          - "X to Y" is dead if observed_low < floor (we've gone below the range)  
-          - "X or below" is dead if observed_low > cap (low is already too warm - it's LOCKED)
-          - "X or above" (warm edge) is dead if observed_low < floor (low went below X)
+        Determine current status based on observations.
+        Returns: 'open', 'dead', or 'locked'
         """
         if self.signal_type == 'high':
             if observed_high is None:
-                return False
-            if self.cap_strike is not None:
-                return observed_high > self.cap_strike
-            return False  # "X or above" edge - never dead
-        else:  # low
+                return 'open'
+            
+            # HIGH "X to Y" or "X or below": dead if exceeded cap
+            if self.cap_strike is not None and observed_high > self.cap_strike:
+                return 'dead'
+            
+            # HIGH "X or above": locked if we hit it
+            if self.is_edge and self.floor_strike is not None and observed_high >= self.floor_strike:
+                return 'locked'
+            
+            return 'open'
+        
+        else:  # LOW
             if observed_low is None:
-                return False
+                return 'open'
             
-            # "X or below" edge (cold edge) - floor is None, cap is the threshold
+            # LOW "X or below" (cold edge): dead if low > cap (too warm, locked out)
             if self.floor_strike is None and self.cap_strike is not None:
-                # Dead if the observed low is ABOVE the cap (too warm, can never hit)
-                return observed_low > self.cap_strike
+                if observed_low > self.cap_strike:
+                    return 'dead'
+                if observed_low <= self.cap_strike:
+                    return 'locked'  # We hit it!
             
-            # "X or above" edge (warm edge) - cap is None, floor is the threshold  
+            # LOW "X or above" (warm edge): dead if low < floor
             if self.cap_strike is None and self.floor_strike is not None:
-                # Dead if observed low went BELOW the floor
-                return observed_low < self.floor_strike
+                if observed_low < self.floor_strike:
+                    return 'dead'
+                # Can't be locked - low could still drop
+                return 'open'
             
-            # Range bracket "X to Y"
+            # LOW "X to Y" (range): dead if low < floor
             if self.floor_strike is not None and self.cap_strike is not None:
-                # Dead if low went below the floor (too cold)
-                return observed_low < self.floor_strike
+                if observed_low < self.floor_strike:
+                    return 'dead'
+                return 'open'
             
-            return False
-    
-    def is_edge_opportunity(self, observed_high: Optional[int], observed_low: Optional[int]) -> bool:
-        """
-        Check if this is an edge bracket that hasn't been hit yet (still possible to win YES).
-        
-        For HIGH "X or above": opportunity if observed_high < floor (hasn't reached X yet)
-        For LOW "X or below": opportunity if observed_low <= cap (low is cold enough to still be in range)
-        For LOW "X or above": opportunity if observed_low >= floor (low hasn't dropped below X)
-        """
-        if not self.is_edge:
-            return False
-        
-        if self.signal_type == 'high':
-            # "X or above" - opportunity if we haven't hit X yet
-            if observed_high is None or self.floor_strike is None:
-                return False
-            return observed_high < self.floor_strike
-        else:  # low
-            # "X or below" (cold edge) - floor is None
-            if self.floor_strike is None and self.cap_strike is not None:
-                if observed_low is None:
-                    return False
-                # Opportunity ONLY if low is AT OR BELOW the cap (could still settle here)
-                return observed_low <= self.cap_strike
-            
-            # "X or above" (warm edge) - cap is None
-            if self.cap_strike is None and self.floor_strike is not None:
-                if observed_low is None:
-                    return False
-                # Opportunity if low is still at or above the floor (hasn't dropped below)
-                return observed_low >= self.floor_strike
-            
-            return False
+            return 'open'
 
-@dataclass 
+
+# ============================================================
+# STATION STATE
+# ============================================================
+
+@dataclass
 class StationState:
     station: str
     observed_high: Optional[int] = None
@@ -190,12 +166,18 @@ class StationState:
     latest_metar: Optional[str] = None
     latest_temp_f: Optional[int] = None
     metar_time: Optional[datetime] = None
-    high_brackets: List[Bracket] = field(default_factory=list)
-    low_brackets: List[Bracket] = field(default_factory=list)
-    current_local_date: Optional[str] = None  # Track which local date the obs are for
+    current_local_date: Optional[str] = None
+    
+    # Watchlist: brackets we're still monitoring
+    high_watchlist: List[BracketState] = field(default_factory=list)
+    low_watchlist: List[BracketState] = field(default_factory=list)
+    
+    # Resolved: brackets that are done (for display only)
+    resolved_brackets: List[BracketState] = field(default_factory=list)
+
 
 # ============================================================
-# MAIN POLLER
+# MAIN SNIPER
 # ============================================================
 
 class WXSniper:
@@ -205,10 +187,9 @@ class WXSniper:
         
         # Config
         self.live_mode = os.environ.get('LIVE_MODE', 'true').lower() == 'true'
-        self.max_no_price = int(os.environ.get('MAX_NO_PRICE', '95'))
-        self.max_yes_price = int(os.environ.get('MAX_YES_PRICE', '95'))
+        self.max_price = int(os.environ.get('MAX_PRICE', '95'))  # Max price to pay
         
-        # State
+        # State per station
         self.states: Dict[str, StationState] = {}
         for station in STATIONS.keys():
             self.states[station] = StationState(station=station)
@@ -217,88 +198,88 @@ class WXSniper:
         self.last_metar_poll: Optional[datetime] = None
         self.last_price_poll: Optional[datetime] = None
         self.trade_log: List[dict] = []
-        self.opportunities: List[dict] = []  # Current opportunities
+        self.snipes: List[dict] = []  # Recent snipes for display
         
     def get_local_date(self, station: str) -> str:
-        """Get today's date in station's local timezone."""
         tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
-        tz = ZoneInfo(tz_name)
-        return datetime.now(tz).strftime('%Y-%m-%d')
-    
-    def get_local_time_str(self, station: str) -> str:
-        """Get current time string in station's local timezone."""
-        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
-        tz = ZoneInfo(tz_name)
-        return datetime.now(tz).strftime('%H:%M %Z')
+        return datetime.now(ZoneInfo(tz_name)).strftime('%Y-%m-%d')
 
     # ============================================================
-    # METAR FETCHING
+    # INITIALIZATION
     # ============================================================
     
-    def fetch_all_metars(self):
-        """Fetch METARs for all stations, update observed temps."""
-        print(f"[METAR] Fetching all stations...")
+    def init_watchlists(self):
+        """Initialize watchlists with all brackets from Kalshi."""
+        print(f"[INIT] Building watchlists...")
+        now = datetime.now(timezone.utc)
+        today_suffix = now.strftime('%y%b%d').upper()
         
         for station, state in self.states.items():
-            try:
-                # Check if local date has changed - reset obs if so
-                current_local_date = self.get_local_date(station)
-                if state.current_local_date != current_local_date:
-                    if state.current_local_date is not None:
-                        print(f"  [{station}] New local date {current_local_date} - resetting obs")
-                    state.current_local_date = current_local_date
-                    state.observed_high = None
-                    state.observed_low = None
-                
-                metar = self.weather.fetch_metar(station)
-                if metar:
-                    raw = metar.raw_text if hasattr(metar, 'raw_text') else str(metar)
-                    parsed = parse_metar(raw)
+            cfg = STATIONS.get(station, {})
+            high_ticker = cfg.get('kalshi_high_ticker')
+            low_ticker = cfg.get('kalshi_low_ticker')
+            
+            state.high_watchlist = []
+            state.low_watchlist = []
+            state.resolved_brackets = []
+            
+            # Fetch HIGH brackets
+            if high_ticker:
+                try:
+                    event = f"{high_ticker}-{today_suffix}"
+                    event_data = self.kalshi.get_event(event)
+                    event_obj = event_data.get('event', event_data)
+                    markets = event_obj.get('markets', [])
                     
-                    state.latest_metar = raw
+                    for m in markets:
+                        b = BracketState(
+                            ticker=m.get('ticker', ''),
+                            subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                            floor_strike=int(m.get('floor_strike')) if m.get('floor_strike') else None,
+                            cap_strike=int(m.get('cap_strike')) if m.get('cap_strike') else None,
+                            strike_type=m.get('strike_type', 'between'),
+                            signal_type='high',
+                            station=station
+                        )
+                        b.no_ask = int(m.get('no_ask') or 100)
+                        b.yes_ask = int(m.get('yes_ask') or 100)
+                        state.high_watchlist.append(b)
                     
-                    # Use actual observation time from METAR if available
-                    if hasattr(metar, 'observation_time') and metar.observation_time:
-                        state.metar_time = metar.observation_time
-                    else:
-                        state.metar_time = datetime.now(timezone.utc)
+                    print(f"  {station} HIGH: {len(state.high_watchlist)} brackets")
+                except Exception as e:
+                    print(f"  {station} HIGH: ERROR - {e}")
+            
+            # Fetch LOW brackets
+            if low_ticker:
+                try:
+                    event = f"{low_ticker}-{today_suffix}"
+                    event_data = self.kalshi.get_event(event)
+                    event_obj = event_data.get('event', event_data)
+                    markets = event_obj.get('markets', [])
                     
-                    if parsed.temp_f is not None:
-                        state.latest_temp_f = parsed.temp_f
-                        
-                        # Update observed high/low
-                        if state.observed_high is None or parsed.temp_f > state.observed_high:
-                            state.observed_high = parsed.temp_f
-                        if state.observed_low is None or parsed.temp_f < state.observed_low:
-                            state.observed_low = parsed.temp_f
+                    for m in markets:
+                        b = BracketState(
+                            ticker=m.get('ticker', ''),
+                            subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                            floor_strike=int(m.get('floor_strike')) if m.get('floor_strike') else None,
+                            cap_strike=int(m.get('cap_strike')) if m.get('cap_strike') else None,
+                            strike_type=m.get('strike_type', 'between'),
+                            signal_type='low',
+                            station=station
+                        )
+                        b.no_ask = int(m.get('no_ask') or 100)
+                        b.yes_ask = int(m.get('yes_ask') or 100)
+                        state.low_watchlist.append(b)
                     
-                    # Check for 6-hour extremes in synoptic METARs
-                    if parsed.six_hr_max_c is not None:
-                        max_f = c_to_f_nws(parsed.six_hr_max_c)
-                        if state.observed_high is None or max_f > state.observed_high:
-                            state.observed_high = max_f
-                            print(f"  [SYNOPTIC] {station} 6hr max: {max_f}°F")
-                    
-                    if parsed.six_hr_min_c is not None:
-                        min_f = c_to_f_nws(parsed.six_hr_min_c)
-                        if state.observed_low is None or min_f < state.observed_low:
-                            state.observed_low = min_f
-                            print(f"  [SYNOPTIC] {station} 6hr min: {min_f}°F")
-                    
-                    print(f"  {station}: {state.latest_temp_f}°F (high={state.observed_high}, low={state.observed_low})")
-                    
-            except Exception as e:
-                print(f"  {station}: ERROR - {e}")
+                    print(f"  {station} LOW: {len(state.low_watchlist)} brackets")
+                except Exception as e:
+                    print(f"  {station} LOW: ERROR - {e}")
         
-        self.last_metar_poll = datetime.now(timezone.utc)
-        print(f"[METAR] Done\n")
-
-    def fetch_historical_metars(self):
-        """
-        Fetch historical METARs for today (since local midnight) to establish 
-        accurate daily high/low on startup.
-        """
-        print(f"[HISTORY] Fetching today's historical METARs...")
+        self.last_price_poll = datetime.now(timezone.utc)
+    
+    def fetch_historical_temps(self):
+        """Fetch historical METARs to get accurate daily high/low."""
+        print(f"[INIT] Fetching historical temps...")
         
         for station, state in self.states.items():
             try:
@@ -306,41 +287,24 @@ class WXSniper:
                 tz_name = cfg.get('timezone', 'America/New_York')
                 tz = ZoneInfo(tz_name)
                 
-                # Get local midnight for this station
                 now_local = datetime.now(tz)
-                local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+                hours = max(1, now_local.hour + 1)
                 
-                # Calculate hours since local midnight
-                hours_since_midnight = (now_local - local_midnight).total_seconds() / 3600
-                hours_to_fetch = max(1, min(24, int(hours_since_midnight) + 1))
+                url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours={hours}"
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
                 
-                # Fetch historical METARs
-                url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw&hours={hours_to_fetch}"
-                response = self.weather.session.get(url, timeout=15)
-                response.raise_for_status()
-                
-                metars = response.text.strip().split('\n')
-                print(f"  {station}: Fetched {len(metars)} METARs for past {hours_to_fetch}h")
-                
-                # Set current local date
                 state.current_local_date = now_local.strftime('%Y-%m-%d')
                 state.observed_high = None
                 state.observed_low = None
                 
-                for raw in metars:
-                    raw = raw.strip()
-                    if not raw or raw.startswith('#'):
+                for line in resp.text.strip().split('\n'):
+                    line = line.strip()
+                    if not line:
                         continue
                     
-                    parsed = parse_metar(raw)
-                    
-                    # Parse METAR time to check if it's from today (local time)
-                    obs_time = self.weather._parse_obs_time(raw)
-                    if obs_time:
-                        obs_local = obs_time.astimezone(tz)
-                        # Skip if not from today
-                        if obs_local.date() != now_local.date():
-                            continue
+                    parsed = parse_metar(line)
                     
                     if parsed.temp_f is not None:
                         if state.observed_high is None or parsed.temp_f > state.observed_high:
@@ -348,7 +312,6 @@ class WXSniper:
                         if state.observed_low is None or parsed.temp_f < state.observed_low:
                             state.observed_low = parsed.temp_f
                     
-                    # Also check 6-hour extremes
                     if parsed.six_hr_max_c is not None:
                         max_f = c_to_f_nws(parsed.six_hr_max_c)
                         if state.observed_high is None or max_f > state.observed_high:
@@ -358,195 +321,183 @@ class WXSniper:
                         min_f = c_to_f_nws(parsed.six_hr_min_c)
                         if state.observed_low is None or min_f < state.observed_low:
                             state.observed_low = min_f
-                    
-                    # Store the most recent METAR
-                    state.latest_metar = raw
-                    state.latest_temp_f = parsed.temp_f
-                    if obs_time:
-                        state.metar_time = obs_time
                 
-                print(f"    -> Today's HIGH={state.observed_high}°F, LOW={state.observed_low}°F")
+                print(f"  [{station}] HIGH={state.observed_high}°F LOW={state.observed_low}°F")
                 
             except Exception as e:
-                print(f"  {station}: ERROR fetching history - {e}")
-        
-        print(f"[HISTORY] Done\n")
-
-    # ============================================================
-    # PRICE FETCHING
-    # ============================================================
+                print(f"  [{station}] Error: {e}")
     
-    def fetch_all_prices(self):
-        """Fetch current prices for all brackets."""
-        print(f"[PRICES] Fetching all brackets...")
-        now = datetime.now(timezone.utc)
-        today_suffix = now.strftime('%y%b%d').upper()  # e.g., "26JAN30"
+    def prune_watchlists(self):
+        """
+        Check all watchlists against current observations.
+        Remove already-dead/locked brackets (we missed them).
+        """
+        print(f"[INIT] Pruning watchlists...")
         
         for station, state in self.states.items():
-            cfg = STATIONS.get(station, {})
-            high_ticker_base = cfg.get('kalshi_high_ticker')
-            low_ticker_base = cfg.get('kalshi_low_ticker')
+            # Check HIGH watchlist
+            still_open = []
+            for b in state.high_watchlist:
+                status = b.check_status(state.observed_high, state.observed_low)
+                if status == 'open':
+                    still_open.append(b)
+                else:
+                    b.status = status
+                    state.resolved_brackets.append(b)
+            state.high_watchlist = still_open
             
-            state.high_brackets = []
-            state.low_brackets = []
+            # Check LOW watchlist
+            still_open = []
+            for b in state.low_watchlist:
+                status = b.check_status(state.observed_high, state.observed_low)
+                if status == 'open':
+                    still_open.append(b)
+                else:
+                    b.status = status
+                    state.resolved_brackets.append(b)
+            state.low_watchlist = still_open
             
-            # Fetch HIGH brackets
-            if high_ticker_base:
-                try:
-                    high_event = f"{high_ticker_base}-{today_suffix}"
-                    event_data = self.kalshi.get_event(high_event)
-                    # API returns {event: {markets: [...]}} structure
-                    event_obj = event_data.get('event', event_data)
-                    markets = event_obj.get('markets', [])
-                    
-                    for m in markets:
-                        ticker = m.get('ticker', '')
-                        subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
-                        floor = m.get('floor_strike')
-                        cap = m.get('cap_strike')
-                        strike_type = m.get('strike_type', 'between')
-                        
-                        no_ask = m.get('no_ask') or 100
-                        yes_ask = m.get('yes_ask') or 100
-                        
-                        bracket = Bracket(
-                            ticker=ticker, subtitle=subtitle,
-                            floor_strike=int(floor) if floor else None,
-                            cap_strike=int(cap) if cap else None,
-                            strike_type=strike_type, signal_type='high',
-                            station=station, no_ask=int(no_ask), yes_ask=int(yes_ask)
-                        )
-                        state.high_brackets.append(bracket)
-                    
-                    print(f"  {station} HIGH: {len(state.high_brackets)} brackets")
-                except Exception as e:
-                    print(f"  {station} HIGH: ERROR - {e}")
-            
-            # Fetch LOW brackets
-            if low_ticker_base:
-                try:
-                    low_event = f"{low_ticker_base}-{today_suffix}"
-                    event_data = self.kalshi.get_event(low_event)
-                    # API returns {event: {markets: [...]}} structure
-                    event_obj = event_data.get('event', event_data)
-                    markets = event_obj.get('markets', [])
-                    
-                    for m in markets:
-                        ticker = m.get('ticker', '')
-                        subtitle = m.get('yes_sub_title', m.get('subtitle', ''))
-                        floor = m.get('floor_strike')
-                        cap = m.get('cap_strike')
-                        strike_type = m.get('strike_type', 'between')
-                        
-                        no_ask = m.get('no_ask') or 100
-                        yes_ask = m.get('yes_ask') or 100
-                        
-                        bracket = Bracket(
-                            ticker=ticker, subtitle=subtitle,
-                            floor_strike=int(floor) if floor else None,
-                            cap_strike=int(cap) if cap else None,
-                            strike_type=strike_type, signal_type='low',
-                            station=station, no_ask=int(no_ask), yes_ask=int(yes_ask)
-                        )
-                        state.low_brackets.append(bracket)
-                    
-                    print(f"  {station} LOW: {len(state.low_brackets)} brackets")
-                except Exception as e:
-                    print(f"  {station} LOW: ERROR - {e}")
-        
-        self.last_price_poll = datetime.now(timezone.utc)
-        print(f"[PRICES] Done\n")
+            high_count = len(state.high_watchlist)
+            low_count = len(state.low_watchlist)
+            resolved = len(state.resolved_brackets)
+            print(f"  [{station}] Watching: {high_count} HIGH, {low_count} LOW | Already resolved: {resolved}")
 
     # ============================================================
-    # OPPORTUNITY DETECTION
+    # METAR POLLING & SNIPE DETECTION
     # ============================================================
     
-    def find_opportunities(self) -> List[dict]:
+    def poll_and_snipe(self):
         """
-        Find all trading opportunities based on current state.
-        
-        Returns list of opportunities with action (buy NO or buy YES).
+        Fetch METARs, update observations, detect transitions, execute snipes.
+        This is the hot loop.
         """
-        opportunities = []
-        
         for station, state in self.states.items():
-            # Check HIGH brackets
-            for b in state.high_brackets:
-                # NO opportunity: bracket is DEAD (observed > cap)
-                if b.is_dead(state.observed_high, state.observed_low):
-                    if b.no_ask <= self.max_no_price:
-                        opportunities.append({
-                            'station': station,
-                            'bracket': b,
-                            'action': 'BUY_NO',
-                            'price': b.no_ask,
-                            'reason': f"HIGH dead: obs {state.observed_high}°F > cap {b.cap_strike}",
-                        })
-                
-                # YES opportunity: edge bracket HAS BEEN HIT (locked winner)
-                # For HIGH "X or above": buy YES if observed_high >= floor (we HIT it)
-                elif b.is_edge and b.floor_strike is not None:
-                    if state.observed_high is not None and state.observed_high >= b.floor_strike:
-                        if b.yes_ask <= self.max_yes_price:
-                            opportunities.append({
-                                'station': station,
-                                'bracket': b,
-                                'action': 'BUY_YES',
-                                'price': b.yes_ask,
-                                'reason': f"HIGH edge HIT: obs {state.observed_high}°F >= floor {b.floor_strike}",
-                            })
+            # Skip if nothing to watch
+            if not state.high_watchlist and not state.low_watchlist:
+                continue
             
-            # Check LOW brackets
-            for b in state.low_brackets:
-                # NO opportunity: bracket is DEAD
-                if b.is_dead(state.observed_high, state.observed_low):
-                    if b.no_ask <= self.max_no_price:
-                        opportunities.append({
-                            'station': station,
-                            'bracket': b,
-                            'action': 'BUY_NO',
-                            'price': b.no_ask,
-                            'reason': f"LOW dead: obs {state.observed_low}°F vs bracket",
-                        })
+            try:
+                metar = self.weather.fetch_metar(station)
+                if not metar:
+                    continue
                 
-                # YES opportunity: edge bracket HAS BEEN HIT (locked winner)
-                # For LOW "X or below": buy YES if observed_low <= cap (we HIT it)
-                elif b.is_edge and b.cap_strike is not None and b.floor_strike is None:
-                    if state.observed_low is not None and state.observed_low <= b.cap_strike:
-                        if b.yes_ask <= self.max_yes_price:
-                            opportunities.append({
-                                'station': station,
-                                'bracket': b,
-                                'action': 'BUY_YES',
-                                'price': b.yes_ask,
-                                'reason': f"LOW edge HIT: obs {state.observed_low}°F <= cap {b.cap_strike}",
-                            })
+                raw = metar.raw_text if hasattr(metar, 'raw_text') else str(metar)
+                parsed = parse_metar(raw)
+                
+                state.latest_metar = raw
+                state.metar_time = metar.observation_time if hasattr(metar, 'observation_time') else datetime.now(timezone.utc)
+                
+                # Track if observations changed
+                old_high = state.observed_high
+                old_low = state.observed_low
+                
+                # Update from current temp
+                if parsed.temp_f is not None:
+                    state.latest_temp_f = parsed.temp_f
+                    if state.observed_high is None or parsed.temp_f > state.observed_high:
+                        state.observed_high = parsed.temp_f
+                    if state.observed_low is None or parsed.temp_f < state.observed_low:
+                        state.observed_low = parsed.temp_f
+                
+                # Update from 6-hour groups
+                if parsed.six_hr_max_c is not None:
+                    max_f = c_to_f_nws(parsed.six_hr_max_c)
+                    if state.observed_high is None or max_f > state.observed_high:
+                        state.observed_high = max_f
+                        print(f"  [SYNOPTIC] {station} 6hr max: {max_f}°F")
+                
+                if parsed.six_hr_min_c is not None:
+                    min_f = c_to_f_nws(parsed.six_hr_min_c)
+                    if state.observed_low is None or min_f < state.observed_low:
+                        state.observed_low = min_f
+                        print(f"  [SYNOPTIC] {station} 6hr min: {min_f}°F")
+                
+                # Did observations change?
+                if state.observed_high != old_high or state.observed_low != old_low:
+                    print(f"  [{station}] Updated: HIGH={state.observed_high}°F LOW={state.observed_low}°F")
+                    
+                    # Check for transitions and snipe!
+                    self._check_transitions(state)
+                
+            except Exception as e:
+                print(f"  [{station}] Poll error: {e}")
         
-        self.opportunities = opportunities
-        return opportunities
-
-    # ============================================================
-    # TRADING
-    # ============================================================
+        self.last_metar_poll = datetime.now(timezone.utc)
     
-    def execute_trade(self, opp: dict) -> bool:
-        """Execute a trade for an opportunity."""
-        bracket = opp['bracket']
-        action = opp['action']
+    def _check_transitions(self, state: StationState):
+        """Check watchlists for OPEN → DEAD or OPEN → LOCKED transitions."""
+        
+        # Check HIGH watchlist
+        still_watching = []
+        for b in state.high_watchlist:
+            new_status = b.check_status(state.observed_high, state.observed_low)
+            
+            if new_status == 'dead' and b.status == 'open':
+                # TRANSITION: OPEN → DEAD
+                self._snipe(b, 'BUY_NO', b.no_ask, f"HIGH dead: {state.observed_high}°F > {b.cap_strike}°F")
+                b.status = 'dead'
+                state.resolved_brackets.append(b)
+            
+            elif new_status == 'locked' and b.status == 'open':
+                # TRANSITION: OPEN → LOCKED
+                self._snipe(b, 'BUY_YES', b.yes_ask, f"HIGH locked: {state.observed_high}°F >= {b.floor_strike}°F")
+                b.status = 'locked'
+                state.resolved_brackets.append(b)
+            
+            else:
+                still_watching.append(b)
+        
+        state.high_watchlist = still_watching
+        
+        # Check LOW watchlist
+        still_watching = []
+        for b in state.low_watchlist:
+            new_status = b.check_status(state.observed_high, state.observed_low)
+            
+            if new_status == 'dead' and b.status == 'open':
+                # TRANSITION: OPEN → DEAD
+                if b.floor_strike is None and b.cap_strike is not None:
+                    reason = f"LOW dead: {state.observed_low}°F > {b.cap_strike}°F (too warm)"
+                else:
+                    reason = f"LOW dead: {state.observed_low}°F < {b.floor_strike}°F"
+                self._snipe(b, 'BUY_NO', b.no_ask, reason)
+                b.status = 'dead'
+                state.resolved_brackets.append(b)
+            
+            elif new_status == 'locked' and b.status == 'open':
+                # TRANSITION: OPEN → LOCKED
+                self._snipe(b, 'BUY_YES', b.yes_ask, f"LOW locked: {state.observed_low}°F <= {b.cap_strike}°F")
+                b.status = 'locked'
+                state.resolved_brackets.append(b)
+            
+            else:
+                still_watching.append(b)
+        
+        state.low_watchlist = still_watching
+    
+    def _snipe(self, bracket: BracketState, action: str, price: int, reason: str):
+        """Execute a snipe trade."""
         side = 'no' if action == 'BUY_NO' else 'yes'
-        price = opp['price']
         
-        trade_record = {
+        # Check price threshold
+        if price > self.max_price:
+            print(f"  [SKIP] {action} {bracket.subtitle} @ {price}¢ > max {self.max_price}¢")
+            return
+        
+        snipe_record = {
             'time': datetime.now(timezone.utc).isoformat(),
-            'station': opp['station'],
+            'station': bracket.station,
             'ticker': bracket.ticker,
             'subtitle': bracket.subtitle,
+            'action': action,
             'side': side,
             'price': price,
-            'reason': opp['reason'],
-            'dry_run': not self.live_mode,
+            'reason': reason,
+            'live': self.live_mode,
             'success': False,
         }
+        
+        print(f"  [SNIPE] {action} {bracket.subtitle} @ {price}¢ - {reason}")
         
         if self.live_mode:
             try:
@@ -558,304 +509,308 @@ class WXSniper:
                     order_type='limit',
                     price_cents=price
                 )
-                trade_record['success'] = True
-                trade_record['order_id'] = result.get('order', {}).get('order_id')
-                print(f"[TRADE] ✅ {action} {bracket.subtitle} @ {price}¢")
+                snipe_record['success'] = True
+                snipe_record['order_id'] = result.get('order', {}).get('order_id')
+                print(f"  [SNIPE] ✅ Order placed!")
             except Exception as e:
-                trade_record['error'] = str(e)
-                print(f"[TRADE] ❌ {action} {bracket.subtitle} failed: {e}")
+                snipe_record['error'] = str(e)
+                print(f"  [SNIPE] ❌ Failed: {e}")
         else:
-            trade_record['success'] = True
-            print(f"[DRY RUN] 🧪 {action} {bracket.subtitle} @ {price}¢")
+            snipe_record['success'] = True
+            print(f"  [SNIPE] 🧪 DRY RUN")
         
-        self.trade_log.append(trade_record)
-        return trade_record['success']
+        bracket.traded = True
+        self.snipes.append(snipe_record)
+        self.trade_log.append(snipe_record)
+
+    # ============================================================
+    # PRICE REFRESH
+    # ============================================================
+    
+    def refresh_prices(self):
+        """Refresh prices for watched brackets only."""
+        print(f"[PRICES] Refreshing watched brackets...")
+        now = datetime.now(timezone.utc)
+        today_suffix = now.strftime('%y%b%d').upper()
+        
+        for station, state in self.states.items():
+            cfg = STATIONS.get(station, {})
+            
+            # Only fetch if we have something to watch
+            if state.high_watchlist:
+                high_ticker = cfg.get('kalshi_high_ticker')
+                if high_ticker:
+                    try:
+                        event = f"{high_ticker}-{today_suffix}"
+                        event_data = self.kalshi.get_event(event)
+                        event_obj = event_data.get('event', event_data)
+                        markets = {m.get('ticker'): m for m in event_obj.get('markets', [])}
+                        
+                        for b in state.high_watchlist:
+                            if b.ticker in markets:
+                                m = markets[b.ticker]
+                                b.no_ask = int(m.get('no_ask') or 100)
+                                b.yes_ask = int(m.get('yes_ask') or 100)
+                    except Exception as e:
+                        print(f"  {station} HIGH prices: {e}")
+            
+            if state.low_watchlist:
+                low_ticker = cfg.get('kalshi_low_ticker')
+                if low_ticker:
+                    try:
+                        event = f"{low_ticker}-{today_suffix}"
+                        event_data = self.kalshi.get_event(event)
+                        event_obj = event_data.get('event', event_data)
+                        markets = {m.get('ticker'): m for m in event_obj.get('markets', [])}
+                        
+                        for b in state.low_watchlist:
+                            if b.ticker in markets:
+                                m = markets[b.ticker]
+                                b.no_ask = int(m.get('no_ask') or 100)
+                                b.yes_ask = int(m.get('yes_ask') or 100)
+                    except Exception as e:
+                        print(f"  {station} LOW prices: {e}")
+        
+        self.last_price_poll = datetime.now(timezone.utc)
 
     # ============================================================
     # MAIN LOOP
     # ============================================================
     
-    def poll_cycle(self):
-        """Run one polling cycle based on current time."""
-        now = datetime.now(timezone.utc)
-        minute = now.minute
-        
-        # Prep window: :51 - fetch fresh prices right before METARs drop
-        if minute == 51:
-            if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 300:
-                self.fetch_all_prices()
-                self.find_opportunities()
-                print(f"[PREP] Found {len(self.opportunities)} potential opportunities")
-        
-        # Hot window: :52-:02 - poll METARs and trade
-        elif minute >= 52 or minute <= 2:
-            # Fetch METARs every 20s
-            if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 20:
-                self.fetch_all_metars()
-                
-                # Re-evaluate opportunities after new METAR data
-                self.find_opportunities()
-                
-                # Execute trades
-                for opp in self.opportunities:
-                    self.execute_trade(opp)
-        
-        # Outside hot window: refresh prices every 10 min
-        else:
-            if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 600:
-                self.fetch_all_prices()
-                self.find_opportunities()
-    
     def run(self):
         """Main entry point."""
-        print(f"[START] WX Sniper v3.6")
-        print(f"[CONFIG] Live: {self.live_mode}")
-        print(f"[CONFIG] Max NO: {self.max_no_price}¢ | Max YES: {self.max_yes_price}¢")
-        print(f"[CONFIG] Stations: {list(self.states.keys())}")
+        print("=" * 60)
+        print("WX SNIPER v3.8 - LATENCY SNIPER")
+        print("=" * 60)
+        print(f"Mode: {'LIVE 🔴' if self.live_mode else 'DRY RUN 🧪'}")
+        print(f"Max price: {self.max_price}¢")
+        print("=" * 60)
         
-        # Start health server FIRST so health checks pass
-        HealthHandler.poller = self
-        health_thread = threading.Thread(target=start_health_server, daemon=True)
-        health_thread.start()
+        # Start dashboard
+        HealthHandler.sniper = self
+        http_thread = threading.Thread(target=start_health_server, daemon=True)
+        http_thread.start()
         
-        # Give the server a moment to bind
-        time.sleep(1)
-        print(f"[HTTP] Health server ready")
-        
-        # Fetch HISTORICAL METARs first to get accurate daily high/low
-        try:
-            self.fetch_historical_metars()
-        except Exception as e:
-            print(f"[WARN] Historical METAR fetch failed: {e}")
-            # Fall back to just current METARs
-            try:
-                self.fetch_all_metars()
-            except Exception as e2:
-                print(f"[WARN] Current METAR fetch also failed: {e2}")
-        
-        try:
-            self.fetch_all_prices()
-            self.find_opportunities()
-        except Exception as e:
-            print(f"[WARN] Initial price fetch failed: {e}")
+        # Initialize
+        print("\n[STARTUP]")
+        self.init_watchlists()
+        self.fetch_historical_temps()
+        self.prune_watchlists()
         
         # Main loop
+        print("\n[RUNNING] Sniper active...")
         while True:
             try:
-                self.poll_cycle()
+                now = datetime.now(timezone.utc)
+                minute = now.minute
+                
+                # Hot window: :52-:02 - poll fast
+                if minute >= 52 or minute <= 2:
+                    self.poll_and_snipe()
+                    time.sleep(5)  # Poll every 5s
+                
+                # Prep window: :50-:51 - refresh prices
+                elif minute in (50, 51):
+                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 120:
+                        self.refresh_prices()
+                    time.sleep(10)
+                
+                # Normal time - light polling
+                else:
+                    if self.last_metar_poll is None or (now - self.last_metar_poll).total_seconds() > 300:
+                        self.poll_and_snipe()
+                    if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 600:
+                        self.refresh_prices()
+                    time.sleep(30)
+                    
+            except KeyboardInterrupt:
+                print("\n[EXIT]")
+                break
             except Exception as e:
-                print(f"[ERROR] Poll cycle failed: {e}")
-            time.sleep(10)
+                print(f"[ERROR] {e}")
+                time.sleep(30)
+
 
 # ============================================================
-# HEALTH / UI SERVER
+# DASHBOARD
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-    poller: Optional[WXSniper] = None
+    sniper: Optional[WXSniper] = None
     
     def log_message(self, format, *args):
-        pass  # Suppress logging
+        pass
     
     def do_GET(self):
         if self.path == '/health':
             self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(b'OK')
+            self.wfile.write(json.dumps({'status': 'ok'}).encode())
         else:
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            html = self.build_dashboard()
-            self.wfile.write(html.encode('utf-8'))
+            self.wfile.write(self.build_dashboard().encode('utf-8'))
     
     def build_dashboard(self) -> str:
-        p = HealthHandler.poller
-        if not p:
-            return "<html><body>Poller not initialized</body></html>"
+        s = HealthHandler.sniper
+        if not s:
+            return "<html><body>Not initialized</body></html>"
         
         now = datetime.now(timezone.utc)
+        minute = now.minute
+        is_hot = minute >= 52 or minute <= 2
+        
+        # Count total watchlist items
+        total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) for st in s.states.values())
+        total_resolved = sum(len(st.resolved_brackets) for st in s.states.values())
         
         html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>WX Sniper v3.6</title>
-<meta http-equiv="refresh" content="30">
+<title>WX Sniper v3.8</title>
+<meta http-equiv="refresh" content="{'10' if is_hot else '30'}">
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 20px; }}
 h1 {{ color: #58a6ff; }}
 h2 {{ color: #8b949e; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-top: 30px; }}
 h3 {{ color: #58a6ff; margin-top: 20px; }}
 table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
-th, td {{ padding: 8px 12px; text-align: left; border: 1px solid #30363d; }}
+th, td {{ padding: 6px 10px; text-align: left; border: 1px solid #30363d; }}
 th {{ background: #161b22; }}
-tr:hover {{ background: #161b22; }}
-.no {{ color: #f85149; }}
-.yes {{ color: #3fb950; }}
-.dead {{ color: #f85149; font-weight: bold; }}
-.edge {{ color: #d29922; }}
-.opportunity {{ background: #1c3d1c; }}
+.dead {{ color: #f85149; }}
+.locked {{ color: #3fb950; }}
+.open {{ color: #d29922; }}
+.hot {{ background: #3d1c1c; padding: 5px 10px; border-radius: 4px; }}
+.snipe {{ background: #1c3d1c; }}
 .metar {{ font-family: monospace; font-size: 11px; color: #8b949e; }}
 .time {{ color: #8b949e; font-size: 12px; }}
+.stats {{ display: flex; gap: 20px; margin: 10px 0; }}
+.stat {{ background: #161b22; padding: 10px 15px; border-radius: 6px; }}
+.stat-value {{ font-size: 24px; font-weight: bold; color: #58a6ff; }}
+.stat-label {{ font-size: 12px; color: #8b949e; }}
 </style>
 </head><body>
-<h1>WX Sniper v3.6</h1>
+<h1>&#127919; WX Sniper v3.8</h1>
 <p>
-    Mode: <strong>{"LIVE" if p.live_mode else "DRY RUN"}</strong> |
-    Max NO: <strong>{p.max_no_price}c</strong> |
-    Max YES: <strong>{p.max_yes_price}c</strong>
+    Mode: <strong>{"LIVE &#128308;" if s.live_mode else "DRY RUN &#129514;"}</strong> |
+    Max price: <strong>{s.max_price}&#162;</strong> |
+    {"<span class='hot'>&#128293; HOT WINDOW</span>" if is_hot else "Normal polling"}
 </p>
+
+<div class="stats">
+    <div class="stat">
+        <div class="stat-value">{total_watching}</div>
+        <div class="stat-label">Watching</div>
+    </div>
+    <div class="stat">
+        <div class="stat-value">{total_resolved}</div>
+        <div class="stat-label">Resolved</div>
+    </div>
+    <div class="stat">
+        <div class="stat-value">{len(s.snipes)}</div>
+        <div class="stat-label">Snipes</div>
+    </div>
+</div>
+
 <p class="time">
-    UTC: {now.strftime("%Y-%m-%d %H:%M:%S")} |
-    Last METAR: {p.last_metar_poll.strftime("%H:%M:%S") if p.last_metar_poll else "Never"} |
-    Last Prices: {p.last_price_poll.strftime("%H:%M:%S") if p.last_price_poll else "Never"}
+    UTC: {now.strftime("%H:%M:%S")} |
+    Last METAR: {s.last_metar_poll.strftime("%H:%M:%S") if s.last_metar_poll else "Never"} |
+    Last Prices: {s.last_price_poll.strftime("%H:%M:%S") if s.last_price_poll else "Never"}
 </p>
 '''
         
-        # Opportunities section
-        html += f"<h2>Opportunities ({len(p.opportunities)})</h2>"
-        if p.opportunities:
-            html += '<table><tr><th>Station</th><th>Bracket</th><th>Action</th><th>Price</th><th>Reason</th></tr>'
-            for opp in p.opportunities:
-                b = opp['bracket']
-                action_class = "yes" if opp['action'] == 'BUY_YES' else "no"
-                html += f'''<tr class="opportunity">
-                    <td>{opp['station']}</td>
-                    <td>{b.subtitle}</td>
-                    <td class="{action_class}">{opp['action']}</td>
-                    <td>{opp['price']}¢</td>
-                    <td>{opp['reason']}</td>
-                </tr>'''
-            html += '</table>'
-        else:
-            html += '<p>No opportunities found at current prices.</p>'
-        
-        # Station data
-        html += "<h2>Station Data</h2>"
-        
-        for station, state in p.states.items():
-            cfg = STATIONS.get(station, {})
-            city = cfg.get('name', station)
-            tz_name = cfg.get('timezone', 'America/New_York')
-            tz = ZoneInfo(tz_name)
-            local_date = state.current_local_date or p.get_local_date(station)
-            
-            # Get METAR observation time in local time
-            if state.metar_time:
-                metar_local = state.metar_time.astimezone(tz)
-                metar_time_str = metar_local.strftime('%H:%M')
-            else:
-                metar_time_str = "?"
-            
-            # Header with METAR
-            metar_preview = state.latest_metar[:60] + "..." if state.latest_metar and len(state.latest_metar) > 60 else (state.latest_metar or "None")
-            
-            html += f'''<h3>{city} ({station}) - METAR @ {metar_time_str}</h3>
-            <p>
-                <strong>Observed:</strong> HIGH={state.observed_high or "?"}&deg;F, LOW={state.observed_low or "?"}&deg;F |
-                <strong>Latest:</strong> {state.latest_temp_f or "?"}&deg;F
-            </p>
-            <p class="metar">METAR: {metar_preview}</p>
-            '''
-            
-            # HIGH brackets
-            if state.high_brackets:
-                html += '<table><tr><th>HIGH Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.high_brackets, key=lambda x: x.floor_strike or 0, reverse=True):
-                    status = ""
-                    row_class = ""
-                    
-                    if b.is_dead(state.observed_high, state.observed_low):
-                        status = '<span class="dead">DEAD</span>'
-                        if b.no_ask <= p.max_no_price:
-                            status += ' → BUY NO'
-                            row_class = "opportunity"
-                    elif b.is_edge:
-                        if b.is_edge_opportunity(state.observed_high, state.observed_low):
-                            status = '<span class="edge">EDGE - not hit</span>'
-                            if b.yes_ask <= p.max_yes_price:
-                                status += ' → BUY YES'
-                                row_class = "opportunity"
-                        else:
-                            status = '<span class="yes">EDGE - HIT</span>'
-                    else:
-                        status = "Open"
-                    
-                    html += f'''<tr class="{row_class}">
-                        <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "—"}</td>
-                        <td>{b.cap_strike or "—"}</td>
-                        <td class="no">{b.no_ask}¢</td>
-                        <td class="yes">{b.yes_ask}¢</td>
-                        <td>{status}</td>
-                    </tr>'''
-                html += '</table>'
-            
-            # LOW brackets
-            if state.low_brackets:
-                html += '<table><tr><th>LOW Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.low_brackets, key=lambda x: x.cap_strike or 999):
-                    status = ""
-                    row_class = ""
-                    
-                    if b.is_dead(state.observed_high, state.observed_low):
-                        status = '<span class="dead">DEAD</span>'
-                        if b.no_ask <= p.max_no_price:
-                            status += ' → BUY NO'
-                            row_class = "opportunity"
-                    elif b.is_edge:
-                        if b.is_edge_opportunity(state.observed_high, state.observed_low):
-                            status = '<span class="edge">EDGE - not hit</span>'
-                            if b.yes_ask <= p.max_yes_price:
-                                status += ' → BUY YES'
-                                row_class = "opportunity"
-                        else:
-                            status = '<span class="yes">EDGE - HIT</span>'
-                    else:
-                        status = "Open"
-                    
-                    html += f'''<tr class="{row_class}">
-                        <td>{b.subtitle}</td>
-                        <td>{b.floor_strike or "—"}</td>
-                        <td>{b.cap_strike or "—"}</td>
-                        <td class="no">{b.no_ask}¢</td>
-                        <td class="yes">{b.yes_ask}¢</td>
-                        <td>{status}</td>
-                    </tr>'''
-                html += '</table>'
-        
-        # Trade log
-        if p.trade_log:
-            html += f"<h2>Trade Log ({len(p.trade_log)})</h2>"
-            html += '<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Side</th><th>Price</th><th>Status</th></tr>'
-            for t in reversed(p.trade_log[-20:]):
-                status = "✅" if t.get('success') else "❌"
-                if t.get('dry_run'):
-                    status = "🧪 DRY"
-                side_class = t.get('side', 'no')
-                html += f'''<tr>
-                    <td class="time">{t.get('time', '')[:19]}</td>
-                    <td>{t.get('station', '')}</td>
-                    <td>{t.get('subtitle', '')}</td>
-                    <td class="{side_class}">{t.get('side', '').upper()}</td>
-                    <td>{t.get('price', '')}¢</td>
+        # Recent snipes
+        if s.snipes:
+            html += f"<h2>&#9889; Recent Snipes ({len(s.snipes)})</h2>"
+            html += '<table><tr><th>Time</th><th>Station</th><th>Bracket</th><th>Action</th><th>Price</th><th>Reason</th><th>Status</th></tr>'
+            for snipe in reversed(s.snipes[-10:]):
+                status = "&#9989;" if snipe.get('success') else "&#10060;"
+                if not snipe.get('live'):
+                    status = "&#129514;"
+                action_class = "locked" if snipe['action'] == 'BUY_YES' else "dead"
+                html += f'''<tr class="snipe">
+                    <td class="time">{snipe['time'][11:19]}</td>
+                    <td>{snipe['station']}</td>
+                    <td>{snipe['subtitle']}</td>
+                    <td class="{action_class}">{snipe['action']}</td>
+                    <td>{snipe['price']}&#162;</td>
+                    <td>{snipe['reason']}</td>
                     <td>{status}</td>
                 </tr>'''
             html += '</table>'
         
+        # Station watchlists
+        html += "<h2>Watchlists</h2>"
+        
+        for station, state in s.states.items():
+            cfg = STATIONS.get(station, {})
+            city = cfg.get('name', station)
+            tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+            
+            metar_time = state.metar_time.astimezone(tz).strftime('%H:%M') if state.metar_time else "?"
+            
+            watching_count = len(state.high_watchlist) + len(state.low_watchlist)
+            
+            html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
+            <p>
+                <strong>Observed:</strong> HIGH={state.observed_high or "?"}&#176;F, LOW={state.observed_low or "?"}&#176;F |
+                METAR @ {metar_time}
+            </p>'''
+            
+            # HIGH watchlist
+            if state.high_watchlist:
+                html += '<p><strong>HIGH Watchlist:</strong></p>'
+                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th></tr>'
+                for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike or 0, reverse=True):
+                    html += f'''<tr>
+                        <td>{b.subtitle}</td>
+                        <td>{b.floor_strike or "&#8212;"}</td>
+                        <td>{b.cap_strike or "&#8212;"}</td>
+                        <td>{b.no_ask}&#162;</td>
+                        <td>{b.yes_ask}&#162;</td>
+                    </tr>'''
+                html += '</table>'
+            
+            # LOW watchlist
+            if state.low_watchlist:
+                html += '<p><strong>LOW Watchlist:</strong></p>'
+                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th></tr>'
+                for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike or 999):
+                    html += f'''<tr>
+                        <td>{b.subtitle}</td>
+                        <td>{b.floor_strike or "&#8212;"}</td>
+                        <td>{b.cap_strike or "&#8212;"}</td>
+                        <td>{b.no_ask}&#162;</td>
+                        <td>{b.yes_ask}&#162;</td>
+                    </tr>'''
+                html += '</table>'
+            
+            # Show resolved brackets (collapsed by default)
+            if state.resolved_brackets:
+                html += f'<details><summary>Resolved ({len(state.resolved_brackets)})</summary>'
+                html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                for b in state.resolved_brackets[-20:]:
+                    status_class = "locked" if b.status == 'locked' else "dead"
+                    traded = "&#9989;" if b.traded else "&#8212;"
+                    html += f'''<tr>
+                        <td>{b.subtitle}</td>
+                        <td class="{status_class}">{b.status.upper()}</td>
+                        <td>{traded}</td>
+                    </tr>'''
+                html += '</table></details>'
+        
         html += "</body></html>"
         return html
+
 
 def start_health_server():
     port = int(os.environ.get('PORT', 8080))
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    print(f"[HTTP] Server on port {port}")
+    print(f"[HTTP] Dashboard on port {port}")
     server.serve_forever()
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     sniper = WXSniper()
