@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aviation_weather import AviationWeatherPoller
-from metar_parser import parse_metar
+from metar_parser import parse_metar, nws_round
 from kalshi_client import KalshiClient
 from config import STATIONS
 
@@ -434,7 +434,7 @@ class SmartPoller:
         if self.hourly_mode:
             if parsed.t_group_temp_c is not None:
                 temp_c = parsed.t_group_temp_c
-                current_temp = round(temp_c * 9/5 + 32)
+                current_temp = nws_round(temp_c * 9/5 + 32)
                 print(f"[SIGNAL] {state.station} HOURLY: {current_temp}°F (T-group {temp_c}°C)")
                 
                 if state.observed_high is None or current_temp > state.observed_high:
@@ -577,7 +577,7 @@ class SmartPoller:
                                 self.latest_metars[station] = resp.raw_text
                                 parsed = parse_metar(resp.raw_text)
                                 if parsed.t_group_temp_c is not None:
-                                    self.latest_temps[station] = round(parsed.t_group_temp_c * 9/5 + 32)
+                                    self.latest_temps[station] = nws_round(parsed.t_group_temp_c * 9/5 + 32)
                                 
                                 has_6hr = parsed.six_hour_max_f_rounded or parsed.six_hour_min_f_rounded
                                 print(f"[METAR] {station} {'📊' if has_6hr else '⏳'} {resp.raw_text[:50]}...")
