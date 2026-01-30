@@ -332,27 +332,42 @@ tr:hover {{ background: #161b22; }}
             html += '<table><tr><th>Bracket</th><th>Type</th><th>NO Ask</th><th>YES Ask</th><th>Floor</th><th>Cap</th><th>Status</th></tr>'
             
             for b in state.watchlist:
-                edge = '<span class="edge">🎯 EDGE</span>' if b.is_edge_bracket else ""
+                edge = '🎯 EDGE' if b.is_edge_bracket else ""
                 
-                # Determine bracket lock status based on observed temps
+                # Determine bracket status based on observed temps
                 bracket_status = ""
                 if b.signal_type == 'high':
-                    if state.observed_high is not None and b.cap_strike is not None:
-                        if state.observed_high > b.cap_strike:
-                            bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
-                        elif state.observed_high >= b.floor_strike if b.floor_strike else True:
-                            bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                    if state.observed_high is not None:
+                        # For HIGH "X or above" edge brackets: LOCKED if observed >= floor
+                        if b.is_edge_bracket and b.floor_strike is not None:
+                            if state.observed_high >= b.floor_strike:
+                                bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
+                            else:
+                                bracket_status = f'<span style="color:#d29922;">{edge}</span>'
+                        # For HIGH range brackets (floor to cap): IN RANGE if floor <= observed <= cap
+                        elif b.floor_strike is not None and b.cap_strike is not None:
+                            if b.floor_strike <= state.observed_high <= b.cap_strike:
+                                bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                            elif state.observed_high > b.cap_strike:
+                                bracket_status = '<span style="color:#8b949e;">PASSED</span>'
+                                
                 elif b.signal_type == 'low':
-                    if state.observed_low is not None and b.floor_strike is not None:
-                        if state.observed_low < b.floor_strike:
-                            bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
-                        elif state.observed_low <= b.cap_strike if b.cap_strike else True:
-                            bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                    if state.observed_low is not None:
+                        # For LOW "X or below" edge brackets: LOCKED if observed <= cap
+                        if b.is_edge_bracket and b.cap_strike is not None:
+                            if state.observed_low <= b.cap_strike:
+                                bracket_status = '<span style="color:#238636;">✓ LOCKED</span>'
+                            else:
+                                bracket_status = f'<span style="color:#d29922;">{edge}</span>'
+                        # For LOW range brackets: IN RANGE if floor <= observed <= cap
+                        elif b.floor_strike is not None and b.cap_strike is not None:
+                            if b.floor_strike <= state.observed_low <= b.cap_strike:
+                                bracket_status = '<span style="color:#f0883e;">⚠ IN RANGE</span>'
+                            elif state.observed_low < b.floor_strike:
+                                bracket_status = '<span style="color:#8b949e;">PASSED</span>'
                 
                 if not bracket_status:
-                    bracket_status = edge if edge else "—"
-                elif edge:
-                    bracket_status += f" {edge}"
+                    bracket_status = f'<span style="color:#d29922;">{edge}</span>' if edge else "—"
                 
                 html += f'''<tr>
                     <td>{b.subtitle}</td>
