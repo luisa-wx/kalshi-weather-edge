@@ -113,28 +113,49 @@ class Bracket:
         """
         Check if this bracket is DEAD (cannot settle YES).
         
-        For HIGH brackets: dead if observed_high > cap
-        For LOW brackets: dead if observed_low < floor
+        For HIGH brackets: 
+          - "X to Y" is dead if observed_high > cap (we've exceeded the range)
+          - "X or above" can never be dead (high can always go higher)
+          
+        For LOW brackets:
+          - "X to Y" is dead if observed_low < floor (we've gone below the range)  
+          - "X or below" is dead if observed_low > cap (low is already too warm - it's LOCKED)
+          - "X or above" (warm edge) is dead if observed_low < floor (low went below X)
         """
         if self.signal_type == 'high':
             if observed_high is None:
                 return False
             if self.cap_strike is not None:
                 return observed_high > self.cap_strike
-            return False  # Edge bracket with no cap
+            return False  # "X or above" edge - never dead
         else:  # low
             if observed_low is None:
                 return False
-            if self.floor_strike is not None:
+            
+            # "X or below" edge (cold edge) - floor is None, cap is the threshold
+            if self.floor_strike is None and self.cap_strike is not None:
+                # Dead if the observed low is ABOVE the cap (too warm, can never hit)
+                return observed_low > self.cap_strike
+            
+            # "X or above" edge (warm edge) - cap is None, floor is the threshold  
+            if self.cap_strike is None and self.floor_strike is not None:
+                # Dead if observed low went BELOW the floor
                 return observed_low < self.floor_strike
-            return False  # Edge bracket with no floor
+            
+            # Range bracket "X to Y"
+            if self.floor_strike is not None and self.cap_strike is not None:
+                # Dead if low went below the floor (too cold)
+                return observed_low < self.floor_strike
+            
+            return False
     
     def is_edge_opportunity(self, observed_high: Optional[int], observed_low: Optional[int]) -> bool:
         """
-        Check if this is an edge bracket that hasn't been hit yet.
+        Check if this is an edge bracket that hasn't been hit yet (still possible to win YES).
         
-        For HIGH "X or above": opportunity if observed_high < floor
-        For LOW "X or below": opportunity if observed_low > cap
+        For HIGH "X or above": opportunity if observed_high < floor (hasn't reached X yet)
+        For LOW "X or below": opportunity if observed_low <= cap (low is cold enough to still be in range)
+        For LOW "X or above": opportunity if observed_low >= floor (low hasn't dropped below X)
         """
         if not self.is_edge:
             return False
@@ -145,10 +166,21 @@ class Bracket:
                 return False
             return observed_high < self.floor_strike
         else:  # low
-            # "X or below" - opportunity if we haven't gone below X yet
-            if observed_low is None or self.cap_strike is None:
-                return False
-            return observed_low > self.cap_strike
+            # "X or below" (cold edge) - floor is None
+            if self.floor_strike is None and self.cap_strike is not None:
+                if observed_low is None:
+                    return False
+                # Opportunity ONLY if low is AT OR BELOW the cap (could still settle here)
+                return observed_low <= self.cap_strike
+            
+            # "X or above" (warm edge) - cap is None
+            if self.cap_strike is None and self.floor_strike is not None:
+                if observed_low is None:
+                    return False
+                # Opportunity if low is still at or above the floor (hasn't dropped below)
+                return observed_low >= self.floor_strike
+            
+            return False
 
 @dataclass 
 class StationState:
