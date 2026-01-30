@@ -446,14 +446,12 @@ class WXSniper:
         now = datetime.now(timezone.utc)
         minute = now.minute
         
-        # Prep window: :45-:51 - build watchlist
-        if 45 <= minute <= 51:
-            # Fetch prices at :45
-            if minute == 45 and (self.last_price_poll is None or 
-                (now - self.last_price_poll).total_seconds() > 300):
+        # Prep window: :51 - fetch fresh prices right before METARs drop
+        if minute == 51:
+            if self.last_price_poll is None or (now - self.last_price_poll).total_seconds() > 300:
                 self.fetch_all_prices()
                 self.find_opportunities()
-                print(f"[PREP] Found {len(self.opportunities)} opportunities")
+                print(f"[PREP] Found {len(self.opportunities)} potential opportunities")
         
         # Hot window: :52-:02 - poll METARs and trade
         elif minute >= 52 or minute <= 2:
