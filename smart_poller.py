@@ -743,12 +743,33 @@ class WXSniper:
                 parsed = parse_metar(raw)
                 
                 state.latest_metar = raw
+                
+                # Parse observation time from METAR string (e.g., "301853Z" = day 30, 18:53 UTC)
+                # Or use API's obsTime field
                 obs_time_str = metar_data.get('obsTime') or metar_data.get('reportTime')
                 if obs_time_str:
                     try:
+                        # API returns ISO format like "2026-01-30T18:53:00Z"
                         state.metar_time = datetime.fromisoformat(obs_time_str.replace('Z', '+00:00'))
                     except:
-                        state.metar_time = datetime.now(timezone.utc)
+                        pass
+                
+                # Fallback: parse from raw METAR string if API time not available
+                if state.metar_time is None or obs_time_str is None:
+                    import re
+                    # Match pattern like "301853Z" (DDHHMMZ)
+                    time_match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', raw)
+                    if time_match:
+                        day = int(time_match.group(1))
+                        hour = int(time_match.group(2))
+                        minute = int(time_match.group(3))
+                        # Use current year/month, adjust day
+                        now_utc = datetime.now(timezone.utc)
+                        try:
+                            state.metar_time = now_utc.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
+                        except ValueError:
+                            # Day might be from previous month
+                            state.metar_time = now_utc
                 
                 # Track changes
                 old_high = state.observed_high
