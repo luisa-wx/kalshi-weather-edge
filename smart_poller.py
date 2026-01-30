@@ -363,15 +363,64 @@ class KalshiClient:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
         
-        key_str = self.private_key_str
-        if '\\n' in key_str:
-            key_str = key_str.replace('\\n', '\n')
+        key_str = self.private_key_str.strip()
         
-        return serialization.load_pem_private_key(
-            key_str.encode(),
-            password=None,
-            backend=default_backend()
-        )
+        # Debug: show what we received
+        print(f"[KALSHI] Raw key length: {len(key_str)}, contains newlines: {chr(10) in key_str}, contains backslash-n: {'\\\\n' in repr(key_str)}")
+        
+        # Handle literal \n from environment variables (very common in DO/Heroku)
+        # This handles both \\n (escaped) and cases where shell passed literal backslash-n
+        key_str = key_str.replace('\\n', '\n')
+        key_str = key_str.replace('\\r', '')
+        
+        # Also try replacing space-separated PEM (sometimes happens with copy/paste)
+        # e.g., "-----BEGIN RSA PRIVATE KEY----- MIIE... -----END RSA PRIVATE KEY-----"
+        
+        # If still no newlines and it looks like a PEM, reconstruct it
+        if '\n' not in key_str and 'PRIVATE KEY' in key_str:
+            import re
+            
+            # Try to extract header, content, footer
+            # Handle both RSA PRIVATE KEY and PRIVATE KEY formats
+            match = re.search(
+                r'(-----BEGIN [A-Z ]*PRIVATE KEY-----)\s*'  # Header
+                r'([A-Za-z0-9+/=\s]+?)\s*'                   # Base64 content (allow spaces)
+                r'(-----END [A-Z ]*PRIVATE KEY-----)',       # Footer
+                key_str
+            )
+            
+            if match:
+                header = match.group(1)
+                content = match.group(2)
+                footer = match.group(3)
+                
+                # Remove ALL whitespace from base64 content
+                content = ''.join(content.split())
+                
+                # Split base64 into 64-char lines (PEM standard)
+                lines = [content[i:i+64] for i in range(0, len(content), 64)]
+                
+                key_str = header + '\n' + '\n'.join(lines) + '\n' + footer + '\n'
+                print(f"[KALSHI] Reconstructed PEM with {len(lines)} base64 lines")
+            else:
+                print(f"[KALSHI] WARNING: Could not parse PEM structure")
+                print(f"[KALSHI] Key preview: {key_str[:80]}...")
+        
+        # Ensure ends with newline
+        if not key_str.endswith('\n'):
+            key_str += '\n'
+        
+        try:
+            return serialization.load_pem_private_key(
+                key_str.encode(),
+                password=None,
+                backend=default_backend()
+            )
+        except Exception as e:
+            print(f"[KALSHI] Key parse FAILED: {e}")
+            print(f"[KALSHI] Key starts: {repr(key_str[:60])}")
+            print(f"[KALSHI] Key ends: {repr(key_str[-60:])}")
+            raise
     
     def _sign_request(self, timestamp_ms: int, method: str, path: str) -> str:
         import base64
@@ -783,10 +832,9 @@ class WXSniper:
         """Execute a snipe trade."""
         side = 'no' if action == 'BUY_NO' else 'yes'
         
-        # Check price threshold
-        if price > self.max_price:
-            print(f"  [SKIP] {action} {bracket.subtitle} @ {price}¢ > max {self.max_price}¢")
-            return
+        # TESTING MODE: Always bid 99¢ to guarantee fill
+        # TODO: Revert to actual price-based bidding once we confirm everything works
+        execution_price = 99  # Always bid max to guarantee fill during testing
         
         snipe_record = {
             'time': datetime.now(timezone.utc).isoformat(),
@@ -795,13 +843,14 @@ class WXSniper:
             'subtitle': bracket.subtitle,
             'action': action,
             'side': side,
-            'price': price,
+            'price': execution_price,
+            'original_ask': price,  # Track what the ask was
             'reason': reason,
             'live': self.live_mode,
             'success': False,
         }
         
-        print(f"  [SNIPE] {action} {bracket.subtitle} @ {price}¢ - {reason}")
+        print(f"  [SNIPE] {action} {bracket.subtitle} - bidding {execution_price}¢ (ask was {price}¢) - {reason}")
         
         if self.live_mode:
             try:
@@ -811,7 +860,7 @@ class WXSniper:
                     action='buy',
                     count=1,
                     order_type='limit',
-                    price_cents=price
+                    price_cents=execution_price
                 )
                 snipe_record['success'] = True
                 snipe_record['order_id'] = result.get('order', {}).get('order_id')
