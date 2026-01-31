@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-WX Sniper v4.2 - Zero Strike Bug Fix
-====================================
+WX Sniper v4.3 - Aggressive Polling
+===================================
+
+Changes from v4.2:
+- Much faster polling during METAR drop window:
+  - :52-:56 = every 1 second (METAR drop zone)
+  - :50-:51, :57-:05 = every 3 seconds (hot window)
+  - else = every 60 seconds (normal)
 
 Changes from v4.1:
 - Fixed parsing of floor_strike/cap_strike when value is 0 (was treating 0 as None)
-  This caused brackets like "-1° to 0°" to have cap=None instead of cap=0
 
 Changes from v4.0:
-- Fixed metar_data reference bug (variable didn't exist in context)
-- Added immediate METAR poll on startup so dashboard shows data right away
+- Fixed metar_data reference bug
+- Added immediate METAR poll on startup
 - Fixed price parsing to show 0¢ instead of 100¢ for missing data
 
 STRATEGY SUMMARY:
@@ -1029,7 +1034,7 @@ class WXSniper:
     def run(self):
         """Main entry point."""
         print("=" * 60)
-        print("WX SNIPER v4.2 - ZERO STRIKE BUG FIX")
+        print("WX SNIPER v4.3 - AGGRESSIVE POLLING")
         print("=" * 60)
         print(f"Mode: {'LIVE 🔴' if self.live_mode else 'DRY RUN 🧪'}")
         print(f"Max price: {self.max_price}¢")
@@ -1055,9 +1060,7 @@ class WXSniper:
         while True:
             now = datetime.now(timezone.utc)
             minute = now.minute
-            
-            # Hot window: :52 to :02
-            is_hot = minute >= 50 or minute <= 5
+            second = now.second
             
             # Poll METARs
             self.poll_and_snipe()
@@ -1067,9 +1070,14 @@ class WXSniper:
                 self.refresh_prices()
                 last_price_refresh = time.time()
             
-            # Sleep
-            if is_hot:
-                time.sleep(10)  # Fast polling during hot window
+            # Adaptive polling frequency:
+            # - :52-:56 = METAR drop zone, poll every 1 second
+            # - :50-:51, :57-:05 = hot window edges, poll every 3 seconds
+            # - else = normal, poll every 60 seconds
+            if 52 <= minute <= 56:
+                time.sleep(1)   # Maximum aggression during METAR drop
+            elif minute >= 50 or minute <= 5:
+                time.sleep(3)   # Fast polling during extended hot window
             else:
                 time.sleep(60)  # Normal polling
 
@@ -1104,7 +1112,17 @@ class HealthHandler(BaseHTTPRequestHandler):
         now = datetime.now(timezone.utc)
         now_et = datetime.now(ZoneInfo('America/New_York'))
         minute = now.minute
-        is_hot = minute >= 50 or minute <= 5
+        
+        # Determine polling mode for display
+        if 52 <= minute <= 56:
+            poll_mode = "metar_drop"
+            poll_interval = "1s"
+        elif minute >= 50 or minute <= 5:
+            poll_mode = "hot"
+            poll_interval = "3s"
+        else:
+            poll_mode = "normal"
+            poll_interval = "60s"
         
         total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) for st in s.states.values())
         total_resolved = sum(len(st.resolved_brackets) for st in s.states.values())
@@ -1124,8 +1142,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>WX Sniper v4.2</title>
-<meta http-equiv="refresh" content="{'10' if is_hot else '30'}">
+<title>WX Sniper v4.3</title>
+<meta http-equiv="refresh" content="{'3' if poll_mode == 'metar_drop' else '10' if poll_mode == 'hot' else '30'}">
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 20px; }}
 h1 {{ color: #58a6ff; }}
@@ -1153,11 +1171,11 @@ summary {{ cursor: pointer; color: #8b949e; }}
 .current-temp {{ font-size: 18px; color: #f0f6fc; }}
 </style>
 </head><body>
-<h1>&#127919; WX Sniper v4.2</h1>
+<h1>&#127919; WX Sniper v4.3</h1>
 <p>
     Mode: <strong>{"LIVE &#128308;" if s.live_mode else "DRY RUN &#129514;"}</strong> |
     Max price: <strong>{s.max_price}&#162;</strong> |
-    {"<span class='hot'>&#128293; HOT WINDOW</span>" if is_hot else "Normal polling"}
+    {"<span class='hot'>&#128165; METAR DROP (1s)</span>" if poll_mode == 'metar_drop' else "<span class='hot'>&#128293; HOT WINDOW (3s)</span>" if poll_mode == 'hot' else f"Normal ({poll_interval})"}
 </p>
 
 <div class="stats">
