@@ -490,13 +490,13 @@ class WXSniper:
         log_event('shutdown', signal=signum)
         self.running = False
     
-    def _get_today_suffix(self) -> str:
-        """Get cached date suffix (avoids repeated datetime formatting)."""
-        today = datetime.now(timezone.utc).date()
-        if self._today_suffix_date != today:
-            self._today_suffix = datetime.now(timezone.utc).strftime('%y%b%d').upper()
-            self._today_suffix_date = today
-        return self._today_suffix
+    def _get_today_suffix(self, tz_name: str = None) -> str:
+        """Get date suffix in station's local timezone."""
+        if tz_name:
+            local_now = datetime.now(ZoneInfo(tz_name))
+        else:
+            local_now = datetime.now(ZoneInfo("America/New_York"))
+        return local_now.strftime('%y%b%d').upper()
     
     def get_local_date(self, station: str) -> str:
         tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
@@ -530,10 +530,11 @@ class WXSniper:
     def init_watchlists(self):
         """Initialize watchlists with all brackets from Kalshi."""
         logger.info("[INIT] Building watchlists...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            today_suffix = self._get_today_suffix(tz_name)
             high_ticker = cfg.get('kalshi_high_ticker')
             low_ticker = cfg.get('kalshi_low_ticker')
             
@@ -974,10 +975,11 @@ class WXSniper:
     def refresh_prices(self):
         """Refresh prices for watched brackets."""
         logger.info("[PRICES] Refreshing...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            today_suffix = self._get_today_suffix(tz_name)
             
             if state.high_watchlist:
                 high_ticker = cfg.get('kalshi_high_ticker')
