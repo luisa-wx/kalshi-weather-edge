@@ -994,6 +994,7 @@ class WXSniper:
             'action': action,
             'side': side,
             'price': execution_price,
+            'quantity': self.order_size,
             'original_ask': price,
             'reason': reason,
             'live': self.live_mode,
@@ -1280,8 +1281,8 @@ summary {{ cursor: pointer; color: #8b949e; }}
         
         # Today's Trades
         if todays_snipes:
-            html += f"<h2>&#9889; Today's Trades ({len(todays_snipes)})</h2>"
-            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Price</th><th>Latency</th><th>Status</th></tr>'
+            html += f"<h2>&#9889; METAR Trades ({len(todays_snipes)})</h2>"
+            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Qty</th><th>Price</th><th>Latency</th><th>Status</th></tr>'
             for snipe in reversed(todays_snipes):
                 try:
                     snipe_time = datetime.fromisoformat(snipe['time'].replace('Z', '+00:00'))
@@ -1290,16 +1291,22 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 except:
                     time_str = snipe['time'][11:19]
                 
-                status = "&#9989;" if snipe.get('success') else "&#10060;"
                 if not snipe.get('live'):
                     status = "&#129514; DRY"
+                elif snipe.get('success'):
+                    status = "&#9989; FILLED"
+                else:
+                    status = "&#10060; FAILED"
+                
                 action_class = "locked" if snipe['action'] == 'BUY_YES' else "dead"
                 latency = snipe.get('buy_latency_ms', '?')
+                qty = snipe.get('quantity', s.order_size)
                 html += f'''<tr class="snipe">
                     <td class="time">{time_str}</td>
                     <td>{snipe['station']}</td>
                     <td>{snipe['subtitle']}</td>
                     <td class="{action_class}">{snipe['action']}</td>
+                    <td>{qty}</td>
                     <td>{snipe['price']}&#162;</td>
                     <td class="latency">{latency}ms</td>
                     <td>{status}</td>
@@ -1311,7 +1318,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
         # Scout Trades Section
         if scout_positions:
             html += f"<h2>&#128373; Scout Trades ({len(scout_positions)})</h2>"
-            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Ticker</th><th>Action</th><th>Price</th><th>Reason</th><th>Status</th></tr>'
+            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Ticker</th><th>Action</th><th>Qty</th><th>Price</th><th>Reason</th><th>Status</th></tr>'
             for pos in reversed(scout_positions):
                 try:
                     pos_et = pos.entry_time.astimezone(ZoneInfo('America/New_York'))
@@ -1327,13 +1334,14 @@ summary {{ cursor: pointer; color: #8b949e; }}
                     row_class = "scout"
                 
                 action_class = "locked" if pos.action == 'BUY_YES' else "dead"
-                reason_short = pos.reason[:50] + "..." if len(pos.reason) > 50 else pos.reason
+                reason_short = pos.reason[:40] + "..." if len(pos.reason) > 40 else pos.reason
                 
                 html += f'''<tr class="{row_class}">
                     <td class="time">{time_str}</td>
                     <td>{pos.station}</td>
                     <td>{pos.ticker[-15:]}</td>
                     <td class="{action_class}">{pos.action}</td>
+                    <td>{pos.quantity}</td>
                     <td>{pos.entry_price}&#162;</td>
                     <td title="{pos.reason}">{reason_short}</td>
                     <td>{status}</td>
