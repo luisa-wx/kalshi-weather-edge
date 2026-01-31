@@ -485,6 +485,15 @@ class WXSniper:
         # Pre-compute date suffix
         self._today_suffix = None
         self._today_suffix_date = None
+        
+        # Initialize ASOS Scout (wethr.net integration)
+        self.scout = None
+        try:
+            from wethr_integration import create_scout
+            self.scout = create_scout(self)
+            logger.info("[INIT] ASOS Scout enabled")
+        except ImportError:
+            logger.info("[INIT] ASOS Scout disabled (wethr_integration.py not found)")
     
     def _handle_shutdown(self, signum, frame):
         """Handle SIGTERM/SIGINT for graceful shutdown."""
@@ -707,45 +716,6 @@ class WXSniper:
             resolved = len(state.resolved_brackets)
             logger.info(f"  [{station}] Watching: {high_count} HIGH, {low_count} LOW | Resolved: {resolved}")
     
-    def check_date_rollover(self):
-        """
-        Check if any station's local date has changed and reinitialize if needed.
-        Uses ZoneInfo which handles DST automatically.
-        """
-        any_rollover = False
-        
-        for station, state in self.states.items():
-            cfg = STATIONS.get(station, {})
-            tz_name = cfg.get('timezone', 'America/New_York')
-            
-            # ZoneInfo handles DST automatically - no manual adjustment needed
-            tz = ZoneInfo(tz_name)
-            current_date = datetime.now(tz).strftime('%Y-%m-%d')
-            
-            if state.current_local_date is not None and state.current_local_date != current_date:
-                logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
-                
-                # Reset this station's state for the new day
-                state.observed_high = None
-                state.observed_low = None
-                state.latest_temp_f = None
-                state.high_watchlist = []
-                state.low_watchlist = []
-                state.resolved_brackets = []
-                state.current_local_date = current_date
-                
-                any_rollover = True
-            
-            # Initialize if not set (first run)
-            if state.current_local_date is None:
-                state.current_local_date = current_date
-        
-        if any_rollover:
-            logger.info("[ROLLOVER] Reinitializing watchlists for new day...")
-            self.init_watchlists()
-            self.fetch_historical_temps()
-            self.prune_watchlists()
-    
     # ============================================================
     # POLLING & SNIPE DETECTION
     # ============================================================
@@ -941,6 +911,16 @@ class WXSniper:
                 still_watching.append(b)
         
         state.low_watchlist = still_watching
+        
+        # EJECTION SEAT: Check if METAR contradicts any Scout positions
+        if self.scout:
+            all_brackets = state.high_watchlist + state.low_watchlist + state.resolved_brackets
+            self.scout.check_ejection_seat(
+                station=state.station,
+                observed_high=state.observed_high,
+                observed_low=state.observed_low,
+                brackets=all_brackets
+            )
     
     def _snipe(self, bracket: BracketState, action: str, price: int, reason: str):
         """Execute a snipe trade with QC hedge."""
@@ -1093,9 +1073,6 @@ class WXSniper:
             now = datetime.now(timezone.utc)
             minute = now.minute
             
-            # Check for date rollover (handles DST via ZoneInfo)
-            self.check_date_rollover()
-            
             is_metar_drop = 50 <= minute <= 59
             is_hot = minute <= 5
             
@@ -1110,6 +1087,10 @@ class WXSniper:
                 self.poll_interval_ms = 60000
             
             self.poll_and_snipe()
+            
+            # Poll ASOS Scout (wethr.net) - runs every 30s, dormant during METAR window
+            if self.scout:
+                self.scout.poll()
             
             if time.time() - last_price_refresh > 300:
                 self.refresh_prices()
@@ -1170,10 +1151,17 @@ class HealthHandler(BaseHTTPRequestHandler):
             except:
                 todays_snipes.append(snipe)
         
+        # Get Scout positions for display
+        scout_positions = []
+        scout_status = "DISABLED"
+        if s.scout:
+            scout_positions = s.scout.positions
+            scout_status = "DORMANT" if s.scout.dormant else "ACTIVE"
+        
         html = f'''<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>WX Sniper v4.6</title>
+<title>WX Sniper v5.0</title>
 <meta http-equiv="refresh" content="{'10' if is_hot else '30'}">
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 20px; }}
@@ -1189,11 +1177,16 @@ th {{ background: #161b22; }}
 .open {{ color: #58a6ff; font-weight: bold; }}
 .hot {{ background: #3d1c1c; padding: 5px 10px; border-radius: 4px; }}
 .snipe {{ background: #1c3d1c; }}
+.scout {{ background: #1c1c3d; }}
+.ejected {{ background: #3d1c1c; opacity: 0.7; }}
 .time {{ color: #8b949e; font-size: 12px; }}
 .stats {{ display: flex; gap: 20px; margin: 10px 0; flex-wrap: wrap; }}
 .stat {{ background: #161b22; padding: 10px 15px; border-radius: 6px; }}
 .stat-value {{ font-size: 24px; font-weight: bold; color: #58a6ff; }}
 .stat-label {{ font-size: 12px; color: #8b949e; }}
+.scout-active {{ color: #3fb950; }}
+.scout-dormant {{ color: #f0883e; }}
+.scout-disabled {{ color: #8b949e; }}
 .resolved-row {{ opacity: 0.6; }}
 details {{ margin: 10px 0; }}
 summary {{ cursor: pointer; color: #8b949e; }}
@@ -1203,18 +1196,20 @@ summary {{ cursor: pointer; color: #8b949e; }}
 .latency {{ color: #8b949e; font-size: 11px; }}
 </style>
 </head><body>
-<h1>&#127919; WX Sniper v4.6 (AWS)</h1>
+<h1>&#127919; WX Sniper v5.0 (AWS + Scout)</h1>
 <p>
     Mode: <strong>{"LIVE &#128308;" if s.live_mode else "DRY RUN &#129514;"}</strong> |
     Max price: <strong>{s.max_price}&#162;</strong> |
     Polling: <strong>{s.polling_mode}</strong> ({s.poll_interval_ms}ms) |
+    Scout: <strong class="scout-{scout_status.lower()}">{scout_status}</strong> |
     <span class="latency">Last Kalshi: {s.kalshi.last_latency_ms:.0f}ms</span>
 </p>
 
 <div class="stats">
     <div class="stat"><div class="stat-value">{total_watching}</div><div class="stat-label">Watching</div></div>
     <div class="stat"><div class="stat-value">{total_resolved}</div><div class="stat-label">Resolved</div></div>
-    <div class="stat"><div class="stat-value">{len(todays_snipes)}</div><div class="stat-label">Trades Today</div></div>
+    <div class="stat"><div class="stat-value">{len(todays_snipes)}</div><div class="stat-label">METAR Trades</div></div>
+    <div class="stat"><div class="stat-value">{len(scout_positions)}</div><div class="stat-label">Scout Trades</div></div>
 </div>
 
 <p class="time">
@@ -1252,7 +1247,39 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 </tr>'''
             html += '</table>'
         else:
-            html += "<h2>&#9889; Today's Trades (0)</h2><p style='color:#8b949e'>No trades yet today</p>"
+            html += "<h2>&#9889; METAR Trades (0)</h2><p style='color:#8b949e'>No METAR snipes yet today</p>"
+        
+        # Scout Trades Section
+        if scout_positions:
+            html += f"<h2>&#128373; Scout Trades ({len(scout_positions)})</h2>"
+            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Ticker</th><th>Action</th><th>Price</th><th>Reason</th><th>Status</th></tr>'
+            for pos in reversed(scout_positions):
+                try:
+                    pos_et = pos.entry_time.astimezone(ZoneInfo('America/New_York'))
+                    time_str = pos_et.strftime("%I:%M:%S %p")
+                except:
+                    time_str = "?"
+                
+                if pos.ejected:
+                    status = f"&#128680; EJECTED"
+                    row_class = "ejected"
+                else:
+                    status = "&#9989; OPEN"
+                    row_class = "scout"
+                
+                action_class = "locked" if pos.action == 'BUY_YES' else "dead"
+                reason_short = pos.reason[:50] + "..." if len(pos.reason) > 50 else pos.reason
+                
+                html += f'''<tr class="{row_class}">
+                    <td class="time">{time_str}</td>
+                    <td>{pos.station}</td>
+                    <td>{pos.ticker[-15:]}</td>
+                    <td class="{action_class}">{pos.action}</td>
+                    <td>{pos.entry_price}&#162;</td>
+                    <td title="{pos.reason}">{reason_short}</td>
+                    <td>{status}</td>
+                </tr>'''
+            html += '</table>'
         
         # Watchlists
         html += "<h2>Watchlists</h2>"
