@@ -1254,6 +1254,12 @@ summary {{ cursor: pointer; color: #8b949e; }}
 .metar-info strong {{ color: #58a6ff; }}
 .current-temp {{ font-size: 18px; color: #f0f6fc; }}
 .latency {{ color: #8b949e; font-size: 11px; }}
+/* Scout Lock - front-run position via 5-min ASOS */
+.scout-lock {{ background: #1c1c3d; color: #79c0ff; padding: 2px 6px; border-radius: 3px; font-weight: bold; }}
+/* METAR Lock - confirmed by hourly METAR */
+.metar-lock {{ background: #1c3d1c; color: #7ee787; padding: 2px 6px; border-radius: 3px; font-weight: bold; }}
+/* Ejected - Scout position was wrong */
+.ejected-tag {{ background: #3d1c1c; color: #f85149; padding: 2px 6px; border-radius: 3px; font-weight: bold; text-decoration: line-through; }}
 </style>
 </head><body>
 <h1>&#127919; WX Sniper v5.0 (AWS + Scout)</h1>
@@ -1401,19 +1407,40 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 {range_label} <strong>HIGH</strong> {high_val} &nbsp; <strong>LOW</strong> {low_val}
             </div>'''
             
+            # Build Scout position lookup for this station
+            scout_tickers = {}
+            if s.scout:
+                for pos in s.scout.positions:
+                    if pos.station == station:
+                        scout_tickers[pos.ticker] = pos
+            
+            # Helper function to determine bracket status
+            def get_bracket_status(b):
+                if b.ticker in scout_tickers:
+                    pos = scout_tickers[b.ticker]
+                    if pos.ejected:
+                        return '<span class="ejected-tag">EJECTED</span>'
+                    else:
+                        return '<span class="scout-lock">SCOUT LOCK</span>'
+                elif b.traded:
+                    return '<span class="metar-lock">METAR LOCK</span>'
+                else:
+                    return '<span class="open">OPEN</span>'
+            
             if state.high_watchlist:
                 html += '<h4>HIGH Watchlist</h4>'
                 html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
                 for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike if x.floor_strike is not None else -999, reverse=True):
                     floor_display = b.floor_strike if b.floor_strike is not None else "—"
                     cap_display = b.cap_strike if b.cap_strike is not None else "—"
+                    status_html = get_bracket_status(b)
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
                         <td>{floor_display}</td>
                         <td>{cap_display}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
-                        <td class="open">OPEN</td>
+                        <td>{status_html}</td>
                     </tr>'''
                 html += '</table>'
             
@@ -1423,13 +1450,14 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike if x.cap_strike is not None else 999):
                     floor_display = b.floor_strike if b.floor_strike is not None else "—"
                     cap_display = b.cap_strike if b.cap_strike is not None else "—"
+                    status_html = get_bracket_status(b)
                     html += f'''<tr>
                         <td>{b.subtitle}</td>
                         <td>{floor_display}</td>
                         <td>{cap_display}</td>
                         <td>{b.no_ask}&#162;</td>
                         <td>{b.yes_ask}&#162;</td>
-                        <td class="open">OPEN</td>
+                        <td>{status_html}</td>
                     </tr>'''
                 html += '</table>'
             
@@ -1442,20 +1470,40 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 
                 if high_resolved:
                     html += '<h4>HIGH Resolved</h4>'
-                    html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
                     for b in high_resolved[-15:]:
                         status_class = "locked" if b.status == 'locked' else "dead"
-                        traded = "&#9989;" if b.traded else "—"
-                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{traded}</td></tr>'
+                        # Check if this was a Scout trade
+                        if b.ticker in scout_tickers:
+                            pos = scout_tickers[b.ticker]
+                            if pos.ejected:
+                                source = '<span class="ejected-tag">EJECTED</span>'
+                            else:
+                                source = '<span class="scout-lock">SCOUT</span>'
+                        elif b.traded:
+                            source = '<span class="metar-lock">METAR</span>'
+                        else:
+                            source = "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
                     html += '</table>'
                 
                 if low_resolved:
                     html += '<h4>LOW Resolved</h4>'
-                    html += '<table><tr><th>Bracket</th><th>Status</th><th>Traded?</th></tr>'
+                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
                     for b in low_resolved[-15:]:
                         status_class = "locked" if b.status == 'locked' else "dead"
-                        traded = "&#9989;" if b.traded else "—"
-                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{traded}</td></tr>'
+                        # Check if this was a Scout trade
+                        if b.ticker in scout_tickers:
+                            pos = scout_tickers[b.ticker]
+                            if pos.ejected:
+                                source = '<span class="ejected-tag">EJECTED</span>'
+                            else:
+                                source = '<span class="scout-lock">SCOUT</span>'
+                        elif b.traded:
+                            source = '<span class="metar-lock">METAR</span>'
+                        else:
+                            source = "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
                     html += '</table>'
                 
                 html += '</details>'
