@@ -662,6 +662,9 @@ def create_scout(sniper: Any) -> ASOSScout:
         # In WXSniper.__init__():
         self.scout = create_scout(self)
         
+        # After init_watchlists/fetch_historical_temps:
+        self.scout.seed_observed_temps()
+        
         # In main loop:
         self.scout.poll()
         
@@ -669,8 +672,8 @@ def create_scout(sniper: Any) -> ASOSScout:
         self.scout.seed_observed_temps()
     """
     scout = ASOSScout(sniper)
-    # Seed initial temps from wethr.net so we don't get blindsided
-    scout.seed_observed_temps()
+    # NOTE: Don't seed here - fetch_historical_temps() will reset observed_high/low
+    # Caller should call seed_observed_temps() AFTER fetch_historical_temps()
     return scout
 
 

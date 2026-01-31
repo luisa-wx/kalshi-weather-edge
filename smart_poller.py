@@ -1170,6 +1170,9 @@ class WXSniper:
         # Initialize
         self.init_watchlists()
         self.fetch_historical_temps()
+        # Seed temps from wethr.net to catch any highs/lows the METAR history missed
+        if self.scout:
+            self.scout.seed_observed_temps()
         self.prune_watchlists()
         
         # Initial poll
