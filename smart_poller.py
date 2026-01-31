@@ -870,19 +870,15 @@ class WXSniper:
                 else:
                     state.metar_time = datetime.now(timezone.utc)
                 
-                # Get station's local timezone for date checks
+                # Get station's local timezone for 6-hour group checks
                 cfg = STATIONS.get(station, {})
                 tz_name = cfg.get('timezone', 'America/New_York')
                 tz = ZoneInfo(tz_name)
                 metar_local = state.metar_time.astimezone(tz)
-                current_local_date = metar_local.strftime('%Y-%m-%d')
+                metar_local_hour = metar_local.hour
                 
-                # Check if we need to reset for a new day
-                if state.current_local_date and state.current_local_date != current_local_date:
-                    logger.info(f"[{station}] New day detected via METAR: {state.current_local_date} → {current_local_date}")
-                    state.observed_high = None
-                    state.observed_low = None
-                    state.current_local_date = current_local_date
+                # NOTE: We do NOT reset observed_high/low here - that happens in check_date_rollover()
+                # This prevents mid-processing resets that can cause false triggers
                 
                 old_high = state.observed_high
                 old_low = state.observed_low
@@ -895,11 +891,8 @@ class WXSniper:
                         state.observed_low = parsed.temp_f
                 
                 # Process 6-hour max/min ONLY if it doesn't span midnight
-                # The 6-hour group covers the previous 6 hours from METAR time
-                # If METAR is at 02:54 local, the 6-hour period is ~20:54-02:54 (spans midnight)
-                # We should IGNORE these values as they include yesterday's temps
-                metar_local_hour = metar_local.hour
-                six_hr_spans_midnight = metar_local_hour < 6  # If METAR is before 6 AM local, 6-hr period spans midnight
+                # If METAR is before 6 AM local, the 6-hour period spans midnight - IGNORE
+                six_hr_spans_midnight = metar_local_hour < 6
                 
                 if parsed.six_hr_max_c is not None:
                     if six_hr_spans_midnight:
@@ -1361,16 +1354,32 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 continue
             
             metar_local_str = "?"
+            metar_is_stale = False
             if state.metar_time:
                 metar_local = state.metar_time.astimezone(tz)
                 metar_local_str = metar_local.strftime("%I:%M %p")
+                
+                # Check if METAR is from yesterday (stale)
+                now_local = datetime.now(tz)
+                if metar_local.date() < now_local.date():
+                    metar_is_stale = True
+                    metar_local_str += " <span style='color:#f0883e'>(yesterday)</span>"
             
             current_temp_str = f"{state.latest_temp_f}°F" if state.latest_temp_f is not None else "?"
+            
+            # Show the actual values but label appropriately
+            high_val = f"{state.observed_high}&#176;F" if state.observed_high is not None else "—"
+            low_val = f"{state.observed_low}&#176;F" if state.observed_low is not None else "—"
+            
+            if metar_is_stale:
+                range_label = "<span style='color:#f0883e'>Yesterday's Range:</span>"
+            else:
+                range_label = "<strong>Day's Range:</strong>"
             
             html += f'''<h3>{city} ({station}) - {watching_count} watching</h3>
             <div class="metar-info">
                 <strong>Latest METAR:</strong> {metar_local_str} local &nbsp;&nbsp; <span class="current-temp">{current_temp_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp;
-                <strong>Day's Range:</strong> <strong>HIGH</strong> {state.observed_high or "?"}&#176;F &nbsp; <strong>LOW</strong> {state.observed_low or "?"}&#176;F
+                {range_label} <strong>HIGH</strong> {high_val} &nbsp; <strong>LOW</strong> {low_val}
             </div>'''
             
             if state.high_watchlist:
