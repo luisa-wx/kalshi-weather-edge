@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-WX Sniper v4.4 - Latency Optimization
-=====================================
+WX Sniper v4.5 - QC Hedge + Wide Polling
+========================================
+
+Changes from v4.4:
+- QC HEDGE: After every BUY, immediately place SELL at 99¢ as hedge
+  If NWS issues a correction (COR METAR), someone may take our sell and we only lose fees
+- WIDER METAR DROP ZONE: :50-:59 at 200ms (Vegas dropped at :58!)
+- METAR DROP LOGGING: Log all METAR changes to /tmp/metar_drops.log for pattern analysis
+- BUFFER WINDOW: :00-:05 at 2s polling for late drops
 
 Changes from v4.3:
 - PERSISTENT HTTP SESSIONS: Reuse connections to avoid TLS handshake on every request
   (saves ~100-200ms per request)
-- AGGRESSIVE POLLING: Poll every 100ms during :52-:56 METAR drop window
+- AGGRESSIVE POLLING: Poll every 200ms during METAR drop window
 - NWS SESSION REUSE: Dedicated session for NWS TXT polling
 - ORDER EXECUTION FIRST: Fire order before logging/state updates
 
@@ -833,9 +840,17 @@ class WXSniper:
                 
                 state = self.states[station]
                 
-                # Debug: log if METAR changed
+                # Debug: log if METAR changed with detailed timing
                 if raw != state.latest_metar:
-                    print(f"  [{station}] NEW METAR: {raw[:80]}")
+                    now_utc = datetime.now(timezone.utc)
+                    print(f"  [{station}] NEW METAR @ :{now_utc.minute:02d}:{now_utc.second:02d} - {raw[:60]}...")
+                    
+                    # Log to file for analysis of actual drop patterns
+                    try:
+                        with open('/tmp/metar_drops.log', 'a') as f:
+                            f.write(f"{now_utc.isoformat()},{station},{now_utc.minute},{now_utc.second},{raw[:80]}\n")
+                    except:
+                        pass
                 
                 parsed = parse_metar(raw)
                 
@@ -945,7 +960,15 @@ class WXSniper:
         state.low_watchlist = still_watching
     
     def _snipe(self, bracket: BracketState, action: str, price: int, reason: str):
-        """Execute a snipe trade."""
+        """Execute a snipe trade with QC hedge.
+        
+        Strategy:
+        1. BUY at 99¢ to guarantee fill
+        2. Immediately place SELL at 99¢ as hedge against QC corrections
+        
+        If we're right (no correction): Our sell rests, market settles, we get $1
+        If QC correction happens: Our sell might fill, limiting loss to fees only
+        """
         side = 'no' if action == 'BUY_NO' else 'yes'
         
         # TESTING MODE: Always bid 99¢ to guarantee fill
@@ -970,6 +993,7 @@ class WXSniper:
         
         if self.live_mode:
             try:
+                # STEP 1: BUY
                 result = self.kalshi.create_order(
                     ticker=bracket.ticker,
                     side=side,
@@ -980,13 +1004,33 @@ class WXSniper:
                 )
                 snipe_record['success'] = True
                 snipe_record['order_id'] = result.get('order', {}).get('order_id')
-                print(f"  [SNIPE] ✅ Order placed!")
+                print(f"  [SNIPE] ✅ BUY order placed!")
+                
+                # STEP 2: HEDGE SELL at 99¢
+                # This protects against QC corrections - if NWS revises the temp
+                # downward, someone might take our sell and we only lose fees
+                try:
+                    hedge_result = self.kalshi.create_order(
+                        ticker=bracket.ticker,
+                        side=side,
+                        action='sell',
+                        count=1,
+                        order_type='limit',
+                        price_cents=99  # Sell at 99¢ - breakeven minus fees
+                    )
+                    hedge_order_id = hedge_result.get('order', {}).get('order_id')
+                    snipe_record['hedge_order_id'] = hedge_order_id
+                    print(f"  [SNIPE] 🛡️ HEDGE sell order placed @ 99¢")
+                except Exception as e:
+                    snipe_record['hedge_error'] = str(e)
+                    print(f"  [SNIPE] ⚠️ Hedge failed (still have position): {e}")
+                    
             except Exception as e:
                 snipe_record['error'] = str(e)
-                print(f"  [SNIPE] ❌ Failed: {e}")
+                print(f"  [SNIPE] ❌ BUY failed: {e}")
         else:
             snipe_record['success'] = True
-            print(f"  [SNIPE] 🧪 DRY RUN")
+            print(f"  [SNIPE] 🧪 DRY RUN (would place BUY + HEDGE SELL)")
         
         bracket.traded = True
         self.snipes.append(snipe_record)
@@ -1075,21 +1119,21 @@ class WXSniper:
             minute = now.minute
             second = now.second
             
-            # AGGRESSIVE POLLING SCHEDULE:
-            # :52-:56 = METAR DROP ZONE - poll every 100ms
-            # :50-:51, :57-:02 = HOT WINDOW - poll every 1s
+            # AGGRESSIVE POLLING SCHEDULE (wide until we have per-station data):
+            # :50-:59 = METAR DROP ZONE - poll every 200ms (Vegas dropped at :58!)
+            # :00-:05 = BUFFER WINDOW - poll every 2s (catching late drops)
             # else = NORMAL - poll every 60s
             
-            is_metar_drop = 52 <= minute <= 56
-            is_hot = (50 <= minute <= 51) or (57 <= minute <= 59) or (minute <= 2)
+            is_metar_drop = 50 <= minute <= 59
+            is_hot = minute <= 5
             
             # Update polling mode for dashboard
             if is_metar_drop:
                 self.polling_mode = "💥 METAR DROP"
-                self.poll_interval_ms = 100
+                self.poll_interval_ms = 200
             elif is_hot:
                 self.polling_mode = "🔥 HOT"
-                self.poll_interval_ms = 1000
+                self.poll_interval_ms = 2000
             else:
                 self.polling_mode = "NORMAL"
                 self.poll_interval_ms = 60000
@@ -1104,9 +1148,9 @@ class WXSniper:
             
             # Sleep based on urgency
             if is_metar_drop:
-                time.sleep(0.1)  # 100ms - METAR drop zone
+                time.sleep(0.2)  # 200ms - METAR drop zone
             elif is_hot:
-                time.sleep(1)   # 1s - hot window
+                time.sleep(2)   # 2s - buffer window
             else:
                 time.sleep(60)  # Normal polling
 
