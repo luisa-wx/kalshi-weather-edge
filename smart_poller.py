@@ -791,6 +791,9 @@ class WXSniper:
             logger.info("[ROLLOVER] Reinitializing watchlists for new day...")
             self.init_watchlists()
             self.fetch_historical_temps()
+            # Seed temps from wethr.net to catch any highs/lows we missed
+            if self.scout:
+                self.scout.seed_observed_temps()
             self.prune_watchlists()
     
     # ============================================================

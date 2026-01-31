@@ -159,6 +159,79 @@ class ASOSScout:
             logger.error(f"[SCOUT] {station} unexpected error: {e}")
             return None
     
+    def fetch_wethr_high(self, station: str) -> Optional[Dict]:
+        """
+        Fetch day's running high/low from wethr.net API using wethr_high mode.
+        
+        This gives us the day's high/low with NWS rounding logic applied,
+        allowing us to know bracket status BEFORE the hourly METAR.
+        
+        Args:
+            station: ICAO code (e.g., 'KNYC')
+            
+        Returns:
+            Dict with wethr_high, wethr_low, etc. or None on error
+        """
+        try:
+            params = {
+                'station_code': station,
+                'mode': 'wethr_high',
+                'logic': 'nws'
+            }
+            
+            resp = self.session.get(WETHR_BASE_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            
+            data = resp.json()
+            
+            # Handle error responses
+            if 'error' in data:
+                logger.warning(f"[SCOUT] {station} wethr_high error: {data['error']}")
+                return None
+            
+            return data
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[SCOUT] {station} wethr_high fetch error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[SCOUT] {station} wethr_high unexpected error: {e}")
+            return None
+    
+    def seed_observed_temps(self):
+        """
+        Seed observed_high/low from wethr.net's wethr_high mode.
+        
+        Called on startup/rollover to populate initial high/low estimates
+        so we don't get blindsided by the first METAR of the day.
+        
+        This ensures brackets that are already obviously dead (based on 5-min data)
+        don't trigger trades when the hourly METAR merely confirms what we already knew.
+        """
+        logger.info("[SCOUT] Seeding observed temps from wethr.net...")
+        
+        for station, state in self.sniper.states.items():
+            data = self.fetch_wethr_high(station)
+            if not data:
+                continue
+            
+            wethr_high = data.get('wethr_high')
+            wethr_low = data.get('wethr_low')
+            
+            if wethr_high is not None:
+                wethr_high = int(wethr_high)
+                if state.observed_high is None or wethr_high > state.observed_high:
+                    old = state.observed_high
+                    state.observed_high = wethr_high
+                    logger.info(f"[SCOUT] {station} observed_high: {old} → {wethr_high} (from wethr.net)")
+            
+            if wethr_low is not None:
+                wethr_low = int(wethr_low)
+                if state.observed_low is None or wethr_low < state.observed_low:
+                    old = state.observed_low
+                    state.observed_low = wethr_low
+                    logger.info(f"[SCOUT] {station} observed_low: {old} → {wethr_low} (from wethr.net)")
+    
     def parse_observation_time(self, time_str: str) -> Optional[datetime]:
         """Parse wethr.net observation_time string to datetime."""
         try:
@@ -591,8 +664,14 @@ def create_scout(sniper: Any) -> ASOSScout:
         
         # In main loop:
         self.scout.poll()
+        
+        # After date rollover:
+        self.scout.seed_observed_temps()
     """
-    return ASOSScout(sniper)
+    scout = ASOSScout(sniper)
+    # Seed initial temps from wethr.net so we don't get blindsided
+    scout.seed_observed_temps()
+    return scout
 
 
 # ============================================================
