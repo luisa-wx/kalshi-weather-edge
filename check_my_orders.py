@@ -62,11 +62,8 @@ def get_my_orders(ticker=None):
     private_key = load_private_key()
     
     timestamp_ms = int(time.time() * 1000)
-    endpoint = "/portfolio/orders"
-    params = "limit=100"
-    if ticker:
-        params += f"&ticker={ticker}"
-    sign_path = f"/trade-api/v2{endpoint}?{params}"
+    # Sign without query params, add them to URL only
+    sign_path = "/trade-api/v2/portfolio/orders"
     
     signature = sign_request(private_key, timestamp_ms, "GET", sign_path)
     
@@ -76,8 +73,12 @@ def get_my_orders(ticker=None):
         "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
     }
     
-    url = f"https://api.elections.kalshi.com/trade-api/v2{endpoint}?{params}"
-    resp = requests.get(url, headers=headers, timeout=10)
+    params = {"limit": 100}
+    if ticker:
+        params["ticker"] = ticker
+    
+    url = "https://api.elections.kalshi.com/trade-api/v2/portfolio/orders"
+    resp = requests.get(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -85,11 +86,8 @@ def get_my_fills(ticker=None):
     private_key = load_private_key()
     
     timestamp_ms = int(time.time() * 1000)
-    endpoint = "/portfolio/fills"
-    params = "limit=100"
-    if ticker:
-        params += f"&ticker={ticker}"
-    sign_path = f"/trade-api/v2{endpoint}?{params}"
+    # Sign without query params, add them to URL only
+    sign_path = "/trade-api/v2/portfolio/fills"
     
     signature = sign_request(private_key, timestamp_ms, "GET", sign_path)
     
@@ -99,8 +97,12 @@ def get_my_fills(ticker=None):
         "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
     }
     
-    url = f"https://api.elections.kalshi.com/trade-api/v2{endpoint}?{params}"
-    resp = requests.get(url, headers=headers, timeout=10)
+    params = {"limit": 100}
+    if ticker:
+        params["ticker"] = ticker
+    
+    url = "https://api.elections.kalshi.com/trade-api/v2/portfolio/fills"
+    resp = requests.get(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
