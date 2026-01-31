@@ -461,6 +461,7 @@ class WXSniper:
         # Config
         self.live_mode = os.environ.get('LIVE_MODE', 'false').lower() == 'true'
         self.max_price = int(os.environ.get('MAX_PRICE', '95'))
+        self.order_size = int(os.environ.get('ORDER_SIZE', '10'))
         
         # State
         self.states: Dict[str, StationState] = {
@@ -490,13 +491,13 @@ class WXSniper:
         log_event('shutdown', signal=signum)
         self.running = False
     
-    def _get_today_suffix(self, tz_name: str = None) -> str:
-        """Get date suffix in station's local timezone."""
-        if tz_name:
-            local_now = datetime.now(ZoneInfo(tz_name))
-        else:
-            local_now = datetime.now(ZoneInfo("America/New_York"))
-        return local_now.strftime('%y%b%d').upper()
+    def _get_today_suffix(self) -> str:
+        """Get cached date suffix (avoids repeated datetime formatting)."""
+        today = datetime.now(timezone.utc).date()
+        if self._today_suffix_date != today:
+            self._today_suffix = datetime.now(timezone.utc).strftime('%y%b%d').upper()
+            self._today_suffix_date = today
+        return self._today_suffix
     
     def get_local_date(self, station: str) -> str:
         tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
@@ -530,11 +531,10 @@ class WXSniper:
     def init_watchlists(self):
         """Initialize watchlists with all brackets from Kalshi."""
         logger.info("[INIT] Building watchlists...")
+        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
-            tz_name = cfg.get('timezone', 'America/New_York')
-            today_suffix = self._get_today_suffix(tz_name)
             high_ticker = cfg.get('kalshi_high_ticker')
             low_ticker = cfg.get('kalshi_low_ticker')
             
@@ -706,6 +706,45 @@ class WXSniper:
             low_count = len(state.low_watchlist)
             resolved = len(state.resolved_brackets)
             logger.info(f"  [{station}] Watching: {high_count} HIGH, {low_count} LOW | Resolved: {resolved}")
+    
+    def check_date_rollover(self):
+        """
+        Check if any station's local date has changed and reinitialize if needed.
+        Uses ZoneInfo which handles DST automatically.
+        """
+        any_rollover = False
+        
+        for station, state in self.states.items():
+            cfg = STATIONS.get(station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            
+            # ZoneInfo handles DST automatically - no manual adjustment needed
+            tz = ZoneInfo(tz_name)
+            current_date = datetime.now(tz).strftime('%Y-%m-%d')
+            
+            if state.current_local_date is not None and state.current_local_date != current_date:
+                logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
+                
+                # Reset this station's state for the new day
+                state.observed_high = None
+                state.observed_low = None
+                state.latest_temp_f = None
+                state.high_watchlist = []
+                state.low_watchlist = []
+                state.resolved_brackets = []
+                state.current_local_date = current_date
+                
+                any_rollover = True
+            
+            # Initialize if not set (first run)
+            if state.current_local_date is None:
+                state.current_local_date = current_date
+        
+        if any_rollover:
+            logger.info("[ROLLOVER] Reinitializing watchlists for new day...")
+            self.init_watchlists()
+            self.fetch_historical_temps()
+            self.prune_watchlists()
     
     # ============================================================
     # POLLING & SNIPE DETECTION
@@ -931,7 +970,7 @@ class WXSniper:
                     ticker=bracket.ticker,
                     side=side,
                     action='buy',
-                    count=1,
+                    count=self.order_size,
                     order_type='limit',
                     price_cents=execution_price
                 )
@@ -948,7 +987,7 @@ class WXSniper:
                         ticker=bracket.ticker,
                         side=side,
                         action='sell',
-                        count=1,
+                        count=self.order_size,
                         order_type='limit',
                         price_cents=99
                     )
@@ -975,11 +1014,10 @@ class WXSniper:
     def refresh_prices(self):
         """Refresh prices for watched brackets."""
         logger.info("[PRICES] Refreshing...")
+        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
-            tz_name = cfg.get('timezone', 'America/New_York')
-            today_suffix = self._get_today_suffix(tz_name)
             
             if state.high_watchlist:
                 high_ticker = cfg.get('kalshi_high_ticker')
@@ -1028,6 +1066,7 @@ class WXSniper:
         logger.info("=" * 60)
         logger.info(f"Mode: {'LIVE 🔴' if self.live_mode else 'DRY RUN 🧪'}")
         logger.info(f"Max price: {self.max_price}¢")
+        logger.info(f"Order size: {self.order_size} contracts")
         logger.info("=" * 60)
         
         # Start dashboard
@@ -1053,6 +1092,9 @@ class WXSniper:
         while self.running:
             now = datetime.now(timezone.utc)
             minute = now.minute
+            
+            # Check for date rollover (handles DST via ZoneInfo)
+            self.check_date_rollover()
             
             is_metar_drop = 50 <= minute <= 59
             is_hot = minute <= 5
