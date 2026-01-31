@@ -29,6 +29,7 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
 
@@ -369,7 +370,6 @@ class ASOSScout:
         except Exception as e:
             logger.error(f"[SCOUT] Trade execution failed: {e}")
             return False
-            return False
     
     def check_ejection_seat(self, station: str, observed_high: Optional[int], 
                             observed_low: Optional[int], brackets: List[Any]):
@@ -461,13 +461,46 @@ class ASOSScout:
                 else:
                     logger.warning(f"[SCOUT] DRY RUN - would have ejected")
     
+    def purge_stale_positions(self):
+        """
+        Purge positions from previous days.
+        Called at the start of poll() to clean up old positions.
+        """
+        if not self.positions:
+            return
+        
+        now = datetime.now(timezone.utc)
+        stale_count = 0
+        fresh_positions = []
+        
+        for pos in self.positions:
+            # Get station's local timezone
+            from smart_poller import STATIONS
+            cfg = STATIONS.get(pos.station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            tz = ZoneInfo(tz_name)
+            
+            # Check if position is from today (local time)
+            pos_local = pos.entry_time.astimezone(tz)
+            now_local = now.astimezone(tz)
+            
+            if pos_local.date() < now_local.date():
+                logger.info(f"[SCOUT] Purging stale position: {pos.ticker} (from {pos_local.date()})")
+                stale_count += 1
+            else:
+                fresh_positions.append(pos)
+        
+        if stale_count > 0:
+            logger.info(f"[SCOUT] Purged {stale_count} stale positions")
+            self.positions = fresh_positions
+    
     def poll(self):
         """
         Main Scout polling loop iteration.
         
         Should be called from smart_poller's main loop.
         """
-        # Check for conflict window
+        # Check for conflict window (METAR drop time)
         if self.is_conflict_window():
             if not self.dormant:
                 logger.info("[SCOUT] Entering DORMANT mode (conflict window)")
@@ -478,18 +511,26 @@ class ASOSScout:
             logger.info("[SCOUT] Exiting DORMANT mode")
             self.dormant = False
         
-        # Respect polling interval
+        # Respect polling interval (30s)
         now = datetime.now(timezone.utc)
         if self.last_poll and (now - self.last_poll).total_seconds() < SCOUT_POLL_INTERVAL_SECONDS:
             return
         
         self.last_poll = now
         
+        # Purge any stale positions from previous days
+        self.purge_stale_positions()
+        
+        # Count active stations for logging
+        active_stations = 0
+        
         # Poll each active station
         for station, state in self.sniper.states.items():
             # Skip stations with no open brackets
             if not state.high_watchlist and not state.low_watchlist:
                 continue
+            
+            active_stations += 1
             
             # Fetch wethr.net data
             data = self.fetch_wethr_data(station)
@@ -530,6 +571,8 @@ class ASOSScout:
             # Check DSM invalidation (informational)
             if dsm_high is not None and state.high_watchlist:
                 self.check_dsm_kill(station, int(dsm_high), state.high_watchlist)
+        
+        logger.info(f"[SCOUT] Polled {active_stations} stations | Positions: {len(self.positions)}")
 
 
 # ============================================================
