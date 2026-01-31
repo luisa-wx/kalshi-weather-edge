@@ -1282,7 +1282,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
         # Today's Trades
         if todays_snipes:
             html += f"<h2>&#9889; METAR Trades ({len(todays_snipes)})</h2>"
-            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Qty</th><th>Price</th><th>Latency</th><th>Status</th></tr>'
+            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Qty</th><th>Price</th><th>Latency</th><th>Buy</th><th>Hedge</th></tr>'
             for snipe in reversed(todays_snipes):
                 try:
                     snipe_time = datetime.fromisoformat(snipe['time'].replace('Z', '+00:00'))
@@ -1291,12 +1291,22 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 except:
                     time_str = snipe['time'][11:19]
                 
+                # Buy status
                 if not snipe.get('live'):
-                    status = "&#129514; DRY"
+                    buy_status = "&#129514; DRY"
+                    hedge_status = "—"
                 elif snipe.get('success'):
-                    status = "&#9989; FILLED"
+                    buy_status = "&#9989;"
+                    # Hedge status
+                    if snipe.get('hedge_order_id'):
+                        hedge_status = "&#9989;"
+                    elif snipe.get('hedge_error'):
+                        hedge_status = "&#10060;"
+                    else:
+                        hedge_status = "?"
                 else:
-                    status = "&#10060; FAILED"
+                    buy_status = "&#10060;"
+                    hedge_status = "—"
                 
                 action_class = "locked" if snipe['action'] == 'BUY_YES' else "dead"
                 latency = snipe.get('buy_latency_ms', '?')
@@ -1309,7 +1319,8 @@ summary {{ cursor: pointer; color: #8b949e; }}
                     <td>{qty}</td>
                     <td>{snipe['price']}&#162;</td>
                     <td class="latency">{latency}ms</td>
-                    <td>{status}</td>
+                    <td>{buy_status}</td>
+                    <td>{hedge_status}</td>
                 </tr>'''
             html += '</table>'
         else:
