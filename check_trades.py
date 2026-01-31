@@ -9,6 +9,7 @@ import time
 import requests
 import base64
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # Get credentials from environment
 API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
@@ -58,12 +59,12 @@ def sign_request(private_key, timestamp_ms, method, path):
     )
     return base64.b64encode(signature).decode()
 
-def get_trades(ticker):
+def get_trades(ticker, limit=100):
     private_key = load_private_key()
     
     timestamp_ms = int(time.time() * 1000)
     endpoint = f"/markets/trades"
-    params = f"ticker={ticker}&limit=50"
+    params = f"ticker={ticker}&limit={limit}"
     sign_path = f"/trade-api/v2{endpoint}?{params}"
     
     signature = sign_request(private_key, timestamp_ms, "GET", sign_path)
@@ -83,39 +84,48 @@ if __name__ == "__main__":
     # Las Vegas 65-66 bracket from today
     ticker = "KXHIGHTLV-26JAN30-B65.5"
     
-    print(f"Fetching trades for {ticker}...\n")
+    print(f"Fetching trades for {ticker}...")
+    print(f"(HIGH market - bracket 65-66°F)")
+    print(f"(YES wins if final high is 65-66, NO wins if high >66 or <65)\n")
     
     try:
-        data = get_trades(ticker)
+        data = get_trades(ticker, limit=100)
         trades = data.get('trades', [])
         
-        print(f"Found {len(trades)} recent trades:\n")
-        print(f"{'Time (UTC)':<28} {'Price':>8} {'Count':>8} {'Taker':>8}")
-        print("-" * 56)
+        # Sort by time ascending (oldest first)
+        trades_sorted = sorted(trades, key=lambda t: t.get('created_time', ''))
         
-        for t in trades:
-            # Check what timestamp fields exist
-            ts = t.get('created_time') or t.get('ts') or t.get('timestamp')
-            price = t.get('yes_price') or t.get('no_price') or t.get('price')
+        pt = ZoneInfo('America/Los_Angeles')
+        
+        print(f"Found {len(trades)} trades, showing chronologically:\n")
+        print(f"{'Time (PT)':<20} {'YES':>6} {'NO':>6} {'Count':>8}   {'Action':<20}")
+        print("-" * 70)
+        
+        for t in trades_sorted:
+            ts = t.get('created_time')
+            yes_price = t.get('yes_price', '?')
+            no_price = t.get('no_price', '?')
             count = t.get('count', 1)
             taker = t.get('taker_side', '?')
             
             if ts:
-                if isinstance(ts, int):
-                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                else:
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                time_str = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                dt_pt = dt.astimezone(pt)
+                time_str = dt_pt.strftime("%I:%M:%S.") + dt_pt.strftime("%f")[:3]
             else:
                 time_str = "unknown"
             
-            print(f"{time_str:<28} {price:>8} {count:>8} {taker:>8}")
+            # Make action clear
+            if taker == 'no':
+                action = f"BUY NO @ {no_price}¢"
+            else:
+                action = f"BUY YES @ {yes_price}¢"
+            
+            print(f"{time_str:<20} {yes_price:>5}¢ {no_price:>5}¢ {count:>8}   {action:<20}")
         
-        # Also print raw first trade to see all fields
-        if trades:
-            print(f"\n--- Raw first trade object ---")
-            for k, v in trades[0].items():
-                print(f"  {k}: {v}")
+        print("\n" + "=" * 70)
+        print("After METAR showed HIGH=67°F, NO wins (settles at $1, YES at $0)")
+        print("So BUY NO was the winning trade.")
                 
     except Exception as e:
         print(f"Error: {e}")
