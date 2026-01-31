@@ -631,7 +631,7 @@ class WXSniper:
         return 0
     
     def fetch_historical_temps(self):
-        """Fetch historical METARs to get accurate daily high/low."""
+        """Fetch historical METARs to get accurate daily high/low for TODAY only."""
         logger.info("[INIT] Fetching historical temps...")
         
         try:
@@ -647,6 +647,7 @@ class WXSniper:
             if not isinstance(metars, list):
                 metars = [metars] if metars else []
             
+            # Initialize each station with its current local date
             for station, state in self.states.items():
                 cfg = STATIONS.get(station, {})
                 tz_name = cfg.get('timezone', 'America/New_York')
@@ -661,24 +662,60 @@ class WXSniper:
                     continue
                 
                 state = self.states[station]
+                cfg = STATIONS.get(station, {})
+                tz_name = cfg.get('timezone', 'America/New_York')
+                tz = ZoneInfo(tz_name)
+                
                 raw = metar_data.get('rawOb', '')
+                
+                # Parse METAR time to check if it's from today (local time)
+                time_match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', raw)
+                if time_match:
+                    day = int(time_match.group(1))
+                    hour = int(time_match.group(2))
+                    minute = int(time_match.group(3))
+                    now_utc = datetime.now(timezone.utc)
+                    try:
+                        metar_utc = now_utc.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
+                        # Handle month rollover
+                        if metar_utc > now_utc:
+                            metar_utc = metar_utc.replace(month=metar_utc.month - 1 if metar_utc.month > 1 else 12)
+                    except ValueError:
+                        metar_utc = now_utc
+                    
+                    metar_local = metar_utc.astimezone(tz)
+                    metar_local_date = metar_local.strftime('%Y-%m-%d')
+                    
+                    # Skip METARs from previous days
+                    if metar_local_date != state.current_local_date:
+                        continue
+                    
+                    metar_local_hour = metar_local.hour
+                else:
+                    continue  # Skip if we can't parse the time
+                
                 parsed = parse_metar(raw)
                 
+                # T-group temperature (current reading) - always valid for today
                 if parsed.temp_f is not None:
                     if state.observed_high is None or parsed.temp_f > state.observed_high:
                         state.observed_high = parsed.temp_f
                     if state.observed_low is None or parsed.temp_f < state.observed_low:
                         state.observed_low = parsed.temp_f
                 
+                # 6-hour max - only use if it doesn't span midnight
                 if parsed.six_hr_max_c is not None:
-                    max_f = c_to_f_nws(parsed.six_hr_max_c)
-                    if state.observed_high is None or max_f > state.observed_high:
-                        state.observed_high = max_f
+                    if metar_local_hour >= 6:  # Safe - 6-hr period is within today
+                        max_f = c_to_f_nws(parsed.six_hr_max_c)
+                        if state.observed_high is None or max_f > state.observed_high:
+                            state.observed_high = max_f
                 
+                # 6-hour min - only use if it doesn't span midnight
                 if parsed.six_hr_min_c is not None:
-                    min_f = c_to_f_nws(parsed.six_hr_min_c)
-                    if state.observed_low is None or min_f < state.observed_low:
-                        state.observed_low = min_f
+                    if metar_local_hour >= 6:  # Safe - 6-hr period is within today
+                        min_f = c_to_f_nws(parsed.six_hr_min_c)
+                        if state.observed_low is None or min_f < state.observed_low:
+                            state.observed_low = min_f
             
             for station, state in self.states.items():
                 logger.info(f"  [{station}] HIGH={state.observed_high}°F LOW={state.observed_low}°F")
@@ -833,6 +870,20 @@ class WXSniper:
                 else:
                     state.metar_time = datetime.now(timezone.utc)
                 
+                # Get station's local timezone for date checks
+                cfg = STATIONS.get(station, {})
+                tz_name = cfg.get('timezone', 'America/New_York')
+                tz = ZoneInfo(tz_name)
+                metar_local = state.metar_time.astimezone(tz)
+                current_local_date = metar_local.strftime('%Y-%m-%d')
+                
+                # Check if we need to reset for a new day
+                if state.current_local_date and state.current_local_date != current_local_date:
+                    logger.info(f"[{station}] New day detected via METAR: {state.current_local_date} → {current_local_date}")
+                    state.observed_high = None
+                    state.observed_low = None
+                    state.current_local_date = current_local_date
+                
                 old_high = state.observed_high
                 old_low = state.observed_low
                 
@@ -843,17 +894,32 @@ class WXSniper:
                     if state.observed_low is None or parsed.temp_f < state.observed_low:
                         state.observed_low = parsed.temp_f
                 
+                # Process 6-hour max/min ONLY if it doesn't span midnight
+                # The 6-hour group covers the previous 6 hours from METAR time
+                # If METAR is at 02:54 local, the 6-hour period is ~20:54-02:54 (spans midnight)
+                # We should IGNORE these values as they include yesterday's temps
+                metar_local_hour = metar_local.hour
+                six_hr_spans_midnight = metar_local_hour < 6  # If METAR is before 6 AM local, 6-hr period spans midnight
+                
                 if parsed.six_hr_max_c is not None:
-                    max_f = c_to_f_nws(parsed.six_hr_max_c)
-                    if state.observed_high is None or max_f > state.observed_high:
-                        state.observed_high = max_f
-                        log_event('synoptic_max', station=station, temp_f=max_f)
+                    if six_hr_spans_midnight:
+                        log_event('synoptic_max_ignored', station=station, 
+                                 reason=f"6-hr period spans midnight (METAR at {metar_local_hour}:00 local)")
+                    else:
+                        max_f = c_to_f_nws(parsed.six_hr_max_c)
+                        if state.observed_high is None or max_f > state.observed_high:
+                            state.observed_high = max_f
+                            log_event('synoptic_max', station=station, temp_f=max_f)
                 
                 if parsed.six_hr_min_c is not None:
-                    min_f = c_to_f_nws(parsed.six_hr_min_c)
-                    if state.observed_low is None or min_f < state.observed_low:
-                        state.observed_low = min_f
-                        log_event('synoptic_min', station=station, temp_f=min_f)
+                    if six_hr_spans_midnight:
+                        log_event('synoptic_min_ignored', station=station,
+                                 reason=f"6-hr period spans midnight (METAR at {metar_local_hour}:00 local)")
+                    else:
+                        min_f = c_to_f_nws(parsed.six_hr_min_c)
+                        if state.observed_low is None or min_f < state.observed_low:
+                            state.observed_low = min_f
+                            log_event('synoptic_min', station=station, temp_f=min_f)
                 
                 if state.observed_high != old_high or state.observed_low != old_low:
                     log_event('temp_update', station=station, 
