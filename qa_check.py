@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 WETHR_API_KEY = "da0c8fe4607429123437c3d55cbfd5117652ac24506a9f8af45696a82e0fd652"
 WETHR_BASE_URL = "https://wethr.net/api/v2/observations.php"
-KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 STATIONS = {
     'KNYC': {'name': 'NYC', 'tz': 'America/New_York', 'high': 'KXHIGHNYC', 'low': 'KXLOWNYC'},
