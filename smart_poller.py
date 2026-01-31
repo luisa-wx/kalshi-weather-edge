@@ -753,6 +753,46 @@ class WXSniper:
             resolved = len(state.resolved_brackets)
             logger.info(f"  [{station}] Watching: {high_count} HIGH, {low_count} LOW | Resolved: {resolved}")
     
+    def check_date_rollover(self):
+        """
+        Check if any station's local date has changed and reinitialize if needed.
+        Uses ZoneInfo which handles DST automatically.
+        Called at the start of each main loop iteration.
+        """
+        any_rollover = False
+        
+        for station, state in self.states.items():
+            cfg = STATIONS.get(station, {})
+            tz_name = cfg.get('timezone', 'America/New_York')
+            
+            # ZoneInfo handles DST automatically - no manual adjustment needed
+            tz = ZoneInfo(tz_name)
+            current_date = datetime.now(tz).strftime('%Y-%m-%d')
+            
+            if state.current_local_date is not None and state.current_local_date != current_date:
+                logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
+                
+                # Reset this station's state for the new day
+                state.observed_high = None
+                state.observed_low = None
+                state.latest_temp_f = None
+                state.high_watchlist = []
+                state.low_watchlist = []
+                state.resolved_brackets = []
+                state.current_local_date = current_date
+                
+                any_rollover = True
+            
+            # Initialize if not set (first run)
+            if state.current_local_date is None:
+                state.current_local_date = current_date
+        
+        if any_rollover:
+            logger.info("[ROLLOVER] Reinitializing watchlists for new day...")
+            self.init_watchlists()
+            self.fetch_historical_temps()
+            self.prune_watchlists()
+    
     # ============================================================
     # POLLING & SNIPE DETECTION
     # ============================================================
@@ -876,6 +916,13 @@ class WXSniper:
                 tz = ZoneInfo(tz_name)
                 metar_local = state.metar_time.astimezone(tz)
                 metar_local_hour = metar_local.hour
+                metar_local_date = metar_local.strftime('%Y-%m-%d')
+                
+                # CRITICAL: Skip METARs from previous days - they should NOT affect today's trading
+                if state.current_local_date and metar_local_date != state.current_local_date:
+                    log_event('metar_skipped_yesterday', station=station, 
+                             metar_date=metar_local_date, current_date=state.current_local_date)
+                    continue
                 
                 # NOTE: We do NOT reset observed_high/low here - that happens in check_date_rollover()
                 # This prevents mid-processing resets that can cause false triggers
@@ -1132,6 +1179,9 @@ class WXSniper:
         while self.running:
             now = datetime.now(timezone.utc)
             minute = now.minute
+            
+            # Check for date rollover (handles midnight transitions per station timezone)
+            self.check_date_rollover()
             
             is_metar_drop = 50 <= minute <= 59
             is_hot = minute <= 5
