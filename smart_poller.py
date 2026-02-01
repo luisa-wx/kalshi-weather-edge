@@ -228,7 +228,13 @@ class BracketState:
         self.traded: bool = False
     
     def check_status(self, observed_high: Optional[int], observed_low: Optional[int]) -> str:
-        """Determine current status based on observations."""
+        """Determine current status based on observations.
+        
+        Kalshi convention (from API data):
+          greater: floor = X-1, YES wins when final > floor  (e.g. "30° or above" = floor 29)
+          less:    cap = X+1,   YES wins when final < cap    (e.g. "21° or below" = cap 22)
+          between: floor/cap,   YES wins when floor <= final <= cap
+        """
         
         if self.signal_type == 'high':
             if observed_high is None:
@@ -240,12 +246,14 @@ class BracketState:
                 return 'open'
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                if self.floor_strike is not None and observed_high >= self.floor_strike:
+                # YES wins when final > floor. LOCKED once observed > floor.
+                if self.floor_strike is not None and observed_high > self.floor_strike:
                     return 'locked'
                 return 'open'
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                if self.cap_strike is not None and observed_high > self.cap_strike:
+                # YES wins when final < cap. DEAD once observed >= cap (can't go back down).
+                if self.cap_strike is not None and observed_high >= self.cap_strike:
                     return 'dead'
                 return 'open'
         
@@ -259,12 +267,14 @@ class BracketState:
                 return 'open'
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                if self.floor_strike is not None and observed_low < self.floor_strike:
+                # YES wins when final > floor. DEAD once observed <= floor (can't go back up).
+                if self.floor_strike is not None and observed_low <= self.floor_strike:
                     return 'dead'
                 return 'open'
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                if self.cap_strike is not None and observed_low <= self.cap_strike:
+                # YES wins when final < cap. LOCKED once observed < cap.
+                if self.cap_strike is not None and observed_low < self.cap_strike:
                     return 'locked'
                 return 'open'
         
@@ -276,14 +286,18 @@ class BracketState:
         
         if self.signal_type == 'high':
             if status == 'dead':
+                if self.strike_type in ('less', 'less_or_equal'):
+                    return f"HIGH {observed_high}°F >= cap {self.cap_strike}°F"
                 return f"HIGH {observed_high}°F > cap {self.cap_strike}°F"
             elif status == 'locked':
-                return f"HIGH {observed_high}°F >= floor {self.floor_strike}°F"
+                return f"HIGH {observed_high}°F > floor {self.floor_strike}°F"
         else:
             if status == 'dead':
+                if self.strike_type in ('greater', 'greater_or_equal'):
+                    return f"LOW {observed_low}°F <= floor {self.floor_strike}°F"
                 return f"LOW {observed_low}°F < floor {self.floor_strike}°F"
             elif status == 'locked':
-                return f"LOW {observed_low}°F <= cap {self.cap_strike}°F"
+                return f"LOW {observed_low}°F < cap {self.cap_strike}°F"
         
         return "Still open"
 

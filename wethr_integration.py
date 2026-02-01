@@ -269,8 +269,9 @@ class ASOSScout:
         """
         Check for HIGH bracket locks using lowest_probable.
         
-        If lowest_probable > bracket.cap_strike, the bracket is DEAD.
-        This means even the MINIMUM possible reading exceeds the cap.
+        Kalshi convention:
+          between: cap is actual cap. DEAD when lowest_probable > cap.
+          less: cap = X+1, YES wins when final < cap. DEAD when lowest_probable >= cap.
         
         Returns list of trade signals.
         """
@@ -285,16 +286,23 @@ class ASOSScout:
             if bracket.cap_strike is None:
                 continue
             
-            # HIGH-LOCK: lowest_probable > cap means bracket is mathematically DEAD
-            if lowest_probable > bracket.cap_strike:
+            is_dead = False
+            if bracket.strike_type in ('less', 'less_or_equal'):
+                # YES wins when final < cap. DEAD when lowest_probable >= cap.
+                is_dead = lowest_probable >= bracket.cap_strike
+            else:
+                # between: DEAD when lowest_probable > cap
+                is_dead = lowest_probable > bracket.cap_strike
+            
+            if is_dead:
                 signals.append({
                     'bracket': bracket,
                     'action': 'BUY_NO',
-                    'reason': f"SCOUT: lowest_probable {lowest_probable}°F > cap {bracket.cap_strike}°F",
+                    'reason': f"SCOUT: lowest_probable {lowest_probable}°F vs cap {bracket.cap_strike}°F ({bracket.strike_type})",
                     'wethr_temp': lowest_probable
                 })
                 logger.info(f"[SCOUT] {station} HIGH-LOCK: {bracket.subtitle} "
-                           f"(lowest_probable={lowest_probable} > cap={bracket.cap_strike})")
+                           f"(lowest_probable={lowest_probable} vs cap={bracket.cap_strike}, {bracket.strike_type})")
         
         return signals
     
@@ -303,8 +311,9 @@ class ASOSScout:
         """
         Check for LOW bracket locks using highest_probable.
         
-        If highest_probable < bracket.floor_strike, the bracket is DEAD.
-        This means even the MAXIMUM possible reading is below the floor.
+        Kalshi convention:
+          between: floor is actual floor. DEAD when highest_probable < floor.
+          greater: floor = X-1, YES wins when final > floor. DEAD when highest_probable <= floor.
         
         Returns list of trade signals.
         """
@@ -319,16 +328,23 @@ class ASOSScout:
             if bracket.floor_strike is None:
                 continue
             
-            # LOW-LOCK: highest_probable < floor means bracket is mathematically DEAD
-            if highest_probable < bracket.floor_strike:
+            is_dead = False
+            if bracket.strike_type in ('greater', 'greater_or_equal'):
+                # YES wins when final > floor. DEAD when highest_probable <= floor.
+                is_dead = highest_probable <= bracket.floor_strike
+            else:
+                # between: DEAD when highest_probable < floor
+                is_dead = highest_probable < bracket.floor_strike
+            
+            if is_dead:
                 signals.append({
                     'bracket': bracket,
                     'action': 'BUY_NO',
-                    'reason': f"SCOUT: highest_probable {highest_probable}°F < floor {bracket.floor_strike}°F",
+                    'reason': f"SCOUT: highest_probable {highest_probable}°F vs floor {bracket.floor_strike}°F ({bracket.strike_type})",
                     'wethr_temp': highest_probable
                 })
                 logger.info(f"[SCOUT] {station} LOW-LOCK: {bracket.subtitle} "
-                           f"(highest_probable={highest_probable} < floor={bracket.floor_strike})")
+                           f"(highest_probable={highest_probable} vs floor={bracket.floor_strike}, {bracket.strike_type})")
         
         return signals
     
