@@ -608,6 +608,7 @@ def run():
                 state.parse_failures += 1
                 logger.warning(f"   ❌ {transcript_or_error}")
                 log_row(ts, None, None, None, False, '', transcript_or_error)
+                time.sleep(5)
                 continue
 
             # Update state
@@ -626,9 +627,8 @@ def run():
 
             log_row(ts, zulu, temp_c, candidates, changed, trade_str, '')
 
-            # No sleep — immediately start next call.
-            # Each call takes ~50s naturally (35s listen + overhead).
-            # That IS our polling interval. No reason to add dead time.
+            # Brief pause to let Twilio tear down previous call
+            time.sleep(5)
 
     except KeyboardInterrupt:
         pass
