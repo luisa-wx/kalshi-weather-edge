@@ -606,7 +606,8 @@ class ASOSScout:
         # Poll each active station
         for station, state in self.sniper.states.items():
             # KLAS is handled by klas_phone_sniper.py — skip in Scout
-            if station == 'KLAS':
+            # KSFO is handled by stream sniper — skip in Scout
+            if station in ('KLAS', 'KSFO'):
                 continue
             
             # Skip stations with no open brackets
