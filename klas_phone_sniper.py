@@ -563,7 +563,7 @@ def run():
 
     print_banner(brackets)
 
-    in_metar_window = False
+    last_bracket_refresh = time.time()
 
     try:
         while True:
@@ -572,32 +572,20 @@ def run():
                 logger.info("\n⏰ Past cutoff time — stopping")
                 break
 
-            # Check METAR window
-            if is_metar_window():
-                if not in_metar_window:
-                    logger.info("💤 METAR window — phone sniper sleeping (METAR sniper has priority)")
-                    in_metar_window = True
-                time.sleep(10)
-                continue
-
-            if in_metar_window:
-                logger.info("⏰ METAR window ended — phone sniper resuming")
-                in_metar_window = False
-
-                # Refresh bracket prices after METAR window
-                # (a METAR may have moved prices)
+            # Refresh bracket prices every 10 minutes
+            if time.time() - last_bracket_refresh > 600:
                 try:
                     new_brackets = load_brackets()
                     if new_brackets:
-                        # Preserve traded state
                         for nb in new_brackets:
                             if nb.ticker in state.traded_tickers:
                                 nb.traded = True
-                                nb.status = 'dead'  # or locked
+                                nb.status = 'dead'
                         brackets = new_brackets
                         logger.info(f"[BRACKETS] Refreshed {len(brackets)} brackets")
                 except:
                     pass
+                last_bracket_refresh = time.time()
 
             # Make the call
             state.call_count += 1
