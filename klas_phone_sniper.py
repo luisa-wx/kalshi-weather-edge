@@ -41,6 +41,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('phone_sniper')
 
+# Suppress noisy Twilio HTTP debug logs
+logging.getLogger('twilio.http_client').setLevel(logging.WARNING)
+
 # ─── Credentials ──────────────────────────────────────────────
 account_sid  = os.getenv('TWILIO_ACCOUNT_SID')
 auth_token   = os.getenv('TWILIO_AUTH_TOKEN')
@@ -441,10 +444,18 @@ def make_one_call():
         if not recording:
             return None, None, 'no_recording'
 
-        # Download WAV
+        # Download WAV (retry — Twilio needs time to process recording)
         url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Recordings/{recording.sid}.wav"
-        wav = requests.get(url, auth=(account_sid, auth_token), timeout=30)
-        wav.raise_for_status()
+        wav = None
+        for dl_attempt in range(5):
+            resp = requests.get(url, auth=(account_sid, auth_token), timeout=30)
+            if resp.status_code == 200:
+                wav = resp
+                break
+            time.sleep(3)
+        
+        if wav is None:
+            return None, None, f'wav_download_failed_{resp.status_code}'
 
         # Transcribe
         dg = requests.post(
