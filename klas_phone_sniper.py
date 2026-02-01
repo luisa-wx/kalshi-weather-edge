@@ -597,7 +597,6 @@ def run():
                 state.parse_failures += 1
                 logger.warning(f"   ❌ {transcript_or_error}")
                 log_row(ts, None, None, None, False, '', transcript_or_error)
-                time.sleep(max(5, POLL_INTERVAL - 50))
                 continue
 
             # Update state
@@ -616,9 +615,9 @@ def run():
 
             log_row(ts, zulu, temp_c, candidates, changed, trade_str, '')
 
-            # Sleep until next call
-            # Call takes ~50s, so only need ~10s more to hit 60s interval
-            time.sleep(max(5, POLL_INTERVAL - 50))
+            # No sleep — immediately start next call.
+            # Each call takes ~50s naturally (35s listen + overhead).
+            # That IS our polling interval. No reason to add dead time.
 
     except KeyboardInterrupt:
         pass
