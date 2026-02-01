@@ -472,6 +472,7 @@ class WXSniper:
         self.last_metar_poll: Optional[datetime] = None
         self.last_price_poll: Optional[datetime] = None
         self.snipes: List[dict] = []
+        self.processed_tickers: set = set()  # Global ticker lock — prevents double-trades
         
         # Polling mode display
         self.polling_mode = "NORMAL"
@@ -789,6 +790,8 @@ class WXSniper:
         
         if any_rollover:
             logger.info("[ROLLOVER] Reinitializing watchlists for new day...")
+            self.processed_tickers.clear()  # Reset global ticker lock for new day
+            self.snipes.clear()  # Clear snipe records from previous day
             self.init_watchlists()
             self.fetch_historical_temps()
             # Seed temps from wethr.net to catch any highs/lows we missed
@@ -1032,9 +1035,25 @@ class WXSniper:
             )
     
     def _snipe(self, bracket: BracketState, action: str, price: int, reason: str):
-        """Execute a snipe trade with QC hedge."""
-        side = 'no' if action == 'BUY_NO' else 'yes'
-        execution_price = 99  # Always bid max for guaranteed fill
+        """Execute a snipe trade — BUY ONLY, hold to settlement.
+        
+        Kalshi API semantics:
+          side='no',  action='buy', no_price=99  → Buy No at 99¢, hold → settles $1 = 1¢ profit
+          side='yes', action='buy', yes_price=99 → Buy Yes at 99¢, hold → settles $1 = 1¢ profit
+        
+        NO HEDGE. The contract settles at 100¢. Selling at 99¢ just gives your
+        profit back. Only sell via Ejection Seat if the position is wrong.
+        """
+        # GLOBAL TICKER LOCK — prevents METAR sniper + Scout from both trading
+        if bracket.ticker in self.processed_tickers:
+            log_event('snipe_skipped_duplicate', ticker=bracket.ticker, action=action)
+            return
+        
+        if action == 'BUY_NO':
+            side = 'no'
+        else:
+            side = 'yes'
+        execution_price = 99  # Max bid to guarantee fill on winning side
         
         snipe_record = {
             'time': datetime.now(timezone.utc).isoformat(),
@@ -1055,7 +1074,7 @@ class WXSniper:
         
         if self.live_mode:
             try:
-                # BUY
+                # BUY ONLY — hold to settlement
                 result = self.kalshi.create_order(
                     ticker=bracket.ticker,
                     side=side,
@@ -1070,22 +1089,6 @@ class WXSniper:
                 
                 log_event('snipe_buy_success', order_id=snipe_record['order_id'],
                          latency_ms=snipe_record['buy_latency_ms'])
-                
-                # HEDGE SELL
-                try:
-                    hedge_result = self.kalshi.create_order(
-                        ticker=bracket.ticker,
-                        side=side,
-                        action='sell',
-                        count=self.order_size,
-                        order_type='limit',
-                        price_cents=99
-                    )
-                    snipe_record['hedge_order_id'] = hedge_result.get('order', {}).get('order_id')
-                    log_event('snipe_hedge_success', order_id=snipe_record['hedge_order_id'])
-                except Exception as e:
-                    snipe_record['hedge_error'] = str(e)
-                    log_event('snipe_hedge_failed', error=str(e))
                     
             except Exception as e:
                 snipe_record['error'] = str(e)
@@ -1095,6 +1098,7 @@ class WXSniper:
             log_event('snipe_dry_run')
         
         bracket.traded = True
+        self.processed_tickers.add(bracket.ticker)  # Global lock
         self.snipes.append(snipe_record)
     
     # ============================================================
@@ -1344,7 +1348,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
         # Today's Trades
         if todays_snipes:
             html += f"<h2>&#9889; METAR Trades ({len(todays_snipes)})</h2>"
-            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Qty</th><th>Price</th><th>Latency</th><th>Buy</th><th>Hedge</th></tr>'
+            html += '<table><tr><th>Time (ET)</th><th>Station</th><th>Bracket</th><th>Action</th><th>Qty</th><th>Price</th><th>Latency</th><th>Status</th></tr>'
             for snipe in reversed(todays_snipes):
                 try:
                     snipe_time = datetime.fromisoformat(snipe['time'].replace('Z', '+00:00'))
@@ -1353,22 +1357,13 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 except:
                     time_str = snipe['time'][11:19]
                 
-                # Buy status
+                # Status
                 if not snipe.get('live'):
-                    buy_status = "&#129514; DRY"
-                    hedge_status = "—"
+                    status = "&#129514; DRY"
                 elif snipe.get('success'):
-                    buy_status = "&#9989;"
-                    # Hedge status
-                    if snipe.get('hedge_order_id'):
-                        hedge_status = "&#9989;"
-                    elif snipe.get('hedge_error'):
-                        hedge_status = "&#10060;"
-                    else:
-                        hedge_status = "?"
+                    status = "&#9989;"
                 else:
-                    buy_status = "&#10060;"
-                    hedge_status = "—"
+                    status = "&#10060;"
                 
                 action_class = "locked" if snipe['action'] == 'BUY_YES' else "dead"
                 latency = snipe.get('buy_latency_ms', '?')
@@ -1381,8 +1376,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
                     <td>{qty}</td>
                     <td>{snipe['price']}&#162;</td>
                     <td class="latency">{latency}ms</td>
-                    <td>{buy_status}</td>
-                    <td>{hedge_status}</td>
+                    <td>{status}</td>
                 </tr>'''
             html += '</table>'
         else:

@@ -355,20 +355,24 @@ class ASOSScout:
     
     def execute_scout_trade(self, signal: Dict, station: str) -> bool:
         """
-        Execute a Scout trade via Kalshi API.
+        Execute a Scout trade — BUY ONLY, hold to settlement.
         
-        Args:
-            signal: Trade signal dict from check_high_lock/check_low_lock
-            station: Station code
-            
-        Returns:
-            True if trade executed successfully
+        NO HEDGE. Settlement pays 100¢. Selling at 99¢ gives your profit away.
+        Only the Ejection Seat should sell (market order if the position is wrong).
+        
+        Profit = (100 - entry_price)¢ per contract.
+        At Scout's BID_PRICE of 85¢, that's 15¢/contract if correct.
         """
         bracket = signal['bracket']
         action = signal['action']
         side = 'no' if action == 'BUY_NO' else 'yes'
         
-        # Check price - Scout aims for ~85¢ or better
+        # GLOBAL TICKER LOCK — prevents Scout + METAR sniper double-trade
+        if bracket.ticker in self.sniper.processed_tickers:
+            logger.info(f"[SCOUT] {bracket.ticker} already traded (global lock), skipping")
+            return False
+        
+        # Check price
         price = bracket.no_ask if side == 'no' else bracket.yes_ask
         if price > self.sniper.max_price:
             logger.info(f"[SCOUT] {station} {bracket.subtitle}: Price {price}¢ > max {self.sniper.max_price}¢, skipping")
@@ -377,8 +381,7 @@ class ASOSScout:
         logger.info(f"[SCOUT] EXECUTING: {action} {bracket.ticker} @ {BID_PRICE}¢ x{TRADE_QUANTITY}")
         
         if not self.sniper.live_mode:
-            logger.info(f"[SCOUT] DRY RUN - would have traded")
-            # Track position even in dry run for testing
+            logger.info(f"[SCOUT] DRY RUN — holding to settlement (no hedge)")
             position = ScoutPosition(
                 ticker=bracket.ticker,
                 station=station,
@@ -392,24 +395,24 @@ class ASOSScout:
             )
             self.positions.append(position)
             bracket.traded = True
+            self.sniper.processed_tickers.add(bracket.ticker)
             return True
         
         try:
-            # Execute buy order at BID_PRICE (85¢), not 99¢
-            # We save 99¢ for METAR-confirmed kills via smart_poller
+            # BUY ONLY — hold to settlement for (100 - BID_PRICE)¢ profit
             result = self.sniper.kalshi.create_order(
                 ticker=bracket.ticker,
                 side=side,
                 action='buy',
                 count=TRADE_QUANTITY,
                 order_type='limit',
-                price_cents=BID_PRICE  # Scout bids 85¢
+                price_cents=BID_PRICE
             )
             
             order_id = result.get('order', {}).get('order_id')
-            logger.info(f"[SCOUT] Order placed: {order_id} @ {BID_PRICE}¢")
+            logger.info(f"[SCOUT] Buy placed: {order_id} @ {BID_PRICE}¢ — holding to settlement")
             
-            # Track position for Ejection Seat
+            # Track position for Ejection Seat monitoring
             position = ScoutPosition(
                 ticker=bracket.ticker,
                 station=station,
@@ -423,21 +426,8 @@ class ASOSScout:
             )
             self.positions.append(position)
             
-            # Place hedge sell at 99¢ (profit target)
-            try:
-                hedge_result = self.sniper.kalshi.create_order(
-                    ticker=bracket.ticker,
-                    side=side,
-                    action='sell',
-                    count=TRADE_QUANTITY,
-                    order_type='limit',
-                    price_cents=99
-                )
-                logger.info(f"[SCOUT] Hedge placed: {hedge_result.get('order', {}).get('order_id')}")
-            except Exception as e:
-                logger.error(f"[SCOUT] Hedge failed: {e}")
-            
             bracket.traded = True
+            self.sniper.processed_tickers.add(bracket.ticker)
             return True
             
         except Exception as e:
