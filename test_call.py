@@ -1,25 +1,30 @@
-{\rtf1\ansi\ansicpg1252\cocoartf2822
-\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fnil\fcharset0 HelveticaNeue;}
-{\colortbl;\red255\green255\blue255;}
-{\*\expandedcolortbl;;}
-\margl1440\margr1440\vieww11520\viewh8400\viewkind0
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+import os
+from twilio.rest import Client
+from dotenv import load_dotenv
 
-\f0\fs24 \cf0 from twilio.rest import Client\
-\
-# Use standard straight quotes\
-account_sid = 'AC00f63d1401a9cd0fcf87800a0f5dc416' \
-auth_token = '
-\f1\fs26 b04c57abd5b695a51ba6a5ec3a90be33
-\f0\fs24 ' # Not the API Secret, the main Auth Token\
-client = Client(account_sid, auth_token)\
-\
-try:\
-    call = client.calls.create(\
-        to='+19176799405',  \
-        from_='+18334329646',\
-        url='https://handler.twilio.com/twiml/EH5d2f909a60a6cd5ca7c007d591ad9f5b'\
-    )\
-    print(f"Call initiated successfully! SID: \{call.sid\}")\
-except Exception as e:\
-    print(f"Failed to call: \{e\}")}
+# This looks for a .env file in the same directory and loads it
+load_dotenv()
+
+# Pull the credentials
+account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+from_num = os.getenv('TWILIO_PHONE_NUMBER')
+
+# DEBUG: Prove it worked
+if not account_sid:
+    print("❌ ERROR: TWILIO_ACCOUNT_SID is still None. Check your .env file location.")
+    exit(1)
+else:
+    print(f"✅ Loaded SID: {account_sid[:10]}...")
+
+client = Client(account_sid, auth_token)
+
+try:
+    call = client.calls.create(
+        to='+19176799405',  # Your phone
+        from_=from_num,
+        url='https://handler.twilio.com/twiml/EH5d2f909a60a6cd5ca7c007d591ad9f5b'
+    )
+    print(f"🚀 Call initiated! SID: {call.sid}")
+except Exception as e:
+    print(f"🔥 Twilio Error: {e}")
