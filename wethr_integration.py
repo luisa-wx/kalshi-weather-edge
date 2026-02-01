@@ -41,7 +41,7 @@ from dataclasses import dataclass
 TRADE_QUANTITY = int(os.environ.get('SCOUT_TRADE_QUANTITY', '1'))
 
 # Scout bid price (we bid 85¢, not 99¢ - save 99¢ for METAR-confirmed kills)
-BID_PRICE = int(os.environ.get('SCOUT_BID_PRICE', '85'))
+BID_PRICE = int(os.environ.get('SCOUT_BID_PRICE', '99'))
 
 # Wethr.net API configuration
 WETHR_API_KEY = os.environ.get('WETHR_API_KEY', 'da0c8fe4607429123437c3d55cbfd5117652ac24506a9f8af45696a82e0fd652')
@@ -361,7 +361,7 @@ class ASOSScout:
         Only the Ejection Seat should sell (market order if the position is wrong).
         
         Profit = (100 - entry_price)¢ per contract.
-        At Scout's BID_PRICE of 85¢, that's 15¢/contract if correct.
+        At Scout's BID_PRICE of 99¢, that's 1¢/contract if correct.
         """
         bracket = signal['bracket']
         action = signal['action']
