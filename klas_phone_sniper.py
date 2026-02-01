@@ -424,22 +424,28 @@ def make_one_call():
         )
         call_sid = call.sid
 
-        # Wait for completion
-        for i in range(LISTEN_SECONDS + 20):
+        # Wait for completion — check every 5s
+        final_status = None
+        for i in range(LISTEN_SECONDS + 30):
             time.sleep(1)
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 5 == 0:
                 c = twilio_client.calls(call_sid).fetch()
+                final_status = c.status
                 if c.status in ('completed', 'failed', 'busy', 'no-answer', 'canceled'):
+                    logger.info(f"   call {call_sid[-8:]}: {c.status} after {i+1}s (duration={c.duration}s)")
                     break
+        
+        if final_status in ('failed', 'busy', 'no-answer', 'canceled'):
+            return None, None, f'call_{final_status}'
 
-        # Get recording
+        # Get recording — wait longer, check more often
         recording = None
-        for attempt in range(5):
+        for attempt in range(8):
             recordings = twilio_client.recordings.list(call_sid=call_sid, limit=5)
             if recordings:
                 recording = recordings[0]
                 break
-            time.sleep(3)
+            time.sleep(2)
 
         if not recording:
             return None, None, 'no_recording'
