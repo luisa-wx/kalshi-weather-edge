@@ -239,12 +239,12 @@ class BracketState:
                     return 'dead'
                 return 'open'
             
-            elif self.strike_type == 'greater':
+            elif self.strike_type in ('greater', 'greater_or_equal'):
                 if self.floor_strike is not None and observed_high >= self.floor_strike:
                     return 'locked'
                 return 'open'
             
-            elif self.strike_type == 'less':
+            elif self.strike_type in ('less', 'less_or_equal'):
                 if self.cap_strike is not None and observed_high > self.cap_strike:
                     return 'dead'
                 return 'open'
@@ -258,12 +258,12 @@ class BracketState:
                     return 'dead'
                 return 'open'
             
-            elif self.strike_type == 'greater':
+            elif self.strike_type in ('greater', 'greater_or_equal'):
                 if self.floor_strike is not None and observed_low < self.floor_strike:
                     return 'dead'
                 return 'open'
             
-            elif self.strike_type == 'less':
+            elif self.strike_type in ('less', 'less_or_equal'):
                 if self.cap_strike is not None and observed_low <= self.cap_strike:
                     return 'locked'
                 return 'open'
@@ -574,6 +574,7 @@ class WXSniper:
                         b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
                         b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
                         state.high_watchlist.append(b)
+                        logger.info(f"    [BRACKET] {b.subtitle} | strike_type={m.get('strike_type')} floor={floor_val} cap={cap_val} -> int floor={b.floor_strike} cap={b.cap_strike}")
                     
                     logger.info(f"  {station} HIGH: {len(state.high_watchlist)} brackets")
                 except Exception as e:
@@ -601,6 +602,7 @@ class WXSniper:
                         b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
                         b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
                         state.low_watchlist.append(b)
+                        logger.info(f"    [BRACKET] {b.subtitle} | strike_type={m.get('strike_type')} floor={floor_val} cap={cap_val} -> int floor={b.floor_strike} cap={b.cap_strike}")
                     
                     logger.info(f"  {station} LOW: {len(state.low_watchlist)} brackets")
                 except Exception as e:
