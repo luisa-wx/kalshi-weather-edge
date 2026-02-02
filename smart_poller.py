@@ -326,6 +326,20 @@ class StationState:
     tomorrow_low_watchlist: List[BracketState] = field(default_factory=list)
     tomorrow_resolved_brackets: List[BracketState] = field(default_factory=list)
     tomorrow_market_date: Optional[str] = None  # "Feb 02" — displayed label
+    
+    # ── Phase 2: Proximity Detection (Section 9E Q2) ──
+    wethr_high: Optional[int] = None     # Running day's high from wethr.net (wethr_high mode)
+    wethr_low: Optional[int] = None      # Running day's low from wethr.net (wethr_high mode)
+    high_gap: Optional[int] = None       # °F from wethr_high to next open HIGH bracket boundary
+    low_gap: Optional[int] = None        # °F from wethr_low to next open LOW bracket boundary
+    velocity: Optional[float] = None     # °F/min from last 3 "latest" readings
+    
+    # Q1-Q4 deployment evaluation results (for dashboard QA)
+    q1_result: Optional[str] = None      # 'PASS' / 'FAIL' / 'SLEEP'
+    q2_result: Optional[str] = None      # 'PASS(gap=2)' / 'WAIT(gap=6)'
+    q3_result: Optional[str] = None      # 'PASS(ahead)' / 'PASS(normal)' / 'FAIL(peaked)'
+    q4_result: Optional[str] = None      # 'PASS(2/3↑)' / 'WAIT(stalled)'
+    deploy_signal: Optional[str] = None  # 'DEPLOY' / 'WAIT' / 'SLEEP' — overall result
 
 # ============================================================
 # KALSHI CLIENT (with latency tracking)
@@ -1796,6 +1810,90 @@ summary {{ cursor: pointer; color: #8b949e; }}
                         html += f' &nbsp; <strong style="color:#58a6ff;">▼ {fc_tomorrow.forecast_low}°F</strong> @{l_troughs}h'
                     
                     html += '</div>'
+            
+            # ── Phase 2: Q2 Proximity + Velocity card ──
+            if s.scout and station in s.scout.q2_results:
+                q2 = s.scout.q2_results[station]
+                gap_info = q2.get('gap_info', {})
+                velocity = q2.get('velocity')
+                prox_threshold = q2.get('proximity_threshold', 3)
+                
+                # Velocity display
+                if velocity is not None:
+                    vel_abs = abs(velocity)
+                    vel_dir = '↑' if velocity > 0 else '↓' if velocity < 0 else '→'
+                    vel_color = '#f85149' if vel_abs > 0.1 else '#8b949e'
+                    vel_str = f'<span style="color:{vel_color};">{vel_dir} {vel_abs:.2f}°F/min</span>'
+                    fast_tag = ' <span style="color:#f0883e; font-size:10px;">(FAST)</span>' if vel_abs > 0.1 else ''
+                else:
+                    vel_str = '<span style="color:#8b949e;">—</span>'
+                    fast_tag = ''
+                
+                # Cadence display
+                cadence_s = s.scout.get_cadence_seconds(station)
+                if cadence_s >= 60:
+                    cadence_str = f'{cadence_s // 60}min'
+                else:
+                    cadence_str = f'{cadence_s}s'
+                
+                # wethr_high/low display
+                wh = gap_info.get('wethr_high')
+                wl = gap_info.get('wethr_low')
+                wh_str = f'{wh}°F' if wh is not None else '—'
+                wl_str = f'{wl}°F' if wl is not None else '—'
+                
+                html += f'<div style="background:#161b22; border-left:3px solid #30363d; padding:6px 12px; border-radius:4px; margin:4px 0; font-size:12px; line-height:1.5;">'
+                html += f'<span style="color:#8b949e;">Q2 Proximity</span> &nbsp; '
+                html += f'<span style="color:#8b949e;">cadence:</span> <strong>{cadence_str}</strong> &nbsp; '
+                html += f'<span style="color:#8b949e;">velocity:</span> {vel_str}{fast_tag} &nbsp; '
+                html += f'<span style="color:#8b949e;">threshold:</span> {prox_threshold}°F'
+                html += f'<br/>'
+                html += f'<span style="color:#8b949e;">wethr:</span> '
+                html += f'<strong style="color:#f85149;">▲{wh_str}</strong> '
+                html += f'<strong style="color:#58a6ff;">▼{wl_str}</strong>'
+                html += f' &nbsp;│&nbsp; '
+                html += f'<span style="color:#8b949e;">HIGH gap:</span> {q2["high_result"]} &nbsp; '
+                html += f'<span style="color:#8b949e;">LOW gap:</span> {q2["low_result"]}'
+                
+                # ── Q1-Q4 Deployment Decision ──
+                deployment = q2.get('deployment')
+                if deployment:
+                    html += f'<br/><span style="color:#8b949e; font-size:11px;">─── Deployment ───</span>'
+                    
+                    for sig_type in ('high', 'low'):
+                        d = deployment.get(sig_type, {})
+                        sig = d.get('signal', '—')
+                        if sig == '—':
+                            continue
+                        
+                        sig_icon = '▲' if sig_type == 'high' else '▼'
+                        sig_color = '#f85149' if sig_type == 'high' else '#58a6ff'
+                        
+                        if sig == 'DEPLOY':
+                            sig_html = '<span style="color:#3fb950; font-weight:bold;">DEPLOY</span>'
+                        elif sig.startswith('WAIT'):
+                            sig_html = f'<span style="color:#f0883e;">{sig}</span>'
+                        else:
+                            sig_html = f'<span style="color:#8b949e;">{sig}</span>'
+                        
+                        # Individual Q results — color PASS green, FAIL red, WAIT orange
+                        q_parts = []
+                        for qn, qk in [('Q1', 'q1'), ('Q2', 'q2'), ('Q3', 'q3'), ('Q4', 'q4')]:
+                            qval = d.get(qk, '—')
+                            if qval.startswith('PASS'):
+                                q_parts.append(f'<span style="color:#3fb950;">{qn}✓</span>')
+                            elif qval.startswith('FAIL'):
+                                q_parts.append(f'<span style="color:#f85149;">{qn}✗ {qval[5:]}</span>')
+                            elif qval.startswith('WAIT'):
+                                q_parts.append(f'<span style="color:#f0883e;">{qn}⏳ {qval[5:]}</span>')
+                            else:
+                                q_parts.append(f'<span style="color:#8b949e;">{qn}—</span>')
+                        
+                        html += f'<br/><span style="color:{sig_color};">{sig_icon}</span> '
+                        html += f'{sig_html} &nbsp; '
+                        html += ' '.join(q_parts)
+                
+                html += f'</div>'
             
             # Build Scout position lookup for this station
             scout_tickers = {}

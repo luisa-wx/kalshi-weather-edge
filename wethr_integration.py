@@ -56,6 +56,20 @@ MAX_STALENESS_MINUTES = 15  # Reject observations older than 15 minutes
 # Professional tier allows 60 req/min, so 12 stations x 2/min = 24 req/min is safe
 SCOUT_POLL_INTERVAL_SECONDS = 30
 
+# ── Phase 2: Cadence + Proximity ──
+# Variable polling intervals per phase (seconds)
+CADENCE_IDLE = 900       # 15 min — far from windows
+CADENCE_WATCHING = 300   # 5 min  — near/in a forecast window
+CADENCE_HOT = 120        # 2 min  — close to a bracket boundary
+
+# Proximity thresholds (Section 9E Q2)
+BASE_PROXIMITY_F = 3     # Default gap threshold in °F
+FAST_PROXIMITY_F = 4     # Widen threshold on fast-moving fronts
+VELOCITY_FAST_THRESHOLD = 0.1  # °F per minute → "fast front"
+
+# temp_history ring buffer size
+TEMP_HISTORY_MAX = 10
+
 # Phone-enabled stations (Section 9 orchestrator)
 PHONE_STATIONS = {
     'KPHL': '+12154929617',
@@ -162,8 +176,20 @@ class ASOSScout:
         self.last_forecast_poll: Optional[datetime] = None
         
         # Latest observation cache for trend tracking (Section 9E/Q4)
-        # Key: station, Value: list of (timestamp, temp_f) tuples, max 5
+        # Key: station, Value: list of (timestamp, temp_f) tuples, max TEMP_HISTORY_MAX
         self.temp_history: Dict[str, List[tuple]] = {}
+        
+        # ── Phase 2: Per-station polling + proximity state ──
+        # Per-station last poll times (variable cadence per phase)
+        self.station_last_obs_poll: Dict[str, datetime] = {}
+        self.station_last_wethr_high_poll: Dict[str, datetime] = {}
+        
+        # Cached wethr_high/low per station (refreshed on WATCHING/HOT cadence)
+        self.wethr_high_cache: Dict[str, Dict] = {}  # station -> {wethr_high, wethr_low, ...}
+        
+        # Q2 results per station for dashboard display
+        # Key: station, Value: dict with gap info
+        self.q2_results: Dict[str, Dict] = {}
         
         logger.info("[SCOUT] ASOS Scout initialized")
         logger.info(f"[SCOUT] Trade quantity: {TRADE_QUANTITY}")
@@ -599,6 +625,475 @@ class ASOSScout:
                     state.observed_low = wethr_low
                     logger.info(f"[SCOUT] {station} observed_low: {old} → {wethr_low} (from wethr.net)")
     
+    # ================================================================
+    # PHASE 2: TEMP HISTORY + VELOCITY + GAP + Q2
+    # ================================================================
+    
+    def record_temp(self, station: str, temp_f: int, obs_time: Optional[datetime] = None):
+        """
+        Record a temperature reading for trend/velocity tracking.
+        
+        Called every time we get a valid mode=latest reading.
+        Stores (timestamp, temp_f) tuples, max TEMP_HISTORY_MAX per station.
+        Deduplicates: skips if same temp and <60s since last record.
+        """
+        ts = obs_time or datetime.now(timezone.utc)
+        
+        if station not in self.temp_history:
+            self.temp_history[station] = []
+        
+        history = self.temp_history[station]
+        
+        # Deduplicate: skip if same temp and recent
+        if history:
+            last_ts, last_temp = history[-1]
+            if last_temp == temp_f and (ts - last_ts).total_seconds() < 60:
+                return  # Same temp, too soon
+        
+        history.append((ts, temp_f))
+        
+        # Trim to max size
+        if len(history) > TEMP_HISTORY_MAX:
+            self.temp_history[station] = history[-TEMP_HISTORY_MAX:]
+    
+    def get_velocity(self, station: str) -> Optional[float]:
+        """
+        Compute temperature velocity from the last 3 readings.
+        
+        Returns: °F per minute (positive = warming, negative = cooling)
+                 None if insufficient data.
+        
+        Uses reading[-1] vs reading[-3] per Section 9E spec.
+        """
+        history = self.temp_history.get(station, [])
+        if len(history) < 3:
+            return None
+        
+        ts_recent, temp_recent = history[-1]
+        ts_old, temp_old = history[-3]
+        
+        minutes = (ts_recent - ts_old).total_seconds() / 60
+        if minutes <= 0:
+            return None
+        
+        return (temp_recent - temp_old) / minutes
+    
+    def get_cadence_seconds(self, station: str) -> int:
+        """
+        Get the polling interval for a station based on its current phase.
+        
+        Returns seconds between polls:
+            IDLE     → 900s  (15 min)
+            WATCHING → 300s  (5 min)
+            HOT      → 120s  (2 min)
+            DORMANT  → no poll (returns a large number)
+        """
+        phase, _ = self.get_current_phase(station)
+        
+        if phase == 'HOT':
+            return CADENCE_HOT
+        elif phase == 'WATCHING':
+            return CADENCE_WATCHING
+        elif phase == 'DORMANT':
+            return 9999  # effectively don't poll
+        else:
+            return CADENCE_IDLE
+    
+    def should_poll_station(self, station: str) -> bool:
+        """
+        Check if enough time has passed to poll mode=latest for this station.
+        
+        Per Section 9D:
+            IDLE     → latest NOT polled (return False)
+            WATCHING → every 5 min
+            HOT      → every 2 min
+        """
+        phase, _ = self.get_current_phase(station)
+        if phase in ('IDLE', 'DORMANT'):
+            return False  # Don't poll latest during IDLE — no trend tracking needed
+        
+        now = datetime.now(timezone.utc)
+        last = self.station_last_obs_poll.get(station)
+        
+        if last is None:
+            return True  # First poll
+        
+        cadence = self.get_cadence_seconds(station)
+        elapsed = (now - last).total_seconds()
+        
+        return elapsed >= cadence
+    
+    def should_poll_wethr_high(self, station: str) -> bool:
+        """
+        Check if we should poll wethr_high for this station.
+        
+        Per Section 9D:
+            IDLE     → every 15 min (track running high/low for bracket state)
+            WATCHING → every 5 min
+            HOT      → every 2 min
+        """
+        now = datetime.now(timezone.utc)
+        last = self.station_last_wethr_high_poll.get(station)
+        
+        if last is None:
+            return True
+        
+        cadence = self.get_cadence_seconds(station)
+        elapsed = (now - last).total_seconds()
+        
+        return elapsed >= cadence
+    
+    def compute_gap_to_bracket(self, station: str) -> Dict:
+        """
+        Compute distance from current wethr_high/low to the nearest open bracket boundary.
+        
+        Returns dict with:
+            high_gap: int or None — degrees from wethr_high to next open HIGH bracket floor
+            low_gap: int or None — degrees from wethr_low to next open LOW bracket cap
+            high_next_floor: int or None — the floor of the nearest open HIGH bracket
+            low_next_cap: int or None — the cap of the nearest open LOW bracket
+            high_next_subtitle: str — bracket label
+            low_next_subtitle: str — bracket label
+        """
+        state = self.sniper.states.get(station)
+        cached = self.wethr_high_cache.get(station, {})
+        
+        result = {
+            'high_gap': None, 'low_gap': None,
+            'high_next_floor': None, 'low_next_cap': None,
+            'high_next_subtitle': '', 'low_next_subtitle': '',
+            'wethr_high': None, 'wethr_low': None,
+        }
+        
+        if not state:
+            return result
+        
+        wethr_high = cached.get('wethr_high')
+        wethr_low = cached.get('wethr_low')
+        
+        if wethr_high is not None:
+            result['wethr_high'] = int(wethr_high)
+        if wethr_low is not None:
+            result['wethr_low'] = int(wethr_low)
+        
+        # ── HIGH gap: find lowest floor of still-OPEN HIGH brackets ──
+        # "Next open bracket boundary" = the lowest strike that would trigger
+        # action on a still-OPEN bracket (for highs).
+        # For between: floor is the lower edge of the bracket range. When wethr_high
+        #   reaches floor, the temp is IN the bracket range. Gap = floor - wethr_high.
+        #   (Spec example: brackets "76-77", wethr_high=75, gap = 76-75 = 1)
+        # For greater: floor is X-1 (offset). Bracket LOCKS when obs > floor.
+        # For less: bracket DIES when obs >= cap.
+        if wethr_high is not None and state.high_watchlist:
+            wh = int(wethr_high)
+            open_boundaries = []
+            for b in state.high_watchlist:
+                if b.status != 'open':
+                    continue
+                if b.strike_type == 'between' and b.floor_strike is not None:
+                    # Between: use floor (lower edge of bracket range)
+                    open_boundaries.append((b.floor_strike, b.subtitle))
+                elif b.strike_type in ('greater', 'greater_or_equal') and b.floor_strike is not None:
+                    # Greater: locks when obs > floor (floor is X-1)
+                    open_boundaries.append((b.floor_strike, b.subtitle))
+                elif b.strike_type in ('less', 'less_or_equal') and b.cap_strike is not None:
+                    # Less: dies when obs >= cap
+                    open_boundaries.append((b.cap_strike, b.subtitle))
+            
+            if open_boundaries:
+                # Sort by boundary: nearest actionable boundary first
+                open_boundaries.sort(key=lambda x: x[0])
+                # Find the nearest boundary ABOVE current wethr_high
+                for boundary, subtitle in open_boundaries:
+                    gap = boundary - wh
+                    if gap >= 0:  # Only look at boundaries we haven't passed
+                        result['high_gap'] = gap
+                        result['high_next_floor'] = boundary
+                        result['high_next_subtitle'] = subtitle
+                        break
+        
+        # ── LOW gap: find highest boundary of still-OPEN LOW brackets ──
+        # For lows, "next open bracket boundary" = the highest boundary that
+        # the temp needs to drop to in order to trigger action.
+        # For between: cap is the upper edge of the bracket range. When wethr_low
+        #   drops to cap, the temp enters the bracket range. Gap = wethr_low - cap.
+        #   (Spec example: bracket "26-27", wethr_low=29, gap = 29-27 = 2)
+        # For greater: bracket DIES when obs <= floor. Gap = wethr_low - floor.
+        # For less: bracket LOCKS when obs < cap. Gap = wethr_low - cap.
+        if wethr_low is not None and state.low_watchlist:
+            wl = int(wethr_low)
+            open_boundaries = []
+            for b in state.low_watchlist:
+                if b.status != 'open':
+                    continue
+                if b.strike_type == 'between' and b.cap_strike is not None:
+                    # Between: use cap (upper edge of bracket range)
+                    open_boundaries.append((b.cap_strike, b.subtitle))
+                elif b.strike_type in ('greater', 'greater_or_equal') and b.floor_strike is not None:
+                    # Greater: dies when obs <= floor
+                    open_boundaries.append((b.floor_strike, b.subtitle))
+                elif b.strike_type in ('less', 'less_or_equal') and b.cap_strike is not None:
+                    # Less: locks when obs < cap
+                    open_boundaries.append((b.cap_strike, b.subtitle))
+            
+            if open_boundaries:
+                # Sort descending: nearest boundary BELOW current wethr_low
+                open_boundaries.sort(key=lambda x: x[0], reverse=True)
+                for boundary, subtitle in open_boundaries:
+                    gap = wl - boundary
+                    if gap >= 0:  # Only look at boundaries we haven't passed
+                        result['low_gap'] = gap
+                        result['low_next_cap'] = boundary
+                        result['low_next_subtitle'] = subtitle
+                        break
+        
+        return result
+    
+    def evaluate_q2(self, station: str) -> Dict:
+        """
+        Q2: Are we close (velocity-adjusted)?
+        
+        Returns dict:
+            passed: bool
+            high_result: str — human-readable for dashboard
+            low_result: str — human-readable for dashboard
+            velocity: float or None — °F/min
+            proximity_threshold: int — 3 or 4
+        """
+        velocity = self.get_velocity(station)
+        
+        if velocity is not None and abs(velocity) > VELOCITY_FAST_THRESHOLD:
+            proximity_threshold = FAST_PROXIMITY_F
+        else:
+            proximity_threshold = BASE_PROXIMITY_F
+        
+        gap_info = self.compute_gap_to_bracket(station)
+        
+        high_passed = False
+        low_passed = False
+        high_result = ''
+        low_result = ''
+        
+        if gap_info['high_gap'] is not None:
+            if gap_info['high_gap'] <= proximity_threshold:
+                high_passed = True
+                high_result = f"✅ {gap_info['high_gap']}°F to {gap_info['high_next_subtitle']} (≤{proximity_threshold})"
+            else:
+                high_result = f"⏳ {gap_info['high_gap']}°F to {gap_info['high_next_subtitle']} (>{proximity_threshold})"
+        else:
+            high_result = "— no open HIGH brackets"
+        
+        if gap_info['low_gap'] is not None:
+            if gap_info['low_gap'] <= proximity_threshold:
+                low_passed = True
+                low_result = f"✅ {gap_info['low_gap']}°F to {gap_info['low_next_subtitle']} (≤{proximity_threshold})"
+            else:
+                low_result = f"⏳ {gap_info['low_gap']}°F to {gap_info['low_next_subtitle']} (>{proximity_threshold})"
+        else:
+            low_result = "— no open LOW brackets"
+        
+        result = {
+            'passed': high_passed or low_passed,
+            'high_passed': high_passed,
+            'low_passed': low_passed,
+            'high_result': high_result,
+            'low_result': low_result,
+            'velocity': velocity,
+            'proximity_threshold': proximity_threshold,
+            'gap_info': gap_info,
+        }
+        
+        # Cache for dashboard
+        self.q2_results[station] = result
+        
+        return result
+    
+    # ================================================================
+    # SECTION 9E: Q1, Q3, Q4 + DEPLOYMENT EVALUATOR
+    # ================================================================
+    
+    def evaluate_q1(self, station: str, signal_type: str) -> str:
+        """
+        Q1: Is there stale edge to capture?
+        
+        ⚠️ TESTING MODE: Always returns PASS.
+        We want to observe deployment decisions without the liquidity filter
+        masking them. Re-enable once Q2-Q4 are validated against real data.
+        """
+        return 'PASS(test)'
+    
+    def evaluate_q3(self, station: str, signal_type: str) -> str:
+        """
+        Q3: Does the forecast support continued movement?
+        
+        Compares observed trajectory vs forecast to detect:
+        - AHEAD OF FORECAST: observed beating forecast by 2°F+ → PASS(ahead)
+        - PEAKED: 2+ hours past peak AND declining → FAIL(peaked)
+        - FORECAST BUSTED: past peak but still climbing → PASS(busted)
+        - NORMAL: within forecast expectations → PASS(normal)
+        """
+        state = self.sniper.states.get(station)
+        if not state or state.latest_temp_f is None:
+            return 'PASS(no obs)'
+        
+        fc = self.get_forecast_for_station(station)
+        if not fc or not fc.hourly_temps:
+            return 'PASS(no fcst)'
+        
+        from smart_poller import STATIONS
+        cfg = STATIONS.get(station, {})
+        tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+        current_lst_hour = datetime.now(tz).hour
+        
+        forecast_now = fc.hourly_temps[current_lst_hour]
+        if forecast_now is None:
+            return 'PASS(no fcst hr)'
+        
+        latest = state.latest_temp_f
+        
+        if signal_type == 'high':
+            # Ahead of forecast? (hotter than expected → market mispriced)
+            if latest > forecast_now + 2:
+                return f'PASS(ahead +{latest - forecast_now}°)'
+            
+            # Past peak check — for each high window
+            for w in fc.high_windows:
+                hours_past = current_lst_hour - w.peak_hour_lst
+                if hours_past < 0:
+                    hours_past += 24
+                
+                if hours_past > 2 and hours_past < 12:  # 2+ hours past, not wrapped
+                    history = self.temp_history.get(station, [])
+                    if len(history) >= 3:
+                        last_3 = [h[1] for h in history[-3:]]
+                        if last_3[0] > last_3[1] > last_3[2]:
+                            return 'FAIL(peaked)'
+                        elif last_3[2] > last_3[0]:
+                            return 'PASS(busted)'  # Past peak but still climbing
+            
+            return 'PASS(normal)'
+        
+        else:  # low
+            # Ahead of forecast? (colder than expected)
+            if latest < forecast_now - 2:
+                return f'PASS(ahead -{forecast_now - latest}°)'
+            
+            # Past trough check
+            for w in fc.low_windows:
+                hours_past = current_lst_hour - w.peak_hour_lst
+                if hours_past < 0:
+                    hours_past += 24
+                
+                if hours_past > 2 and hours_past < 12:
+                    history = self.temp_history.get(station, [])
+                    if len(history) >= 3:
+                        last_3 = [h[1] for h in history[-3:]]
+                        if last_3[0] < last_3[1] < last_3[2]:
+                            return 'FAIL(peaked)'  # Warming after trough
+                        elif last_3[2] < last_3[0]:
+                            return 'PASS(busted)'
+            
+            return 'PASS(normal)'
+    
+    def evaluate_q4(self, station: str, signal_type: str) -> str:
+        """
+        Q4: Are we still moving toward the boundary?
+        
+        Check last 3 readings — 2 of 3 must be moving in the right direction.
+        For highs: temp going UP. For lows: temp going DOWN.
+        Edge case: if only 2 readings, require both to show movement.
+        """
+        history = self.temp_history.get(station, [])
+        
+        if len(history) < 2:
+            return 'WAIT(need data)'
+        
+        if len(history) == 2:
+            t1, t2 = history[-2][1], history[-1][1]
+            if signal_type == 'high':
+                return 'PASS(2/2↑)' if t2 > t1 else 'WAIT(flat/↓)'
+            else:
+                return 'PASS(2/2↓)' if t2 < t1 else 'WAIT(flat/↑)'
+        
+        # 3+ readings: check last 3
+        temps = [h[1] for h in history[-3:]]
+        
+        if signal_type == 'high':
+            moves = sum(1 for i in range(2) if temps[i+1] > temps[i])
+            return f'PASS({moves}/3↑)' if moves >= 2 else f'WAIT({moves}/3↑)'
+        else:
+            moves = sum(1 for i in range(2) if temps[i+1] < temps[i])
+            return f'PASS({moves}/3↓)' if moves >= 2 else f'WAIT({moves}/3↓)'
+    
+    def evaluate_deployment(self, station: str) -> Dict:
+        """
+        Run the full Q1-Q4 deployment decision for a station.
+        
+        Evaluates both HIGH and LOW signals. Stores results in q2_results
+        for dashboard rendering. Returns a dict with all results.
+        
+        This is the master evaluator — call after compute_gap_to_bracket.
+        """
+        state = self.sniper.states.get(station)
+        if not state:
+            return {}
+        
+        q2_info = self.q2_results.get(station, {})
+        gap_info = q2_info.get('gap_info', {})
+        velocity = q2_info.get('velocity')
+        
+        results = {
+            'high': {'q1': '—', 'q2': '—', 'q3': '—', 'q4': '—', 'signal': '—'},
+            'low':  {'q1': '—', 'q2': '—', 'q3': '—', 'q4': '—', 'signal': '—'},
+        }
+        
+        # ── HIGH signal evaluation ──
+        if gap_info.get('high_gap') is not None:
+            q1 = self.evaluate_q1(station, 'high')
+            q3 = self.evaluate_q3(station, 'high')
+            q4 = self.evaluate_q4(station, 'high')
+            
+            # Q2 from the already-computed gap
+            h_gap = gap_info['high_gap']
+            prox = q2_info.get('proximity_threshold', BASE_PROXIMITY_F)
+            q2 = f'PASS(gap={h_gap})' if h_gap <= prox else f'WAIT(gap={h_gap})'
+            
+            all_pass = all(r.startswith('PASS') for r in [q1, q2, q3, q4])
+            if all_pass:
+                signal = 'DEPLOY'
+            else:
+                failing = [f'Q{i+1}' for i, r in enumerate([q1, q2, q3, q4]) 
+                          if not r.startswith('PASS')]
+                signal = f'WAIT({",".join(failing)})'
+            
+            results['high'] = {'q1': q1, 'q2': q2, 'q3': q3, 'q4': q4, 'signal': signal}
+        
+        # ── LOW signal evaluation ──
+        if gap_info.get('low_gap') is not None:
+            q1 = self.evaluate_q1(station, 'low')
+            q3 = self.evaluate_q3(station, 'low')
+            q4 = self.evaluate_q4(station, 'low')
+            
+            l_gap = gap_info['low_gap']
+            prox = q2_info.get('proximity_threshold', BASE_PROXIMITY_F)
+            q2 = f'PASS(gap={l_gap})' if l_gap <= prox else f'WAIT(gap={l_gap})'
+            
+            all_pass = all(r.startswith('PASS') for r in [q1, q2, q3, q4])
+            if all_pass:
+                signal = 'DEPLOY'
+            else:
+                failing = [f'Q{i+1}' for i, r in enumerate([q1, q2, q3, q4]) 
+                          if not r.startswith('PASS')]
+                signal = f'WAIT({",".join(failing)})'
+            
+            results['low'] = {'q1': q1, 'q2': q2, 'q3': q3, 'q4': q4, 'signal': signal}
+        
+        # Store in q2_results for dashboard (extending the existing dict)
+        if station in self.q2_results:
+            self.q2_results[station]['deployment'] = results
+        
+        return results
+    
     def parse_observation_time(self, time_str: str) -> Optional[datetime]:
         """Parse wethr.net observation_time string to datetime."""
         try:
@@ -944,7 +1439,12 @@ class ASOSScout:
         """
         Main Scout polling loop iteration.
         
-        Should be called from smart_poller's main loop.
+        Phase 2: Variable cadence per station based on forecast phase.
+            IDLE     → poll mode=latest every 15 min
+            WATCHING → poll mode=latest every 5 min + mode=wethr_high every 5 min
+            HOT      → poll both every 2 min
+        
+        Also: populates temp_history, computes Q2 gap/velocity for dashboard.
         """
         now = datetime.now(timezone.utc)
         
@@ -966,20 +1466,14 @@ class ASOSScout:
             logger.info("[SCOUT] Exiting DORMANT mode")
             self.dormant = False
         
-        # Respect polling interval (30s)
-        now = datetime.now(timezone.utc)
-        if self.last_poll and (now - self.last_poll).total_seconds() < SCOUT_POLL_INTERVAL_SECONDS:
-            return
-        
-        self.last_poll = now
-        
         # Purge any stale positions from previous days
         self.purge_stale_positions()
         
         # Count active stations for logging
         active_stations = 0
+        skipped_cadence = 0
         
-        # Poll each active station
+        # Poll each active station (variable cadence per station)
         for station, state in self.sniper.states.items():
             # KLAS is handled by klas_phone_sniper.py — skip in Scout
             # KSFO is handled by stream sniper — skip in Scout
@@ -990,49 +1484,93 @@ class ASOSScout:
             if not state.high_watchlist and not state.low_watchlist:
                 continue
             
-            active_stations += 1
+            # ── mode=latest: only during WATCHING/HOT ──
+            # IDLE skips latest (no trend tracking needed far from windows)
+            poll_latest = self.should_poll_station(station)
             
-            # Fetch wethr.net data
-            data = self.fetch_wethr_data(station)
-            if not data:
-                continue
+            if poll_latest:
+                active_stations += 1
+                self.station_last_obs_poll[station] = now
+                
+                data = self.fetch_wethr_data(station)
+                if data:
+                    # Parse observation time
+                    obs_time_str = data.get('observation_time')
+                    obs_time = None
+                    if obs_time_str:
+                        obs_time = self.parse_observation_time(obs_time_str)
+                        if obs_time and self.is_stale(obs_time):
+                            logger.debug(f"[SCOUT] {station} observation stale, skipping latest")
+                            data = None  # Mark as stale but don't skip the whole station
+                    
+                    if data:
+                        temp_display = data.get('temperature_display')
+                        lowest_probable = data.get('lowest_probable')
+                        highest_probable = data.get('highest_probable')
+                        dsm_high = data.get('dsm_high_display')
+                        
+                        # Physics Gate (BEFORE recording — don't corrupt velocity)
+                        physics_ok = True
+                        if temp_display is not None:
+                            if not self.physics_gate(station, float(temp_display)):
+                                physics_ok = False
+                        
+                        if physics_ok:
+                            # Record to temp_history (Phase 2)
+                            if temp_display is not None:
+                                try:
+                                    self.record_temp(station, int(round(float(temp_display))), obs_time)
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # Check for HIGH bracket locks
+                            if lowest_probable is not None and state.high_watchlist:
+                                signals = self.check_high_lock(station, int(lowest_probable), state.high_watchlist)
+                                for signal in signals:
+                                    self.execute_scout_trade(signal, station)
+                            
+                            # Check for LOW bracket locks
+                            if highest_probable is not None and state.low_watchlist:
+                                signals = self.check_low_lock(station, int(highest_probable), state.low_watchlist)
+                                for signal in signals:
+                                    self.execute_scout_trade(signal, station)
+                            
+                            # Check DSM invalidation (informational)
+                            if dsm_high is not None and state.high_watchlist:
+                                self.check_dsm_kill(station, int(dsm_high), state.high_watchlist)
+            else:
+                skipped_cadence += 1
             
-            # Parse observation time
-            obs_time_str = data.get('observation_time')
-            if obs_time_str:
-                obs_time = self.parse_observation_time(obs_time_str)
-                if obs_time and self.is_stale(obs_time):
-                    logger.debug(f"[SCOUT] {station} observation stale, skipping")
-                    continue
+            # ── mode=wethr_high: running day's high/low (Phase 2) ──
+            # Only during WATCHING/HOT phases to conserve API quota
+            if self.should_poll_wethr_high(station):
+                self.station_last_wethr_high_poll[station] = now
+                wh_data = self.fetch_wethr_high(station)
+                if wh_data:
+                    self.wethr_high_cache[station] = wh_data
+                    
+                    # Also update observed_high/low from wethr_high
+                    wh = wh_data.get('wethr_high')
+                    wl = wh_data.get('wethr_low')
+                    if wh is not None:
+                        wh = int(wh)
+                        if state.observed_high is None or wh > state.observed_high:
+                            state.observed_high = wh
+                    if wl is not None:
+                        wl = int(wl)
+                        if state.observed_low is None or wl < state.observed_low:
+                            state.observed_low = wl
             
-            # Get temperature fields
-            temp_display = data.get('temperature_display')
-            lowest_probable = data.get('lowest_probable')
-            highest_probable = data.get('highest_probable')
-            dsm_high = data.get('dsm_high_display')
-            
-            # Physics Gate
-            if temp_display is not None:
-                if not self.physics_gate(station, float(temp_display)):
-                    continue
-            
-            # Check for HIGH bracket locks
-            if lowest_probable is not None and state.high_watchlist:
-                signals = self.check_high_lock(station, int(lowest_probable), state.high_watchlist)
-                for signal in signals:
-                    self.execute_scout_trade(signal, station)
-            
-            # Check for LOW bracket locks
-            if highest_probable is not None and state.low_watchlist:
-                signals = self.check_low_lock(station, int(highest_probable), state.low_watchlist)
-                for signal in signals:
-                    self.execute_scout_trade(signal, station)
-            
-            # Check DSM invalidation (informational)
-            if dsm_high is not None and state.high_watchlist:
-                self.check_dsm_kill(station, int(dsm_high), state.high_watchlist)
+            # ── Q2 evaluation (Phase 2) ──
+            # Only compute if we have wethr_high data cached
+            if station in self.wethr_high_cache:
+                self.evaluate_q2(station)
+                
+                # ── Q1-Q4 full deployment evaluation ──
+                self.evaluate_deployment(station)
         
-        logger.info(f"[SCOUT] Polled {active_stations} stations | Positions: {len(self.positions)}")
+        if active_stations > 0 or skipped_cadence > 0:
+            logger.info(f"[SCOUT] Polled {active_stations} stations, {skipped_cadence} skipped (cadence) | Positions: {len(self.positions)}")
 
 
 # ============================================================
