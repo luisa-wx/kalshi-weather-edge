@@ -908,7 +908,7 @@ class StreamingCall:
                     # The final result will have the correct full number.
                     combined = self.transcript_window + " " + transcript_chunk
                     
-                    logger.info(f"[DG:interim] chunk={transcript_chunk!r}")
+                    logger.debug(f"[DG:interim] chunk={transcript_chunk!r}")
                     
                     temp_c, temp_f = parse_temperature(combined)
                     if temp_c is not None:
