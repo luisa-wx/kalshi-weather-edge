@@ -3,20 +3,26 @@
 stream_sniper.py - Real-time streaming ASOS phone sniper
 =========================================================
 
-Keeps a single long-running call to ASOS, streaming audio continuously.
-The ASOS recording loops every ~60s, so we get a fresh temperature
-reading every cycle without hanging up and redialing.
+Conforms to: WX_SNIPER_COMPLETE_REFERENCE.md (2026-02-02)
+
+KEY BEHAVIORAL CHANGE (v2):
+  ASOS phone lines disconnect after ~3 message cycles (~3 minutes).
+  This version uses a RAPID-REDIAL architecture:
+    - Each call lasts ~3 cycles (expect disconnect after ~180s)
+    - On disconnect: immediate redial (no back-off unless repeated failure)
+    - Track readings-per-call to detect if ASOS behavior changes
+    - Cooldown only on consecutive zero-reading calls (broken line)
 
 ARCHITECTURE:
-  1. Twilio calls ASOS phone number (one call, stays connected)
+  1. Twilio calls ASOS phone number
   2. Twilio streams raw mulaw audio via WebSocket to THIS server
   3. This server pipes audio to Deepgram streaming WebSocket
-  4. Deepgram sends back real-time transcript fragments continuously
+  4. Deepgram sends back real-time transcript fragments
   5. Every time we see "temperature ... digits ... celsius" → update state → check brackets
-  6. Call stays open until schedule ends or Ctrl+C
+  6. ASOS hangs up after ~3 cycles → we detect disconnect → redial in <3s
+  7. Repeat until schedule ends
 
-COST: ~$0.65/hour ($0.007/min Twilio + $0.004/min Deepgram)
-  vs ~$2.40/hour with call-per-reading approach
+COST: ~$1.70/hour effective (includes connect fees from frequent redials)
 
 REQUIRES:
   - nginx + SSL on this server (wss:// proxy to localhost:8765)
@@ -24,8 +30,9 @@ REQUIRES:
 
 Usage:
   python3 stream_sniper.py --station KLAS --ws-url wss://54-91-7-11.nip.io/stream
-  python3 stream_sniper.py --station KSFO --ws-url wss://54-91-7-11.nip.io/stream --start 10:00 --end 16:00
-  python3 stream_sniper.py --station KLAS --ws-url wss://54-91-7-11.nip.io/stream --run-minutes 120 --live
+  python3 stream_sniper.py --station KPHL --ws-url wss://54-91-7-11.nip.io/stream --start 10:00 --end 16:00
+  python3 stream_sniper.py --station KAUS --ws-url wss://54-91-7-11.nip.io/stream --run-minutes 120 --live
+  python3 stream_sniper.py --station KLAS --signal low --ws-url wss://54-91-7-11.nip.io/stream
 """
 
 import os
@@ -75,14 +82,31 @@ import websockets
 
 
 # ─── Station registry ─────────────────────────────────────────
+# Phone numbers verified as of 2026-02-01.
+# Per reference doc Section 12: All time boundaries use Local Standard Time
+# year-round (no DST), matching NWS/Kalshi convention.
 
 STATION_REGISTRY = {
     'KLAS': {
         'name': 'Las Vegas McCarran',
-        'phone': '+17025825334',
-        'tz_offset': -8,
+        'phone': '+17025825334',          # VERIFIED 2026-02-01
+        'tz_offset': -8,                  # America/Los_Angeles LST (no DST)
         'high_ticker': 'KXHIGHTLV',
         'low_ticker': None,
+    },
+    'KPHL': {
+        'name': 'Philadelphia International',
+        'phone': '+12154929617',          # VERIFIED 2026-02-01
+        'tz_offset': -5,                  # America/New_York LST
+        'high_ticker': 'KXHIGHPHIL',
+        'low_ticker': 'KXLOWTPHIL',
+    },
+    'KAUS': {
+        'name': 'Austin-Bergstrom',
+        'phone': '+15123697881',          # VERIFIED 2026-02-01
+        'tz_offset': -6,                  # America/Chicago LST
+        'high_ticker': 'KXHIGHAUS',
+        'low_ticker': 'KXLOWTAUS',
     },
     'KSFO': {
         'name': 'San Francisco International',
@@ -126,24 +150,10 @@ STATION_REGISTRY = {
         'high_ticker': 'KXHIGHDEN',
         'low_ticker': 'KXLOWTDEN',
     },
-    'KPHL': {
-        'name': 'Philadelphia International',
-        'phone': '+12154925857',
-        'tz_offset': -5,
-        'high_ticker': 'KXHIGHPHIL',
-        'low_ticker': 'KXLOWTPHIL',
-    },
-    'KAUS': {
-        'name': 'Austin-Bergstrom',
-        'phone': '+15125304777',
-        'tz_offset': -6,
-        'high_ticker': 'KXHIGHAUS',
-        'low_ticker': 'KXLOWTAUS',
-    },
     'KSEA': {
         'name': 'Seattle-Tacoma',
-        'phone': '+12064331794',
-        'tz_offset': -8,
+        'phone': '+12062142592',          # VERIFIED 2026-02-01
+        'tz_offset': -8,                  # America/Los_Angeles LST
         'high_ticker': 'KXHIGHTSEA',
         'low_ticker': None,
     },
@@ -168,7 +178,7 @@ STATION_REGISTRY = {
 
 def parse_args():
     p = argparse.ArgumentParser(description='Stream Sniper — real-time ASOS phone trading')
-    p.add_argument('--station', required=True, help='ICAO station code (e.g. KLAS, KSFO)')
+    p.add_argument('--station', required=True, help='ICAO station code (e.g. KLAS, KPHL, KAUS)')
     p.add_argument('--ws-url', required=True, help='WebSocket URL for Twilio (e.g. wss://54-91-7-11.nip.io/stream)')
     p.add_argument('--phone', default=None, help='Override ASOS phone number')
     p.add_argument('--high-ticker', default=None, help='Override Kalshi HIGH ticker prefix')
@@ -225,10 +235,17 @@ def spaced_digits_to_int(text: str):
 
 
 def nws_round(val: float) -> int:
+    """NWS rounding: asymmetric round half up (toward +infinity).
+    Per TIN 12-54 (December 2012) and WX_SNIPER_COMPLETE_REFERENCE Section 3A.
+    0.5 ALWAYS rounds toward positive infinity.
+    """
     return math.floor(val + 0.5)
 
 
-def c_to_f_nws(temp_c: int) -> int:
+def c_to_f_nws(temp_c: float) -> int:
+    """Convert Celsius to Fahrenheit with NWS rounding.
+    Per WX_SNIPER_COMPLETE_REFERENCE Section 3B.
+    """
     return nws_round(temp_c * 9.0 / 5.0 + 32)
 
 
@@ -278,6 +295,13 @@ def parse_zulu_time(transcript: str):
 
 
 def compute_omo_candidates(temp_c: int) -> list:
+    """Given a whole-degree Celsius reading (from ASOS phone or 5-min data),
+    compute all possible original OMO values in °F.
+    
+    Per WX_SNIPER_COMPLETE_REFERENCE Section 3E:
+    Phone gives whole °C → same ±1°F ambiguity as 5-min NWS data.
+    Must use probable_high and probable_low, never the center conversion.
+    """
     center_f = c_to_f_nws(temp_c)
     candidates = []
     for omo_f in range(center_f - 3, center_f + 4):
@@ -341,6 +365,7 @@ def load_brackets(ticker_prefix: str, tz_offset: int, station: str, signal_type:
             floor_raw = m.get('floor_strike')
             cap_raw = m.get('cap_strike')
             strike_type = m.get('strike_type', 'between')
+            # Implementation Note 1: Zero is a valid strike — check None explicitly
             floor_strike = int(floor_raw) if floor_raw is not None else None
             cap_strike = int(cap_raw) if cap_raw is not None else None
             no_ask = parse_kalshi_price(m.get('no_ask'), m.get('no_ask_dollars'))
@@ -364,32 +389,114 @@ def load_brackets(ticker_prefix: str, tz_offset: int, station: str, signal_type:
 
 # ─── State + Trading ─────────────────────────────────────────
 
+# Per reference Section 5 (QC Risk):
+# Track last N readings for QC spike detection.
+# If max(readings) - second_max(readings) >= 2 AND max was a single reading → QC risk.
+QC_READING_WINDOW = 5  # Track last 5 readings for spike detection
+QC_SPIKE_THRESHOLD = 2  # °F jump that triggers QC flag
+
+
 class SniperState:
-    def __init__(self):
-        self.probable_high = None
-        self.probable_high_max = None
+    def __init__(self, signal_type: str = 'high'):
+        self.signal_type = signal_type
+        
+        # HIGH tracking (observed_high can only go UP)
+        self.probable_high = None       # Conservative: lowest_probable of the highest reading
+        self.probable_high_max = None   # Aggressive: highest_probable of the highest reading
+        
+        # LOW tracking (observed_low can only go DOWN)
+        self.probable_low = None        # Conservative: highest_probable of the lowest reading
+        self.probable_low_min = None    # Aggressive: lowest_probable of the lowest reading
+        
+        # Call / session stats
         self.call_count = 0
         self.parse_count = 0
         self.parse_failures = 0
         self.total_cost = 0.0
         self.traded_tickers = set()
         self.trades = []
-        self.readings = []
+        self.readings = []              # All readings: (timestamp, zulu, temp_c, candidates)
         self.last_zulu = None
         self.last_temp_c = None
+        
+        # QC spike detection (Section 13 Flag 1)
+        # Stores recent (lowest_probable, highest_probable) tuples
+        self.recent_f_readings = []     # Last N center-F readings for QC analysis
+        self.qc_flags = []              # Active QC warnings
 
-    def update_high(self, temp_c: int, zulu: str):
+    def update(self, temp_c: int, zulu: str):
+        """Update state with a new phone reading. Returns (changed, lo_prob, hi_prob, candidates).
+        
+        Works for both HIGH and LOW signals. The monotonicity constraint means:
+          - For HIGH: probable_high can only go UP
+          - For LOW: probable_low can only go DOWN
+        """
         candidates = compute_omo_candidates(temp_c)
         lowest_probable = min(candidates)
         highest_probable = max(candidates)
+        center_f = c_to_f_nws(temp_c)
+        
         self.readings.append((datetime.now(timezone.utc).isoformat(), zulu, temp_c, candidates))
+        
+        # QC tracking: store center-F for spike detection
+        self.recent_f_readings.append(center_f)
+        if len(self.recent_f_readings) > QC_READING_WINDOW:
+            self.recent_f_readings = self.recent_f_readings[-QC_READING_WINDOW:]
+        
         changed = False
+        
+        # Update HIGH tracking
         if self.probable_high is None or lowest_probable > self.probable_high:
             self.probable_high = lowest_probable
             changed = True
         if self.probable_high_max is None or highest_probable > self.probable_high_max:
             self.probable_high_max = highest_probable
+        
+        # Update LOW tracking
+        if self.probable_low is None or highest_probable < self.probable_low:
+            self.probable_low = highest_probable
+            changed = True
+        if self.probable_low_min is None or lowest_probable < self.probable_low_min:
+            self.probable_low_min = lowest_probable
+        
+        # QC spike check after updating
+        self._check_qc_spike()
+        
         return changed, lowest_probable, highest_probable, candidates
+
+    def _check_qc_spike(self):
+        """Flag 1 from Section 13: High QC Risk detection.
+        
+        If max(recent readings) - second_max >= QC_SPIKE_THRESHOLD AND the max 
+        was a single reading, flag QC risk.
+        """
+        if len(self.recent_f_readings) < 3:
+            return
+        
+        readings = self.recent_f_readings.copy()
+        sorted_desc = sorted(readings, reverse=True)
+        peak = sorted_desc[0]
+        second = sorted_desc[1]
+        
+        # Count how many readings are at the peak
+        peak_count = readings.count(peak)
+        
+        if (peak - second) >= QC_SPIKE_THRESHOLD and peak_count == 1:
+            flag = {
+                'time': datetime.now(timezone.utc).isoformat(),
+                'type': 'QC_SPIKE',
+                'peak_f': peak,
+                'second_f': second,
+                'delta': peak - second,
+                'peak_count': peak_count,
+                'risk': 'VERY HIGH' if peak_count == 1 else 'HIGH',
+                'readings': readings.copy(),
+            }
+            self.qc_flags.append(flag)
+            logger.warning(f"   ⚠️  QC SPIKE FLAG: peak={peak}°F, second={second}°F, "
+                          f"delta={peak-second}°F, only {peak_count} reading(s) at peak")
+            logger.warning(f"   ⚠️  Recent readings: {readings}")
+            logger.warning(f"   ⚠️  Per Section 5: single-minute OMO spike = VERY HIGH QC risk")
 
     def is_duplicate(self, temp_c: int, zulu: str) -> bool:
         """Same reading as last time (ASOS loop repeat)."""
@@ -398,36 +505,74 @@ class SniperState:
                 return True
         return False
 
+    def has_active_qc_flag(self) -> bool:
+        """Check if there's an active QC spike flag in the last 10 minutes."""
+        if not self.qc_flags:
+            return False
+        latest = self.qc_flags[-1]
+        try:
+            flag_time = datetime.fromisoformat(latest['time'])
+            age = (datetime.now(timezone.utc) - flag_time).total_seconds()
+            return age < 600  # 10 minute window
+        except:
+            return False
 
-state = SniperState()
+
+state: SniperState = None  # Initialized in main_loop after we know signal_type
 
 
-def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool):
-    if state.probable_high is None:
+def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool, signal_type: str):
+    """Check all brackets for transitions and execute trades.
+    
+    CRITICAL: Comparison operators per WX_SNIPER_COMPLETE_REFERENCE Section 4:
+      HIGH dead:   observed_high > cap   (strictly greater)
+      HIGH locked: observed_high >= floor (greater or equal)
+      LOW dead:    observed_low < floor   (strictly less)
+      LOW locked:  observed_low <= cap    (less or equal)
+    
+    We use BracketState.check_status() from smart_poller which implements these.
+    """
+    observed_high = state.probable_high
+    observed_low = state.probable_low
+    
+    if signal_type == 'high' and observed_high is None:
         return
+    if signal_type == 'low' and observed_low is None:
+        return
+    
     for b in brackets:
         if b.ticker in state.traded_tickers or b.traded:
             continue
+        
         old_status = b.status
-        new_status = b.check_status(state.probable_high, None)
+        new_status = b.check_status(observed_high, observed_low)
         if new_status == old_status:
             continue
+        
         b.status = new_status
+        
         if new_status == 'dead':
             action, side, icon = 'BUY_NO', 'no', '🔴'
         elif new_status == 'locked':
             action, side, icon = 'BUY_YES', 'yes', '🟢'
         else:
             continue
+        
+        # QC gate: if there's an active spike flag, log warning but still trade
+        # (Per Section 5: "Flag for ejection" — we trade but monitor)
+        qc_warning = ''
+        if state.has_active_qc_flag():
+            qc_warning = ' ⚠️  QC SPIKE ACTIVE — monitor for ejection'
+            logger.warning(f"   ⚠️  Trading during active QC flag — ejection monitoring required")
 
         logger.info(f"\n{'='*60}")
         logger.info(f"{icon} BRACKET KILL: {b.subtitle}")
-        logger.info(f"   {old_status} → {new_status} | probable_high={state.probable_high}°F")
-        logger.info(f"   Action: {action} {b.ticker} @ {bid_price}¢ x{qty}")
+        logger.info(f"   {old_status} → {new_status} | H≥{state.probable_high}°F L≤{state.probable_low}°F")
+        logger.info(f"   Action: {action} {b.ticker} @ {bid_price}¢ x{qty}{qc_warning}")
         logger.info(f"{'='*60}")
 
         if not live:
-            logger.info(f"   🧪 DRY RUN")
+            logger.info(f"   🧪 DRY RUN — hold to settlement (no hedge)")
             state.traded_tickers.add(b.ticker)
             b.traded = True
             state.trades.append({
@@ -436,16 +581,19 @@ def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool):
                 'action': action, 'price': bid_price,
                 'quantity': qty, 'dry_run': True,
                 'probable_high': state.probable_high,
+                'probable_low': state.probable_low,
+                'qc_flag': state.has_active_qc_flag(),
             })
             continue
 
         try:
+            # BUY ONLY — hold to settlement. NO HEDGE. (Section 11)
             result = kalshi.create_order(
                 ticker=b.ticker, side=side, action='buy',
                 count=qty, order_type='limit', price_cents=bid_price
             )
             order_id = result.get('order', {}).get('order_id', '???')
-            logger.info(f"   ✅ ORDER PLACED: {order_id}")
+            logger.info(f"   ✅ ORDER PLACED: {order_id} — hold to settlement")
             state.traded_tickers.add(b.ticker)
             b.traded = True
             state.trades.append({
@@ -453,7 +601,10 @@ def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool):
                 'ticker': b.ticker, 'subtitle': b.subtitle,
                 'action': action, 'price': bid_price,
                 'quantity': qty, 'order_id': order_id,
-                'dry_run': False, 'probable_high': state.probable_high,
+                'dry_run': False,
+                'probable_high': state.probable_high,
+                'probable_low': state.probable_low,
+                'qc_flag': state.has_active_qc_flag(),
             })
         except Exception as e:
             logger.error(f"   ❌ TRADE FAILED: {e}")
@@ -542,30 +693,45 @@ def init_log(station: str):
     LOG_FILE = f'/tmp/{station.lower()}_stream_sniper.csv'
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w') as f:
-            f.write("timestamp,zulu,temp_c,omo_low,omo_high,probable_high,new_high,trade,error\n")
+            f.write("timestamp,zulu,temp_c,omo_low,omo_high,probable_high,probable_low,"
+                    "new_high,new_low,trade,qc_flag,error\n")
 
 
-def log_row(ts, zulu, temp_c, candidates, new_high, trade, error):
+def log_row(ts, zulu, temp_c, candidates, changed, trade, error):
     with open(LOG_FILE, 'a') as f:
         omo_lo = min(candidates) if candidates else ''
         omo_hi = max(candidates) if candidates else ''
+        qc = 'QC_SPIKE' if state.has_active_qc_flag() else ''
         f.write(f"{ts},{zulu or ''},{temp_c or ''},{omo_lo},{omo_hi},"
-                f"{state.probable_high or ''},{new_high},{trade},{error or ''}\n")
+                f"{state.probable_high or ''},{state.probable_low or ''},"
+                f"{changed},{changed},{trade},{qc},{error or ''}\n")
 
 
 # ──────────────────────────────────────────────────────────────
-# CORE: Persistent call with continuous parsing
+# CORE: Short-call rapid-redial architecture
 # ──────────────────────────────────────────────────────────────
+#
+# ASOS phone lines disconnect after ~3 message cycles (~180 seconds).
+# Strategy:
+#   - Call connects, we get 1-3 readings per call
+#   - On disconnect: redial immediately (< 3 seconds gap)
+#   - Track readings-per-call for diagnostics
+#   - Back off ONLY on consecutive zero-reading calls (line is broken/busy)
+
+# Redial timing constants
+REDIAL_DELAY_NORMAL = 2       # Seconds between calls (normal disconnect)
+REDIAL_DELAY_BACKOFF = 15     # Seconds if consecutive zero-reading calls
+MAX_ZERO_CALLS_BEFORE_BACKOFF = 3  # How many empty calls before we back off
+CALL_HEALTH_CHECK_TIMEOUT = 60  # Seconds before checking if call is still alive
 
 parse_queue: asyncio.Queue = None
 
 
 class StreamingCall:
-    """One long-running Twilio Media Stream call.
+    """One short-lived Twilio Media Stream call.
     
-    Continuously watches transcript for temperature readings.
-    Each parse pushes (temp_c, zulu) onto parse_queue for the main loop.
-    ASOS loops every ~60s → one reading per minute from a single call.
+    Expects ASOS to disconnect after ~3 message cycles.
+    Parses temperature readings and pushes them to parse_queue.
     """
 
     def __init__(self):
@@ -616,7 +782,8 @@ class StreamingCall:
                     await self.deepgram_ws.close()
                 except:
                     pass
-            logger.info(f"[STREAM] Call ended after {self.total_parses} parses")
+            duration = time.time() - self.call_start if self.call_start else 0
+            logger.info(f"[STREAM] Call ended: {self.total_parses} readings in {duration:.0f}s")
 
     async def _receive_twilio(self, websocket):
         try:
@@ -636,7 +803,7 @@ class StreamingCall:
                         await self.deepgram_ws.send(audio_bytes)
 
                 elif event == 'stop':
-                    logger.info("[STREAM] Twilio stream stopped")
+                    logger.info("[STREAM] Twilio stream stopped (ASOS hung up — expected after ~3 cycles)")
                     if self._dg_is_open():
                         try:
                             await self.deepgram_ws.send(json.dumps({"type": "CloseStream"}))
@@ -724,16 +891,19 @@ async def ws_handler(websocket):
 # ─── Main loop ────────────────────────────────────────────────
 
 async def main_loop(args, station_cfg):
-    global active_call, call_connected_event, parse_queue
+    global active_call, call_connected_event, parse_queue, state
 
     station = args.station.upper()
     tz_offset = station_cfg['tz_offset']
     station_phone = args.phone or station_cfg['phone']
-    ticker_prefix = args.high_ticker or station_cfg.get(f'{args.signal}_ticker')
     signal_type = args.signal
+    ticker_prefix = args.high_ticker or station_cfg.get(f'{signal_type}_ticker')
     ws_url = args.ws_url
     if not ws_url.endswith('/stream'):
         ws_url = ws_url.rstrip('/') + '/stream'
+
+    # Initialize state with the correct signal type
+    state = SniperState(signal_type=signal_type)
 
     init_log(station)
     brackets = load_brackets(ticker_prefix, tz_offset, station, signal_type)
@@ -755,7 +925,7 @@ async def main_loop(args, station_cfg):
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║  STREAM SNIPER — {mode_str:<12s}                               ║
+║  STREAM SNIPER v2 — {mode_str:<12s}  (RAPID-REDIAL)             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Station:   {station} ({station_cfg['name']})
 ║  Phone:     {station_phone}
@@ -764,6 +934,7 @@ async def main_loop(args, station_cfg):
 ║  Bid:       {args.bid}¢ x {args.qty} contracts
 ║  Brackets:  {n} active
 ║  Stream:    {ws_url}
+║  Behavior:  ASOS hangs up after ~3 cycles → auto-redial in <3s
 ╚══════════════════════════════════════════════════════════════════╝
 """)
     for b in brackets:
@@ -782,8 +953,12 @@ async def main_loop(args, station_cfg):
     last_bracket_refresh = time.time()
     parse_queue = asyncio.Queue()
     call_sid = None
+    
+    # Rapid-redial tracking
+    consecutive_zero_calls = 0   # Calls that produced zero readings
+    total_session_readings = 0
 
-    # ── Outer loop: manages the call. If it drops, redial. ──
+    # ── Outer loop: manages calls. Expects frequent disconnects. ──
     while should_run(args, tz_offset, start_time):
 
         active_call = StreamingCall()
@@ -791,7 +966,7 @@ async def main_loop(args, station_cfg):
         state.call_count += 1
 
         now_str = datetime.now(timezone.utc).strftime('%H:%M:%SZ')
-        logger.info(f"📞 #{state.call_count} ({now_str}) calling {station}...")
+        logger.info(f"📞 Call #{state.call_count} ({now_str}) → {station} {station_phone}")
 
         twiml = f"""<Response>
     <Connect>
@@ -807,17 +982,17 @@ async def main_loop(args, station_cfg):
                 timeout=30,
             )
             call_sid = call.sid
-            logger.info(f"   Call SID: {call_sid}")
+            logger.info(f"   SID: {call_sid}")
         except Exception as e:
             logger.error(f"   ❌ Call failed: {e}")
             active_call = None
-            await asyncio.sleep(5)
+            await asyncio.sleep(REDIAL_DELAY_BACKOFF)
             continue
 
         # Wait for WebSocket to connect
         try:
             await asyncio.wait_for(call_connected_event.wait(), timeout=55)
-            logger.info("   ✅ Stream connected — listening continuously")
+            logger.info("   ✅ Stream connected — listening for ~3 cycles")
         except asyncio.TimeoutError:
             logger.warning("   ⏰ No stream connection — will redial")
             try:
@@ -825,11 +1000,17 @@ async def main_loop(args, station_cfg):
             except:
                 pass
             active_call = None
-            await asyncio.sleep(3)
+            consecutive_zero_calls += 1
+            if consecutive_zero_calls >= MAX_ZERO_CALLS_BEFORE_BACKOFF:
+                logger.warning(f"   ⚠️  {consecutive_zero_calls} consecutive failed connects — backing off {REDIAL_DELAY_BACKOFF}s")
+                await asyncio.sleep(REDIAL_DELAY_BACKOFF)
+            else:
+                await asyncio.sleep(REDIAL_DELAY_NORMAL)
             continue
 
         # ── Inner loop: consume parsed readings while call is alive ──
         last_parse_time = 0  # Cooldown to prevent interim+final double-fire
+        call_readings = 0    # Readings from THIS call
 
         while should_run(args, tz_offset, start_time):
 
@@ -847,15 +1028,16 @@ async def main_loop(args, station_cfg):
                     pass
                 last_bracket_refresh = time.time()
 
-            # Wait for next parsed reading (timeout to check call health)
+            # Wait for next parsed reading
+            # Shorter timeout than before — we expect calls to be short
             try:
-                temp_c, zulu = await asyncio.wait_for(parse_queue.get(), timeout=90)
+                temp_c, zulu = await asyncio.wait_for(parse_queue.get(), timeout=CALL_HEALTH_CHECK_TIMEOUT)
             except asyncio.TimeoutError:
-                # No reading in 90s — check if call is still alive
+                # No reading in 60s — check if call is still alive
                 try:
                     c = twilio_client.calls(call_sid).fetch()
                     if c.status in ('completed', 'failed', 'busy', 'no-answer', 'canceled'):
-                        logger.warning(f"   📴 Call ended ({c.status}) — will redial")
+                        logger.info(f"   📴 Call ended ({c.status}) — {call_readings} readings this call")
                         break
                     else:
                         logger.debug(f"   Call still active ({c.status})")
@@ -866,11 +1048,13 @@ async def main_loop(args, station_cfg):
 
             # Stream ended sentinel
             if temp_c == '__STREAM_ENDED__':
-                logger.info("   📴 Stream ended — will redial")
+                logger.info(f"   📴 ASOS disconnected — {call_readings} readings this call (expected behavior)")
                 break
 
             ts = datetime.now(timezone.utc).isoformat()
             state.parse_count += 1
+            call_readings += 1
+            total_session_readings += 1
 
             # Cooldown: skip if same temp parsed within 5 seconds (interim+final double-fire)
             now = time.time()
@@ -886,33 +1070,55 @@ async def main_loop(args, station_cfg):
             state.last_temp_c = temp_c
             state.last_zulu = zulu
 
-            # Update state
-            changed, lo_prob, hi_prob, candidates = state.update_high(temp_c, zulu or '????Z')
-            marker = ' ⬆️  NEW HIGH' if changed else ''
-            logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
-                       f"H≥{state.probable_high}°F{marker}")
+            # Update state (works for both high and low)
+            changed, lo_prob, hi_prob, candidates = state.update(temp_c, zulu or '????Z')
+            
+            if signal_type == 'high':
+                marker = ' ⬆️  NEW HIGH' if (state.probable_high == lo_prob and changed) else ''
+                logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
+                           f"H≥{state.probable_high}°F{marker}")
+            else:
+                marker = ' ⬇️  NEW LOW' if (state.probable_low == hi_prob and changed) else ''
+                logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
+                           f"L≤{state.probable_low}°F{marker}")
 
             # Check brackets
             trade_str = ''
             pre_trades = len(state.trades)
-            check_and_trade(brackets, args.bid, args.qty, args.live)
+            check_and_trade(brackets, args.bid, args.qty, args.live, signal_type)
             if len(state.trades) > pre_trades:
                 trade_str = state.trades[-1]['action'] + ':' + state.trades[-1]['ticker']
 
             log_row(ts, zulu, temp_c, candidates, changed, trade_str, '')
 
             # Update cost estimate
-            elapsed_min = (time.time() - active_call.call_start) / 60
-            state.total_cost = elapsed_min * 0.011
+            elapsed_min = (time.time() - start_time) / 60
+            state.total_cost = state.call_count * 0.02 + elapsed_min * 0.011  # connect fees + per-minute
 
-        # ── Call ended or schedule done — hang up ──
+        # ── Call ended — decide redial delay ──
         if call_sid:
             try:
                 twilio_client.calls(call_sid).update(status='completed')
-                logger.info("   📴 Call hung up")
             except:
                 pass
         active_call = None
+
+        # Track consecutive zero-reading calls for back-off
+        if call_readings == 0:
+            consecutive_zero_calls += 1
+            if consecutive_zero_calls >= MAX_ZERO_CALLS_BEFORE_BACKOFF:
+                logger.warning(f"   ⚠️  {consecutive_zero_calls} consecutive zero-reading calls — "
+                              f"backing off {REDIAL_DELAY_BACKOFF}s (line may be busy/broken)")
+                await asyncio.sleep(REDIAL_DELAY_BACKOFF)
+            else:
+                await asyncio.sleep(REDIAL_DELAY_NORMAL)
+        else:
+            # Good call — reset counter, fast redial
+            consecutive_zero_calls = 0
+            if should_run(args, tz_offset, start_time):
+                logger.info(f"   🔄 Redialing in {REDIAL_DELAY_NORMAL}s... "
+                           f"(session total: {total_session_readings} readings from {state.call_count} calls)")
+                await asyncio.sleep(REDIAL_DELAY_NORMAL)
 
 
 # ─── Entry point ──────────────────────────────────────────────
@@ -929,19 +1135,33 @@ async def run(args, station_cfg):
         server.close()
         await server.wait_closed()
 
+    # Session summary
     print(f"\n{'='*60}")
-    print(f"📊 STREAM SNIPER — SESSION SUMMARY")
+    print(f"📊 STREAM SNIPER v2 — SESSION SUMMARY")
     print(f"{'='*60}")
     print(f"  Station:        {args.station}")
+    print(f"  Signal:         {args.signal.upper()}")
     print(f"  Calls:          {state.call_count}")
     print(f"  Readings:       {state.parse_count}")
     print(f"  Est. cost:      ${state.total_cost:.2f}")
-    print(f"  Probable HIGH:  ≥{state.probable_high}°F")
+    
+    if args.signal == 'high':
+        print(f"  Probable HIGH:  ≥{state.probable_high}°F (aggressive: {state.probable_high_max}°F)")
+    else:
+        print(f"  Probable LOW:   ≤{state.probable_low}°F (aggressive: {state.probable_low_min}°F)")
+    
+    if state.qc_flags:
+        print(f"\n  ⚠️  QC FLAGS ({len(state.qc_flags)}):")
+        for f in state.qc_flags[-5:]:
+            print(f"    {f['time'][:19]} | peak={f['peak_f']}°F second={f['second_f']}°F "
+                  f"delta={f['delta']}°F risk={f['risk']}")
+    
     if state.trades:
         print(f"\n  TRADES ({len(state.trades)}):")
         for t in state.trades:
             dry = " [DRY]" if t['dry_run'] else " ✅"
-            print(f"    {t['time']} | {t['action']} {t['subtitle']} @ {t['price']}¢{dry}")
+            qc = " ⚠️QC" if t.get('qc_flag') else ""
+            print(f"    {t['time'][:19]} | {t['action']} {t['subtitle']} @ {t['price']}¢{dry}{qc}")
     else:
         print(f"  No trades")
     print(f"\n  Log: {LOG_FILE}")
