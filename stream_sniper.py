@@ -195,7 +195,7 @@ def parse_args():
     p.add_argument('--ws-url', required=True, help='WebSocket URL for Twilio (e.g. wss://54-91-7-11.nip.io/stream)')
     p.add_argument('--phone', default=None, help='Override ASOS phone number')
     p.add_argument('--high-ticker', default=None, help='Override Kalshi HIGH ticker prefix')
-    p.add_argument('--signal', default='high', choices=['high', 'low'], help='Trade HIGH or LOW brackets')
+    p.add_argument('--signal', default='high', choices=['high', 'low', 'both'], help='Trade HIGH, LOW, or BOTH brackets')
     p.add_argument('--run-minutes', type=int, default=None, help='Run for N minutes then stop')
     p.add_argument('--start', default=None, help='Start time in station local time (HH:MM)')
     p.add_argument('--end', default=None, help='End time in station local time (HH:MM)')
@@ -951,22 +951,45 @@ async def main_loop(args, station_cfg):
 
     station = args.station.upper()
     station_phone = args.phone or station_cfg['phone']
-    signal_type = args.signal
-    ticker_prefix = args.high_ticker or station_cfg.get(f'{signal_type}_ticker')
+    signal_type = args.signal  # 'high', 'low', or 'both'
     ws_url = args.ws_url
     if not ws_url.endswith('/stream'):
         ws_url = ws_url.rstrip('/') + '/stream'
 
-    # Initialize state with the correct signal type
-    state = SniperState(signal_type=signal_type)
+    # Initialize state — always tracks both high and low
+    state = SniperState(signal_type='both')
 
     init_log(station)
-    brackets = load_brackets(ticker_prefix, station_cfg, station, signal_type)
+    
+    # Load bracket lists based on signal_type
+    high_brackets = []
+    low_brackets = []
+    
+    if signal_type in ('high', 'both'):
+        high_ticker = args.high_ticker or station_cfg.get('high_ticker')
+        if high_ticker:
+            high_brackets = load_brackets(high_ticker, station_cfg, station, 'high')
+        elif signal_type == 'high':
+            logger.error("No HIGH ticker configured for this station")
+            return
+    
+    if signal_type in ('low', 'both'):
+        low_ticker = station_cfg.get('low_ticker')
+        if low_ticker:
+            low_brackets = load_brackets(low_ticker, station_cfg, station, 'low')
+        elif signal_type == 'low':
+            logger.error("No LOW ticker configured for this station")
+            return
+    
+    # Combined bracket list for display and refresh
+    brackets = high_brackets + low_brackets
     if not brackets:
-        logger.error("No brackets loaded — check Kalshi API or event ticker")
+        logger.error("No brackets loaded — check Kalshi API or event tickers")
         return
 
     n = len(brackets)
+    n_high = len(high_brackets)
+    n_low = len(low_brackets)
     mode_str = 'LIVE 🔴' if args.live else 'DRY RUN 🧪'
     schedule_str = ''
     if args.run_minutes:
@@ -977,6 +1000,12 @@ async def main_loop(args, station_cfg):
         schedule_str = f'{args.start_utc}-{args.end_utc} UTC'
     else:
         schedule_str = '60 minutes (default)'
+    
+    signal_str = signal_type.upper()
+    if signal_type == 'both':
+        signal_str = f'HIGH ({n_high}) + LOW ({n_low})'
+    else:
+        signal_str = f'{signal_type.upper()} brackets'
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -984,7 +1013,7 @@ async def main_loop(args, station_cfg):
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Station:   {station} ({station_cfg['name']})
 ║  Phone:     {station_phone}
-║  Signal:    {signal_type.upper()} brackets
+║  Signal:    {signal_str}
 ║  Schedule:  {schedule_str}
 ║  Bid:       {args.bid}¢ x {args.qty} contracts
 ║  Brackets:  {n} active
@@ -992,9 +1021,16 @@ async def main_loop(args, station_cfg):
 ║  Behavior:  ASOS hangs up after ~3 cycles → auto-redial in <3s
 ╚══════════════════════════════════════════════════════════════════╝
 """)
-    for b in brackets:
-        print(f"  {b.subtitle:<25s} floor={b.floor_strike} cap={b.cap_strike} "
-              f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]")
+    if high_brackets:
+        print("  HIGH:")
+        for b in high_brackets:
+            print(f"    {b.subtitle:<25s} floor={b.floor_strike} cap={b.cap_strike} "
+                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]")
+    if low_brackets:
+        print("  LOW:")
+        for b in low_brackets:
+            print(f"    {b.subtitle:<25s} floor={b.floor_strike} cap={b.cap_strike} "
+                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]")
     print()
 
     # Wait for start time if specified
@@ -1073,13 +1109,27 @@ async def main_loop(args, station_cfg):
             # Refresh brackets every 10 minutes
             if time.time() - last_bracket_refresh > 600:
                 try:
-                    new_brackets = load_brackets(ticker_prefix, station_cfg, station, signal_type)
-                    if new_brackets:
-                        for nb in new_brackets:
-                            if nb.ticker in state.traded_tickers:
-                                nb.traded = True
-                                nb.status = 'dead'
-                        brackets = new_brackets
+                    if signal_type in ('high', 'both'):
+                        ht = args.high_ticker or station_cfg.get('high_ticker')
+                        if ht:
+                            new_high = load_brackets(ht, station_cfg, station, 'high')
+                            if new_high:
+                                for nb in new_high:
+                                    if nb.ticker in state.traded_tickers:
+                                        nb.traded = True
+                                        nb.status = 'dead'
+                                high_brackets = new_high
+                    if signal_type in ('low', 'both'):
+                        lt = station_cfg.get('low_ticker')
+                        if lt:
+                            new_low = load_brackets(lt, station_cfg, station, 'low')
+                            if new_low:
+                                for nb in new_low:
+                                    if nb.ticker in state.traded_tickers:
+                                        nb.traded = True
+                                        nb.status = 'dead'
+                                low_brackets = new_low
+                    brackets = high_brackets + low_brackets
                 except:
                     pass
                 last_bracket_refresh = time.time()
@@ -1129,19 +1179,25 @@ async def main_loop(args, station_cfg):
             # Update state (works for both high and low)
             changed, lo_prob, hi_prob, candidates = state.update(temp_c, zulu or '????Z')
             
-            if signal_type == 'high':
+            # Log HIGH status
+            if high_brackets:
                 marker = ' ⬆️  NEW HIGH' if (state.probable_high == lo_prob and changed) else ''
                 logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
                            f"H≥{state.probable_high}°F{marker}")
-            else:
+            
+            # Log LOW status
+            if low_brackets:
                 marker = ' ⬇️  NEW LOW' if (state.probable_low == hi_prob and changed) else ''
                 logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
                            f"L≤{state.probable_low}°F{marker}")
 
-            # Check brackets
+            # Check brackets — both lists
             trade_str = ''
             pre_trades = len(state.trades)
-            check_and_trade(brackets, args.bid, args.qty, args.live, signal_type)
+            if high_brackets:
+                check_and_trade(high_brackets, args.bid, args.qty, args.live, 'high')
+            if low_brackets:
+                check_and_trade(low_brackets, args.bid, args.qty, args.live, 'low')
             if len(state.trades) > pre_trades:
                 trade_str = state.trades[-1]['action'] + ':' + state.trades[-1]['ticker']
 
