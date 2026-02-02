@@ -350,6 +350,84 @@ def compute_omo_candidates(temp_c: int) -> list:
     return sorted(candidates)
 
 
+def seed_state_from_metars(station: str, station_cfg: dict):
+    """Fetch recent METARs and determine today's observed high/low so far.
+    
+    This prevents the sniper from buying brackets that the poller (or METARs)
+    have already resolved. Without this, the sniper starts with a blank state
+    and might buy NO on "48° or below" when the METAR high is already 52°F.
+    
+    Uses T-group (tenths °C) from each METAR → NWS round to °F → track max/min.
+    Returns (observed_high_f, observed_low_f) or (None, None) on failure.
+    """
+    try:
+        # Fetch last 24h of METARs
+        url = (f"https://aviationweather.gov/api/data/metar"
+               f"?ids={station}&format=json&hours=24&_t={int(time.time())}")
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"[SEED] METAR fetch failed: HTTP {resp.status_code}")
+            return None, None
+        
+        metars = resp.json()
+        if not isinstance(metars, list):
+            metars = [metars]
+        
+        # Determine today's climate day boundary in UTC
+        # Climate day = local civil midnight to midnight
+        tz_name = station_cfg.get('timezone', 'America/New_York')
+        tz = ZoneInfo(tz_name)
+        local_now = datetime.now(tz)
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_midnight = local_midnight.astimezone(timezone.utc)
+        
+        high_f = None
+        low_f = None
+        metar_count = 0
+        
+        for m in metars:
+            raw = m.get('rawOb', '')
+            obs_time_str = m.get('reportTime', '') or m.get('obsTime', '')
+            
+            # Parse observation time
+            obs_utc = None
+            if obs_time_str:
+                try:
+                    # Try ISO format
+                    obs_utc = datetime.fromisoformat(obs_time_str.replace('Z', '+00:00'))
+                except:
+                    pass
+            
+            # Skip METARs from before today's climate day
+            if obs_utc and obs_utc < utc_midnight:
+                continue
+            
+            # Parse T-group for precise temperature
+            t_match = re.search(r'\bT(\d)(\d{3})(\d)(\d{3})\b', raw)
+            if t_match:
+                temp_sign = -1 if t_match.group(1) == '1' else 1
+                temp_c_tenths = temp_sign * int(t_match.group(2)) / 10.0
+                temp_f = nws_round(temp_c_tenths * 9.0 / 5.0 + 32)
+                
+                if high_f is None or temp_f > high_f:
+                    high_f = temp_f
+                if low_f is None or temp_f < low_f:
+                    low_f = temp_f
+                metar_count += 1
+        
+        if metar_count > 0:
+            logger.info(f"[SEED] Seeded from {metar_count} METARs today: "
+                       f"HIGH≥{high_f}°F LOW≤{low_f}°F")
+        else:
+            logger.info(f"[SEED] No METARs found for today's climate day")
+        
+        return high_f, low_f
+        
+    except Exception as e:
+        logger.warning(f"[SEED] METAR seed failed: {e}")
+        return None, None
+
+
 # ─── Kalshi ───────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -958,6 +1036,15 @@ async def main_loop(args, station_cfg):
 
     # Initialize state — always tracks both high and low
     state = SniperState(signal_type='both')
+    
+    # Seed state from METARs so we don't re-buy already-resolved brackets
+    seed_high, seed_low = seed_state_from_metars(station, station_cfg)
+    if seed_high is not None:
+        state.probable_high = seed_high
+        state.probable_high_max = seed_high
+    if seed_low is not None:
+        state.probable_low = seed_low
+        state.probable_low_min = seed_low
 
     init_log(station)
     
@@ -986,6 +1073,19 @@ async def main_loop(args, station_cfg):
     if not brackets:
         logger.error("No brackets loaded — check Kalshi API or event tickers")
         return
+    
+    # Pre-resolve brackets from METAR seed so we don't trade already-resolved ones
+    pre_resolved = 0
+    if state.probable_high is not None or state.probable_low is not None:
+        for b in brackets:
+            new_status = b.check_status(state.probable_high, state.probable_low)
+            if new_status in ('dead', 'locked'):
+                b.status = new_status
+                b.traded = True  # Mark as if already traded — don't re-buy
+                state.traded_tickers.add(b.ticker)
+                pre_resolved += 1
+        if pre_resolved:
+            logger.info(f"[SEED] Pre-resolved {pre_resolved} brackets from METAR data")
 
     n = len(brackets)
     n_high = len(high_brackets)
@@ -1024,13 +1124,15 @@ async def main_loop(args, station_cfg):
     if high_brackets:
         print("  HIGH:")
         for b in high_brackets:
+            status_tag = f" [{b.status.upper()}]" if b.status != 'open' else ''
             print(f"    {b.subtitle:<25s} floor={b.floor_strike} cap={b.cap_strike} "
-                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]")
+                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]{status_tag}")
     if low_brackets:
         print("  LOW:")
         for b in low_brackets:
+            status_tag = f" [{b.status.upper()}]" if b.status != 'open' else ''
             print(f"    {b.subtitle:<25s} floor={b.floor_strike} cap={b.cap_strike} "
-                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]")
+                  f"({b.strike_type}) NO@{b.no_ask}¢ [{b.ticker}]{status_tag}")
     print()
 
     # Wait for start time if specified
