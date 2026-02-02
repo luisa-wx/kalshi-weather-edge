@@ -1182,7 +1182,7 @@ class ASOSScout:
             return
         
         port = SNIPER_WS_PORTS[station]
-        ws_url = f"{SNIPER_WS_BASE}:{port}/stream"
+        ws_url = f"{SNIPER_WS_BASE}/stream/{station.lower()}"
         
         cmd = [
             'python3', 'stream_sniper.py',
