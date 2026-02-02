@@ -372,7 +372,8 @@ class ASOSScout:
     
     def is_in_forecast_window(self, station: str) -> Optional[str]:
         """
-        Check if current time is in any forecast window for this station.
+        Check if current time is in any ACTIVE forecast window for this station.
+        A window is only "active" if we haven't clearly passed the peak.
         
         Returns:
             'high', 'low', 'both', or None
@@ -380,16 +381,27 @@ class ASOSScout:
         from smart_poller import STATIONS
         cfg = STATIONS.get(station, {})
         tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
-        current_lst_hour = datetime.now(tz).hour  # Approx — exact LST requires offset
+        current_lst_hour = datetime.now(tz).hour
         
         fc = self.get_forecast_for_station(station)
+        state = self.sniper.states.get(station)
         if not fc:
             return None
         
-        in_high = any(w.window_start_lst <= current_lst_hour <= w.window_end_lst 
-                      for w in fc.high_windows)
-        in_low = any(w.window_start_lst <= current_lst_hour <= w.window_end_lst 
-                     for w in fc.low_windows)
+        def window_is_active(w):
+            """A window is active if we're inside it AND haven't passed peak by 2+hr."""
+            if not (w.window_start_lst <= current_lst_hour <= w.window_end_lst):
+                return False
+            hours_past_peak = current_lst_hour - w.peak_hour_lst
+            if hours_past_peak < 0:
+                hours_past_peak += 24
+            # Past peak by 2+ hours (but not wrapped around) = window is done
+            if hours_past_peak > 2 and hours_past_peak < 20:
+                return False
+            return True
+        
+        in_high = any(window_is_active(w) for w in fc.high_windows)
+        in_low = any(window_is_active(w) for w in fc.low_windows)
         
         if in_high and in_low:
             return 'both'
@@ -420,48 +432,52 @@ class ASOSScout:
         fc = self.get_forecast_for_station(station)
         state = self.sniper.states.get(station)
         
-        # If no forecast yet, default
         if not fc:
             return ('IDLE', 'no forecast loaded')
         
-        # Check OVERRIDE: LATEST temp (not day's high) beating forecast by 2°F+
-        # This catches frontal passages where the current reading is way off
-        # from what the forecast expected for this hour.
+        # ── DIRECTIONAL OVERRIDE ──
+        # Only fire HOT if the deviation HELPS set an extreme:
+        #   - Near a HIGH window AND latest > forecast+2 → climbing faster than expected
+        #   - Near a LOW window AND latest < forecast-2 → dropping faster than expected
+        # Being warm during a LOW window is uninteresting (means low not set yet).
+        
         if state and state.latest_temp_f is not None and fc.hourly_temps[current_lst_hour] is not None:
             forecast_now = fc.hourly_temps[current_lst_hour]
             latest = state.latest_temp_f
             
-            # For highs: latest temp is climbing well above forecast for this hour
-            if latest > forecast_now + 2:
-                return ('HOT', f'latest {latest}°F >> forecast {forecast_now}°F @{current_lst_hour:02d}h')
-            # For lows: latest temp is dropping well below forecast for this hour
-            if latest < forecast_now - 2:
-                return ('HOT', f'latest {latest}°F << forecast {forecast_now}°F @{current_lst_hour:02d}h')
+            # Check HIGH windows: are we running hotter than forecast?
+            for w in fc.high_windows:
+                hours_past = current_lst_hour - w.peak_hour_lst
+                if hours_past < 0:
+                    hours_past += 24
+                if hours_past <= 3 or hours_past >= 21:  # near this window
+                    if latest > forecast_now + 2:
+                        return ('HOT', f'running hot: {latest}°F vs fcst {forecast_now}°F (high peak @{w.peak_hour_lst:02d}h)')
+            
+            # Check LOW windows: are we dropping faster than forecast?
+            for w in fc.low_windows:
+                hours_past = current_lst_hour - w.peak_hour_lst
+                if hours_past < 0:
+                    hours_past += 24
+                if hours_past <= 3 or hours_past >= 21:
+                    if latest < forecast_now - 2:
+                        return ('HOT', f'dropping fast: {latest}°F vs fcst {forecast_now}°F (low trough @{w.peak_hour_lst:02d}h)')
         
-        # Check if currently inside any forecast window
+        # ── Inside an active window? ──
         window = self.is_in_forecast_window(station)
         if window:
             return ('WATCHING', f'in {window.upper()} window')
         
-        # Check 3-hour proximity to any window
+        # ── Approaching a FUTURE window? (only look forward, not backward) ──
         all_windows = (fc.high_windows or []) + (fc.low_windows or [])
         for w in all_windows:
-            hours_to_start = w.window_start_lst - current_lst_hour
-            hours_to_end = w.window_end_lst - current_lst_hour
+            hours_until_start = w.window_start_lst - current_lst_hour
+            if hours_until_start < -12:
+                hours_until_start += 24  # wrap
             
-            # Handle wrapping (e.g., current=22, window_start=1)
-            if hours_to_start > 12:
-                hours_to_start -= 24
-            elif hours_to_start < -12:
-                hours_to_start += 24
-            if hours_to_end > 12:
-                hours_to_end -= 24
-            elif hours_to_end < -12:
-                hours_to_end += 24
-            
-            dist = min(abs(hours_to_start), abs(hours_to_end))
-            if dist <= 3:
-                return ('WATCHING', f'{w.signal.upper()} window in ~{dist}hr')
+            # Only future windows
+            if 0 < hours_until_start <= 3:
+                return ('WATCHING', f'{w.signal.upper()} window in ~{hours_until_start}hr')
         
         return ('IDLE', 'outside all windows')
 

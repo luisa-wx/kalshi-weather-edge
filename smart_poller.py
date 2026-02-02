@@ -1518,24 +1518,31 @@ summary {{ cursor: pointer; color: #8b949e; }}
                             l_troughs = ', '.join(f"{w.peak_hour_lst:02d}" for w in fc_today.low_windows) or '?'
                             html += f'<strong style="color:#58a6ff;">▼ {fc_today.forecast_low}°F</strong>'
                             html += f' <span style="color:#8b949e;">@{l_troughs}h</span>'
-                        
-                        # Gap to nearest bracket (the key number)
-                        if state.observed_high is not None and fc_today.forecast_high is not None:
-                            gap_high = fc_today.forecast_high - state.observed_high
-                            if gap_high > 0:
-                                html += f' &nbsp; <span style="color:#f0883e;">gap to forecast high: {gap_high}°F</span>'
                     
-                    # ── Row 3: Sparkline ──
+                    # ── Row 3: Sparkline with hour labels and current-hour marker ──
                     if fc_today and fc_today.hourly_temps:
+                        from smart_poller import STATIONS as _STATIONS
+                        _cfg = _STATIONS.get(station, {})
+                        _tz = ZoneInfo(_cfg.get('timezone', 'America/New_York'))
+                        _now_hour = datetime.now(_tz).hour
+                        
                         temps = fc_today.hourly_temps
                         valid = [t for t in temps if t is not None]
                         if valid:
                             t_min, t_max = min(valid), max(valid)
                             t_range = max(t_max - t_min, 1)
-                            bars = []
+                            
+                            # Hour labels row: 0, 6, 12, 18
+                            html += '<br/><div style="display:inline-block; margin-top:4px;">'
+                            
+                            # Build sparkline bars
+                            html += '<div style="display:inline-flex;align-items:flex-end;height:20px;">'
                             for i, t in enumerate(temps):
+                                is_now = (i == _now_hour)
+                                border = 'border:1px solid #e6edf3;' if is_now else ''
+                                
                                 if t is None:
-                                    bars.append(f'<span style="display:inline-block;width:7px;height:2px;background:#21262d;margin:0 0.5px;vertical-align:bottom;" title="hr {i}: —"></span>')
+                                    html += f'<span style="display:inline-block;width:7px;height:2px;background:#21262d;margin:0 0.5px;vertical-align:bottom;{border}" title="{i:02d}h: —"></span>'
                                 else:
                                     pct = (t - t_min) / t_range
                                     h = max(2, int(pct * 18))
@@ -1545,12 +1552,19 @@ summary {{ cursor: pointer; color: #8b949e; }}
                                         color = '#3fb950'
                                     else:
                                         color = '#58a6ff'
-                                    bars.append(f'<span style="display:inline-block;width:7px;height:{h}px;background:{color};margin:0 0.5px;vertical-align:bottom;" title="{i:02d}h: {t}°F"></span>')
+                                    html += f'<span style="display:inline-block;width:7px;height:{h}px;background:{color};margin:0 0.5px;vertical-align:bottom;{border}" title="{i:02d}h: {t}°F"></span>'
+                            html += '</div>'
                             
-                            html += '<br/><span style="display:inline-flex;align-items:flex-end;height:20px;margin-top:2px;">'
-                            html += ''.join(bars)
-                            html += '</span>'
-                            html += f' <span style="color:#8b949e; font-size:11px;">{t_min}°–{t_max}°F (hover for hourly)</span>'
+                            # Hour tick labels underneath
+                            html += '<div style="display:flex;font-size:9px;color:#8b949e;margin-top:1px;">'
+                            for i in range(24):
+                                if i % 6 == 0:
+                                    html += f'<span style="width:8px;text-align:center;">{i}</span>'
+                                else:
+                                    html += '<span style="width:8px;"></span>'
+                            html += '</div>'
+                            
+                            html += f'</div> <span style="color:#8b949e; font-size:11px;">{t_min}°–{t_max}°F</span>'
                     
                     # ── Row 4: Tomorrow's forecast (if available) ──
                     if fc_tomorrow:
