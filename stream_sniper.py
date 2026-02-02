@@ -3,20 +3,20 @@
 stream_sniper.py - Real-time streaming ASOS phone sniper
 =========================================================
 
-Calls an ASOS station, streams audio via Twilio Media Streams to
-Deepgram for real-time transcription, parses temperature the moment
-it's spoken, and trades Kalshi brackets.
+Keeps a single long-running call to ASOS, streaming audio continuously.
+The ASOS recording loops every ~60s, so we get a fresh temperature
+reading every cycle without hanging up and redialing.
 
 ARCHITECTURE:
-  1. Twilio calls ASOS phone number
+  1. Twilio calls ASOS phone number (one call, stays connected)
   2. Twilio streams raw mulaw audio via WebSocket to THIS server
   3. This server pipes audio to Deepgram streaming WebSocket
-  4. Deepgram sends back real-time transcript fragments
-  5. The moment we see "temperature ... digits ... celsius" → parse → trade
-  6. Hang up call → wait → next call
+  4. Deepgram sends back real-time transcript fragments continuously
+  5. Every time we see "temperature ... digits ... celsius" → update state → check brackets
+  6. Call stays open until schedule ends or Ctrl+C
 
-LATENCY: ~10-15s from call start to parsed temperature
-COST: ~$0.02/call (Twilio + Deepgram)
+COST: ~$0.65/hour ($0.007/min Twilio + $0.004/min Deepgram)
+  vs ~$2.40/hour with call-per-reading approach
 
 REQUIRES:
   - nginx + SSL on this server (wss:// proxy to localhost:8765)
@@ -24,8 +24,8 @@ REQUIRES:
 
 Usage:
   python3 stream_sniper.py --station KLAS --ws-url wss://54-91-7-11.nip.io/stream
-  python3 stream_sniper.py --station KSFO --ws-url wss://54-91-7-11.nip.io/stream --start 18:00 --end 20:00
-  python3 stream_sniper.py --station KLAS --ws-url wss://54-91-7-11.nip.io/stream --run-minutes 60
+  python3 stream_sniper.py --station KSFO --ws-url wss://54-91-7-11.nip.io/stream --start 10:00 --end 16:00
+  python3 stream_sniper.py --station KLAS --ws-url wss://54-91-7-11.nip.io/stream --run-minutes 120 --live
 """
 
 import os
@@ -75,12 +75,12 @@ import websockets
 
 
 # ─── Station registry ─────────────────────────────────────────
-# ASOS phone numbers sourced from FAA/NWS directories
+
 STATION_REGISTRY = {
     'KLAS': {
         'name': 'Las Vegas McCarran',
         'phone': '+17025825334',
-        'tz_offset': -8,   # PST (Local Standard Time, no DST per NWS)
+        'tz_offset': -8,
         'high_ticker': 'KXHIGHTLV',
         'low_ticker': None,
     },
@@ -170,26 +170,18 @@ def parse_args():
     p = argparse.ArgumentParser(description='Stream Sniper — real-time ASOS phone trading')
     p.add_argument('--station', required=True, help='ICAO station code (e.g. KLAS, KSFO)')
     p.add_argument('--ws-url', required=True, help='WebSocket URL for Twilio (e.g. wss://54-91-7-11.nip.io/stream)')
-    p.add_argument('--phone', default=None, help='Override ASOS phone number (default: from registry)')
+    p.add_argument('--phone', default=None, help='Override ASOS phone number')
     p.add_argument('--high-ticker', default=None, help='Override Kalshi HIGH ticker prefix')
     p.add_argument('--signal', default='high', choices=['high', 'low'], help='Trade HIGH or LOW brackets')
-
-    # Schedule — three ways to control when it runs:
-    # 1) --run-minutes N  (run for N minutes from now)
-    # 2) --start HH:MM --end HH:MM  (local station time window)
-    # 3) --start-utc HH:MM --end-utc HH:MM  (UTC time window)
-    # If none specified, runs for 60 minutes.
     p.add_argument('--run-minutes', type=int, default=None, help='Run for N minutes then stop')
-    p.add_argument('--start', default=None, help='Start time in station local time (HH:MM, 24h)')
-    p.add_argument('--end', default=None, help='End time in station local time (HH:MM, 24h)')
-    p.add_argument('--start-utc', default=None, help='Start time in UTC (HH:MM, 24h)')
-    p.add_argument('--end-utc', default=None, help='End time in UTC (HH:MM, 24h)')
-
+    p.add_argument('--start', default=None, help='Start time in station local time (HH:MM)')
+    p.add_argument('--end', default=None, help='End time in station local time (HH:MM)')
+    p.add_argument('--start-utc', default=None, help='Start time in UTC (HH:MM)')
+    p.add_argument('--end-utc', default=None, help='End time in UTC (HH:MM)')
     p.add_argument('--bid', type=int, default=99, help='Bid price in cents (default: 99)')
     p.add_argument('--qty', type=int, default=1, help='Trade quantity (default: 1)')
     p.add_argument('--live', action='store_true', help='Enable live trading (default: dry run)')
     p.add_argument('--port', type=int, default=8765, help='WebSocket server port (default: 8765)')
-
     return p.parse_args()
 
 
@@ -233,19 +225,15 @@ def spaced_digits_to_int(text: str):
 
 
 def nws_round(val: float) -> int:
-    """NWS rounding: round half up (asymmetric). math.floor(val + 0.5)"""
     return math.floor(val + 0.5)
 
 
 def c_to_f_nws(temp_c: int) -> int:
-    """Convert Celsius to Fahrenheit with NWS rounding."""
     return nws_round(temp_c * 9.0 / 5.0 + 32)
 
 
 def parse_temperature(transcript: str):
-    """Parse temperature from ASOS transcript. Returns (temp_c, temp_f) or (None, None)."""
     text = transcript.lower()
-    # Primary pattern: "temperature [minus] digits celsius"
     match = re.search(
         r'temperature[,\s]+(minus\s+|negative\s+)?([\d\s]+?)(?:\s*celsius|\s*\.|$)',
         text
@@ -256,7 +244,6 @@ def parse_temperature(transcript: str):
         val = spaced_digits_to_int(("minus " if sign else "") + digit_str)
         if val is not None and -60 <= val <= 60:
             return val, c_to_f_nws(val)
-    # Fallback: just "temperature" followed by digits
     temp_idx = text.find('temperature')
     if temp_idx >= 0:
         after = text[temp_idx + len('temperature'):temp_idx + len('temperature') + 30]
@@ -268,7 +255,6 @@ def parse_temperature(transcript: str):
 
 
 def parse_zulu_time(transcript: str):
-    """Parse Zulu time from ASOS transcript. Returns e.g. '0020Z' or None."""
     text = transcript.lower()
     zulu_idx = text.find('zulu')
     if zulu_idx < 0:
@@ -292,7 +278,6 @@ def parse_zulu_time(transcript: str):
 
 
 def compute_omo_candidates(temp_c: int) -> list:
-    """Given a Celsius reading, find all Fahrenheit values that round back to this Celsius."""
     center_f = c_to_f_nws(temp_c)
     candidates = []
     for omo_f in range(center_f - 3, center_f + 4):
@@ -316,7 +301,6 @@ except ImportError as e:
 # ─── Bracket loading ─────────────────────────────────────────
 
 def get_today_suffix(tz_offset: int) -> str:
-    """Get Kalshi date suffix in station's local standard time."""
     now_utc = datetime.now(timezone.utc)
     local = now_utc + timedelta(hours=tz_offset)
     return local.strftime('%y%b%d').upper()
@@ -337,7 +321,6 @@ def parse_kalshi_price(price_raw, price_dollars) -> int:
 
 
 def load_brackets(ticker_prefix: str, tz_offset: int, station: str, signal_type: str) -> list:
-    """Load active brackets from Kalshi for today's event."""
     suffix = get_today_suffix(tz_offset)
     event_ticker = f"{ticker_prefix}-{suffix}"
     logger.info(f"[BRACKETS] Fetching {event_ticker}...")
@@ -386,11 +369,14 @@ class SniperState:
         self.probable_high = None
         self.probable_high_max = None
         self.call_count = 0
+        self.parse_count = 0
         self.parse_failures = 0
         self.total_cost = 0.0
         self.traded_tickers = set()
         self.trades = []
         self.readings = []
+        self.last_zulu = None
+        self.last_temp_c = None
 
     def update_high(self, temp_c: int, zulu: str):
         candidates = compute_omo_candidates(temp_c)
@@ -405,12 +391,18 @@ class SniperState:
             self.probable_high_max = highest_probable
         return changed, lowest_probable, highest_probable, candidates
 
+    def is_duplicate(self, temp_c: int, zulu: str) -> bool:
+        """Same reading as last time (ASOS loop repeat)."""
+        if self.last_zulu and self.last_temp_c is not None:
+            if zulu == self.last_zulu and temp_c == self.last_temp_c:
+                return True
+        return False
+
 
 state = SniperState()
 
 
 def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool):
-    """Check brackets against current state and trade if transitions found."""
     if state.probable_high is None:
         return
     for b in brackets:
@@ -470,21 +462,17 @@ def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool):
 # ─── Schedule helpers ─────────────────────────────────────────
 
 def parse_time_str(t: str) -> tuple:
-    """Parse 'HH:MM' to (hour, minute)."""
     parts = t.strip().split(':')
     return int(parts[0]), int(parts[1])
 
 
 def should_run(args, tz_offset: int, start_time: float) -> bool:
-    """Check if we should still be running based on schedule config."""
     now_utc = datetime.now(timezone.utc)
 
-    # Mode 1: run-minutes (relative timer)
     if args.run_minutes is not None:
         elapsed = time.time() - start_time
         return elapsed < (args.run_minutes * 60)
 
-    # Mode 2: local time window
     if args.start and args.end:
         local = now_utc + timedelta(hours=tz_offset)
         local_hm = local.hour * 60 + local.minute
@@ -495,10 +483,8 @@ def should_run(args, tz_offset: int, start_time: float) -> bool:
         if end_mins > start_mins:
             return start_mins <= local_hm < end_mins
         else:
-            # Wraps midnight
             return local_hm >= start_mins or local_hm < end_mins
 
-    # Mode 3: UTC time window
     if args.start_utc and args.end_utc:
         utc_hm = now_utc.hour * 60 + now_utc.minute
         start_h, start_m = parse_time_str(args.start_utc)
@@ -510,13 +496,11 @@ def should_run(args, tz_offset: int, start_time: float) -> bool:
         else:
             return utc_hm >= start_mins or utc_hm < end_mins
 
-    # Default: 60 minutes
     elapsed = time.time() - start_time
     return elapsed < 3600
 
 
 def should_wait_to_start(args, tz_offset: int) -> bool:
-    """If a start time is specified and it's before that time, return True."""
     now_utc = datetime.now(timezone.utc)
 
     if args.start:
@@ -524,7 +508,6 @@ def should_wait_to_start(args, tz_offset: int) -> bool:
         local_hm = local.hour * 60 + local.minute
         start_h, start_m = parse_time_str(args.start)
         start_mins = start_h * 60 + start_m
-        # If end wraps midnight, only wait if we're between end and start
         if args.end:
             end_h, end_m = parse_time_str(args.end)
             end_mins = end_h * 60 + end_m
@@ -559,54 +542,49 @@ def init_log(station: str):
     LOG_FILE = f'/tmp/{station.lower()}_stream_sniper.csv'
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w') as f:
-            f.write("timestamp,zulu,temp_c,omo_low,omo_high,probable_high,new_high,latency_s,trade,error\n")
+            f.write("timestamp,zulu,temp_c,omo_low,omo_high,probable_high,new_high,trade,error\n")
 
 
-def log_row(ts, zulu, temp_c, candidates, new_high, latency, trade, error):
+def log_row(ts, zulu, temp_c, candidates, new_high, trade, error):
     with open(LOG_FILE, 'a') as f:
         omo_lo = min(candidates) if candidates else ''
         omo_hi = max(candidates) if candidates else ''
         f.write(f"{ts},{zulu or ''},{temp_c or ''},{omo_lo},{omo_hi},"
-                f"{state.probable_high or ''},{new_high},{latency:.1f},{trade},{error or ''}\n")
+                f"{state.probable_high or ''},{new_high},{trade},{error or ''}\n")
 
 
 # ──────────────────────────────────────────────────────────────
-# CORE: WebSocket bridge  Twilio → Deepgram → parse
+# CORE: Persistent call with continuous parsing
 # ──────────────────────────────────────────────────────────────
 
-MAX_CALL_SECONDS = 45
-COST_PER_CALL    = 0.02
-CALL_GAP_SECONDS = 15   # Wait between successful calls for Twilio teardown
-RETRY_GAP_SECONDS = 3  # Quick retry on failed calls
+parse_queue: asyncio.Queue = None
 
 
 class StreamingCall:
-    """Handles one Twilio Media Stream call."""
+    """One long-running Twilio Media Stream call.
+    
+    Continuously watches transcript for temperature readings.
+    Each parse pushes (temp_c, zulu) onto parse_queue for the main loop.
+    ASOS loops every ~60s → one reading per minute from a single call.
+    """
 
     def __init__(self):
-        self.transcript_so_far = ""
-        self.temp_c = None
-        self.temp_f = None
-        self.zulu = None
-        self.parsed = False
         self.call_start = None
         self.stream_sid = None
         self.call_sid = None
         self.deepgram_ws = None
+        self.transcript_window = ""
+        self.total_parses = 0
 
     def _dg_is_open(self):
-        """Check if Deepgram WebSocket is still open (websockets v16 compat)."""
         if self.deepgram_ws is None:
             return False
-        # websockets v16: .close_code is None while connection is open
         return self.deepgram_ws.close_code is None
 
     async def handle_twilio_ws(self, websocket):
-        """Handle incoming Twilio Media Stream WebSocket connection."""
         self.call_start = time.time()
         logger.info("[STREAM] Twilio WebSocket connected")
 
-        # Open Deepgram streaming connection
         dg_url = (
             f"wss://api.deepgram.com/v1/listen?"
             f"encoding=mulaw&sample_rate=8000&channels=1"
@@ -623,7 +601,6 @@ class StreamingCall:
             logger.error(f"[STREAM] Deepgram connect failed: {e}")
             return
 
-        # Run two tasks: receive from Twilio, receive from Deepgram
         try:
             await asyncio.gather(
                 self._receive_twilio(websocket),
@@ -639,9 +616,9 @@ class StreamingCall:
                     await self.deepgram_ws.close()
                 except:
                     pass
+            logger.info(f"[STREAM] Call ended after {self.total_parses} parses")
 
     async def _receive_twilio(self, websocket):
-        """Receive audio from Twilio and forward to Deepgram."""
         try:
             async for message in websocket:
                 data = json.loads(message)
@@ -667,21 +644,11 @@ class StreamingCall:
                             pass
                     break
 
-                # Safety timeout
-                if self.call_start and (time.time() - self.call_start) > MAX_CALL_SECONDS:
-                    if not self.parsed:
-                        logger.warning(f"[STREAM] {MAX_CALL_SECONDS}s timeout — no parse")
-                    break
-
-                # If we got a temp, stop receiving
-                if self.parsed:
-                    break
-
         except websockets.exceptions.ConnectionClosed:
-            pass
+            logger.info("[STREAM] Twilio WebSocket closed")
 
     async def _receive_deepgram(self):
-        """Receive transcript fragments from Deepgram and watch for temperature."""
+        """Continuously watch transcript for temperature readings."""
         try:
             async for message in self.deepgram_ws:
                 data = json.loads(message)
@@ -696,122 +663,64 @@ class StreamingCall:
                 if not transcript_chunk:
                     continue
 
-                # Accumulate and check
                 if is_final:
-                    self.transcript_so_far += " " + transcript_chunk
-                    self.transcript_so_far = self.transcript_so_far.strip()
-                    temp_c, temp_f = parse_temperature(self.transcript_so_far)
+                    self.transcript_window += " " + transcript_chunk
+                    self.transcript_window = self.transcript_window.strip()
+
+                    temp_c, temp_f = parse_temperature(self.transcript_window)
                     if temp_c is not None:
-                        self.temp_c = temp_c
-                        self.temp_f = temp_f
-                        self.zulu = parse_zulu_time(self.transcript_so_far)
-                        self.parsed = True
-                        latency = time.time() - self.call_start
-                        logger.info(f"[STREAM] 🎯 PARSED in {latency:.1f}s: "
-                                   f"{temp_c}°C → {temp_f}°F | {self.zulu or '????Z'}")
-                        return
+                        zulu = parse_zulu_time(self.transcript_window)
+                        self.total_parses += 1
+                        elapsed = time.time() - self.call_start
+                        logger.info(f"[STREAM] 🎯 #{self.total_parses} ({elapsed:.0f}s): "
+                                   f"{temp_c}°C → {temp_f}°F | {zulu or '????Z'}")
+                        await parse_queue.put((temp_c, zulu))
+                        self.transcript_window = ""
+
+                    # Prevent unbounded growth — keep tail for boundary spans
+                    if len(self.transcript_window) > 500:
+                        self.transcript_window = self.transcript_window[-200:]
+
                 else:
-                    # Check interim results too (faster trigger)
-                    combined = self.transcript_so_far + " " + transcript_chunk
+                    # Interim results — faster detection
+                    combined = self.transcript_window + " " + transcript_chunk
                     temp_c, temp_f = parse_temperature(combined)
                     if temp_c is not None:
-                        self.temp_c = temp_c
-                        self.temp_f = temp_f
-                        self.zulu = parse_zulu_time(combined)
-                        self.parsed = True
-                        self.transcript_so_far = combined.strip()
-                        latency = time.time() - self.call_start
-                        logger.info(f"[STREAM] 🎯 PARSED (interim) in {latency:.1f}s: "
-                                   f"{temp_c}°C → {temp_f}°F | {self.zulu or '????Z'}")
-                        return
+                        zulu = parse_zulu_time(combined)
+                        self.total_parses += 1
+                        elapsed = time.time() - self.call_start
+                        logger.info(f"[STREAM] 🎯 #{self.total_parses} (interim, {elapsed:.0f}s): "
+                                   f"{temp_c}°C → {temp_f}°F | {zulu or '????Z'}")
+                        await parse_queue.put((temp_c, zulu))
+                        self.transcript_window = ""
 
         except websockets.exceptions.ConnectionClosed:
-            pass
+            logger.info("[STREAM] Deepgram WebSocket closed")
 
 
 # ─── WebSocket server ─────────────────────────────────────────
 
-current_call: StreamingCall = None
-call_complete_event: asyncio.Event = None
+active_call: StreamingCall = None
+call_connected_event: asyncio.Event = None
 
 
 async def ws_handler(websocket):
-    """Handle incoming WebSocket connections from Twilio."""
-    global current_call
+    global active_call
 
-    if current_call is None:
-        logger.debug("[WS] Received connection but no active call — ignoring")
+    if active_call is None:
+        logger.debug("[WS] No active call object — ignoring connection")
         return
 
-    await current_call.handle_twilio_ws(websocket)
+    if call_connected_event:
+        call_connected_event.set()
 
-    if call_complete_event:
-        call_complete_event.set()
-
-
-# ─── Call orchestrator ────────────────────────────────────────
-
-async def make_streaming_call(station_phone: str, ws_url: str):
-    """Initiate one call and wait for the stream to complete."""
-    global current_call, call_complete_event
-
-    state.call_count += 1
-    state.total_cost += COST_PER_CALL
-
-    call_complete_event = asyncio.Event()
-    current_call = StreamingCall()
-
-    now_str = datetime.now(timezone.utc).strftime('%H:%M:%SZ')
-    logger.info(f"📞 #{state.call_count:03d} ({now_str}) calling... [${state.total_cost:.2f}]")
-
-    twiml = f"""<Response>
-    <Connect>
-        <Stream url="{ws_url}" />
-    </Connect>
-</Response>"""
-
-    try:
-        call = twilio_client.calls.create(
-            to=station_phone,
-            from_=from_num,
-            twiml=twiml,
-            timeout=30,
-        )
-        call_sid = call.sid
-        logger.info(f"   Call SID: {call_sid}")
-    except Exception as e:
-        logger.error(f"   ❌ Call failed: {e}")
-        current_call = None
-        return None, None, str(e)
-
-    # Wait for the WebSocket handler to finish (or timeout)
-    try:
-        await asyncio.wait_for(call_complete_event.wait(), timeout=MAX_CALL_SECONDS + 10)
-    except asyncio.TimeoutError:
-        logger.warning("   ⏰ Call timed out waiting for stream")
-
-    result_call = current_call
-    current_call = None
-
-    # Hang up the call
-    try:
-        twilio_client.calls(call_sid).update(status='completed')
-        logger.info("   📴 Call hung up")
-    except Exception as e:
-        logger.debug(f"   Hangup: {e}")
-
-    if result_call.parsed:
-        return result_call.temp_c, result_call.zulu, result_call.transcript_so_far
-    else:
-        state.parse_failures += 1
-        snippet = result_call.transcript_so_far[:80] if result_call.transcript_so_far else 'empty'
-        return None, None, f'no_parse: "{snippet}"'
+    await active_call.handle_twilio_ws(websocket)
 
 
 # ─── Main loop ────────────────────────────────────────────────
 
 async def main_loop(args, station_cfg):
-    global brackets
+    global active_call, call_connected_event, parse_queue
 
     station = args.station.upper()
     tz_offset = station_cfg['tz_offset']
@@ -828,7 +737,6 @@ async def main_loop(args, station_cfg):
         logger.error("No brackets loaded — check Kalshi API or event ticker")
         return
 
-    # Banner
     n = len(brackets)
     mode_str = 'LIVE 🔴' if args.live else 'DRY RUN 🧪'
     schedule_str = ''
@@ -868,61 +776,131 @@ async def main_loop(args, station_cfg):
 
     start_time = time.time()
     last_bracket_refresh = time.time()
+    parse_queue = asyncio.Queue()
+    call_sid = None
 
-    while True:
-        if not should_run(args, tz_offset, start_time):
-            logger.info(f"⏰ Schedule ended — stopping")
-            break
+    # ── Outer loop: manages the call. If it drops, redial. ──
+    while should_run(args, tz_offset, start_time):
 
-        # Refresh bracket prices every 10 minutes
-        if time.time() - last_bracket_refresh > 600:
-            try:
-                new_brackets = load_brackets(ticker_prefix, tz_offset, station, signal_type)
-                if new_brackets:
-                    for nb in new_brackets:
-                        if nb.ticker in state.traded_tickers:
-                            nb.traded = True
-                            nb.status = 'dead'
-                    brackets = new_brackets
-                    logger.info(f"[BRACKETS] Refreshed {len(brackets)} brackets")
-            except:
-                pass
-            last_bracket_refresh = time.time()
+        active_call = StreamingCall()
+        call_connected_event = asyncio.Event()
+        state.call_count += 1
 
-        # Make a streaming call
-        temp_c, zulu, transcript_or_error = await make_streaming_call(station_phone, ws_url)
-        ts = datetime.now(timezone.utc).isoformat()
+        now_str = datetime.now(timezone.utc).strftime('%H:%M:%SZ')
+        logger.info(f"📞 #{state.call_count} ({now_str}) calling {station}...")
 
-        if temp_c is None:
-            logger.warning(f"   ❌ {transcript_or_error}")
-            log_row(ts, None, None, None, False, 0, '', transcript_or_error)
-            await asyncio.sleep(RETRY_GAP_SECONDS)
+        twiml = f"""<Response>
+    <Connect>
+        <Stream url="{ws_url}" />
+    </Connect>
+</Response>"""
+
+        try:
+            call = twilio_client.calls.create(
+                to=station_phone,
+                from_=from_num,
+                twiml=twiml,
+                timeout=30,
+            )
+            call_sid = call.sid
+            logger.info(f"   Call SID: {call_sid}")
+        except Exception as e:
+            logger.error(f"   ❌ Call failed: {e}")
+            active_call = None
+            await asyncio.sleep(5)
             continue
 
-        # Update state
-        changed, lo_prob, hi_prob, candidates = state.update_high(temp_c, zulu or '????Z')
-        marker = ' ⬆️  NEW HIGH' if changed else ''
-        logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
-                   f"H≥{state.probable_high}°F{marker}")
+        # Wait for WebSocket to connect
+        try:
+            await asyncio.wait_for(call_connected_event.wait(), timeout=55)
+            logger.info("   ✅ Stream connected — listening continuously")
+        except asyncio.TimeoutError:
+            logger.warning("   ⏰ No stream connection — will redial")
+            try:
+                twilio_client.calls(call_sid).update(status='completed')
+            except:
+                pass
+            active_call = None
+            await asyncio.sleep(3)
+            continue
 
-        # Check brackets
-        trade_str = ''
-        pre_trades = len(state.trades)
-        check_and_trade(brackets, args.bid, args.qty, args.live)
-        if len(state.trades) > pre_trades:
-            trade_str = state.trades[-1]['action'] + ':' + state.trades[-1]['ticker']
+        # ── Inner loop: consume parsed readings while call is alive ──
+        while should_run(args, tz_offset, start_time):
 
-        latency = 0
-        log_row(ts, zulu, temp_c, candidates, changed, latency, trade_str, '')
+            # Refresh brackets every 10 minutes
+            if time.time() - last_bracket_refresh > 600:
+                try:
+                    new_brackets = load_brackets(ticker_prefix, tz_offset, station, signal_type)
+                    if new_brackets:
+                        for nb in new_brackets:
+                            if nb.ticker in state.traded_tickers:
+                                nb.traded = True
+                                nb.status = 'dead'
+                        brackets = new_brackets
+                except:
+                    pass
+                last_bracket_refresh = time.time()
 
-        # Wait between calls — critical for Twilio WebSocket teardown
-        await asyncio.sleep(CALL_GAP_SECONDS)
+            # Wait for next parsed reading (timeout to check call health)
+            try:
+                temp_c, zulu = await asyncio.wait_for(parse_queue.get(), timeout=90)
+            except asyncio.TimeoutError:
+                # No reading in 90s — check if call is still alive
+                try:
+                    c = twilio_client.calls(call_sid).fetch()
+                    if c.status in ('completed', 'failed', 'busy', 'no-answer', 'canceled'):
+                        logger.warning(f"   📴 Call ended ({c.status}) — will redial")
+                        break
+                    else:
+                        logger.debug(f"   Call still active ({c.status})")
+                        continue
+                except:
+                    logger.warning("   📴 Call status check failed — will redial")
+                    break
+
+            ts = datetime.now(timezone.utc).isoformat()
+            state.parse_count += 1
+
+            # Deduplicate ASOS loop repeats
+            if state.is_duplicate(temp_c, zulu):
+                logger.info(f"   🔄 Same reading ({temp_c}°C {zulu}) — skipping")
+                continue
+
+            state.last_temp_c = temp_c
+            state.last_zulu = zulu
+
+            # Update state
+            changed, lo_prob, hi_prob, candidates = state.update_high(temp_c, zulu or '????Z')
+            marker = ' ⬆️  NEW HIGH' if changed else ''
+            logger.info(f"   🌡️  {temp_c}°C → OMO [{lo_prob}-{hi_prob}] | "
+                       f"H≥{state.probable_high}°F{marker}")
+
+            # Check brackets
+            trade_str = ''
+            pre_trades = len(state.trades)
+            check_and_trade(brackets, args.bid, args.qty, args.live)
+            if len(state.trades) > pre_trades:
+                trade_str = state.trades[-1]['action'] + ':' + state.trades[-1]['ticker']
+
+            log_row(ts, zulu, temp_c, candidates, changed, trade_str, '')
+
+            # Update cost estimate
+            elapsed_min = (time.time() - active_call.call_start) / 60
+            state.total_cost = elapsed_min * 0.011
+
+        # ── Call ended or schedule done — hang up ──
+        if call_sid:
+            try:
+                twilio_client.calls(call_sid).update(status='completed')
+                logger.info("   📴 Call hung up")
+            except:
+                pass
+        active_call = None
 
 
 # ─── Entry point ──────────────────────────────────────────────
 
 async def run(args, station_cfg):
-    """Start WebSocket server and main loop concurrently."""
     server = await websockets.serve(ws_handler, "0.0.0.0", args.port)
     logger.info(f"[WS] Server listening on port {args.port}")
 
@@ -934,14 +912,13 @@ async def run(args, station_cfg):
         server.close()
         await server.wait_closed()
 
-    # Print summary
     print(f"\n{'='*60}")
     print(f"📊 STREAM SNIPER — SESSION SUMMARY")
     print(f"{'='*60}")
     print(f"  Station:        {args.station}")
     print(f"  Calls:          {state.call_count}")
-    print(f"  Parse failures: {state.parse_failures}")
-    print(f"  Total cost:     ${state.total_cost:.2f}")
+    print(f"  Readings:       {state.parse_count}")
+    print(f"  Est. cost:      ${state.total_cost:.2f}")
     print(f"  Probable HIGH:  ≥{state.probable_high}°F")
     if state.trades:
         print(f"\n  TRADES ({len(state.trades)}):")
@@ -957,7 +934,6 @@ async def run(args, station_cfg):
 if __name__ == '__main__':
     args = parse_args()
 
-    # Resolve station
     station = args.station.upper()
     if station not in STATION_REGISTRY:
         print(f"❌ Unknown station: {station}")
