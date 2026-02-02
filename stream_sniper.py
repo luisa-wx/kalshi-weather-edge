@@ -576,7 +576,8 @@ def log_row(ts, zulu, temp_c, candidates, new_high, latency, trade, error):
 
 MAX_CALL_SECONDS = 45
 COST_PER_CALL    = 0.02
-CALL_GAP_SECONDS = 8   # Wait between calls to let Twilio teardown
+CALL_GAP_SECONDS = 15   # Wait between successful calls for Twilio teardown
+RETRY_GAP_SECONDS = 3  # Quick retry on failed calls
 
 
 class StreamingCall:
@@ -895,7 +896,7 @@ async def main_loop(args, station_cfg):
         if temp_c is None:
             logger.warning(f"   ❌ {transcript_or_error}")
             log_row(ts, None, None, None, False, 0, '', transcript_or_error)
-            await asyncio.sleep(CALL_GAP_SECONDS)
+            await asyncio.sleep(RETRY_GAP_SECONDS)
             continue
 
         # Update state
