@@ -569,11 +569,15 @@ state: SniperState = None  # Initialized in main_loop after we know signal_type
 def check_and_trade(brackets: list, bid_price: int, qty: int, live: bool, signal_type: str):
     """Check all brackets for transitions and execute trades.
     
-    CRITICAL: Comparison operators per WX_SNIPER_COMPLETE_REFERENCE Section 4:
-      HIGH dead:   observed_high > cap   (strictly greater)
-      HIGH locked: observed_high >= floor (greater or equal)
-      LOW dead:    observed_low < floor   (strictly less)
-      LOW locked:  observed_low <= cap    (less or equal)
+    CRITICAL: Kalshi encodes greater/less with offset strikes:
+      greater: floor = X-1  (e.g. "80° or above" → floor=79, YES wins when final > 79)
+      less:    cap = X+1    (e.g. "71° or below" → cap=72, YES wins when final < 72)
+    
+    So the operators against raw API values are:
+      HIGH greater LOCKED:  observed > floor   (strictly >)
+      HIGH less DEAD:       observed >= cap     (>=)
+      LOW less LOCKED:      observed < cap      (strictly <)
+      LOW greater DEAD:     observed <= floor   (<=)
     
     We use BracketState.check_status() from smart_poller which implements these.
     """

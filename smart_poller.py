@@ -249,10 +249,22 @@ class BracketState:
     def check_status(self, observed_high: Optional[int], observed_low: Optional[int]) -> str:
         """Determine current status based on observations.
         
-        Kalshi convention (from API data):
-          greater: floor = X-1, YES wins when final > floor  (e.g. "30° or above" = floor 29)
-          less:    cap = X+1,   YES wins when final < cap    (e.g. "21° or below" = cap 22)
-          between: floor/cap,   YES wins when floor <= final <= cap
+        CRITICAL — Kalshi API encoding (verified 2026-02-01 against KLAX data):
+        
+          greater: floor_strike = X-1   (e.g. "80° or above" → floor=79)
+                   YES wins when final > floor  (i.e. final >= 80)
+                   
+          less:    cap_strike = X+1     (e.g. "71° or below" → cap=72)
+                   YES wins when final < cap    (i.e. final <= 71)
+                   
+          between: floor_strike/cap_strike are the ACTUAL boundaries (no offset)
+                   (e.g. "72° to 73°" → floor=72, cap=73)
+                   YES wins when floor <= final <= cap
+        
+        The operators below use STRICT comparisons (> and <) for greater/less
+        because floor/cap are already offset by 1 from the displayed boundary.
+        The reference doc Section 4 uses >= and <= but assumes non-offset values.
+        Both are equivalent; this code matches Kalshi's raw API data.
         """
         
         if self.signal_type == 'high':
@@ -260,50 +272,58 @@ class BracketState:
                 return 'open'
             
             if self.strike_type == 'between':
+                # between: floor/cap are actual boundaries
+                # DEAD when high exceeds cap (can never come back down)
                 if self.cap_strike is not None and observed_high > self.cap_strike:
                     return 'dead'
-                return 'open'
+                return 'open'   # NEVER locked (high might still rise past cap)
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                # YES wins when final > floor. LOCKED once observed >= floor.
-                # Per WX_SNIPER_COMPLETE_REFERENCE Section 4:
-                #   HIGH locked: observed_high >= floor (greater or equal)
-                if self.floor_strike is not None and observed_high >= self.floor_strike:
+                # "80° or above": floor=79, YES wins when final > 79
+                # LOCKED once observed_high > floor (high can only go up)
+                # e.g. high=80: 80 > 79 = True → LOCKED ✓
+                # e.g. high=79: 79 > 79 = False → OPEN ✓ (hasn't hit 80 yet)
+                if self.floor_strike is not None and observed_high > self.floor_strike:
                     return 'locked'
-                return 'open'
+                return 'open'   # NEVER dead (high can only go up)
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                # YES wins when final < cap. DEAD once observed > cap.
-                # Per WX_SNIPER_COMPLETE_REFERENCE Section 4:
-                #   HIGH dead: observed_high > cap (strictly greater)
-                if self.cap_strike is not None and observed_high > self.cap_strike:
+                # "71° or below": cap=72, YES wins when final < 72
+                # DEAD once observed_high >= cap (high already ≥72, can't be <72)
+                # e.g. high=72: 72 >= 72 = True → DEAD ✓ (already ≥72)
+                # e.g. high=71: 71 >= 72 = False → OPEN ✓ (still ≤71)
+                if self.cap_strike is not None and observed_high >= self.cap_strike:
                     return 'dead'
-                return 'open'
+                return 'open'   # NEVER locked (high might still rise past boundary)
         
         elif self.signal_type == 'low':
             if observed_low is None:
                 return 'open'
             
             if self.strike_type == 'between':
+                # between: floor/cap are actual boundaries
+                # DEAD when low drops below floor (can never come back up)
                 if self.floor_strike is not None and observed_low < self.floor_strike:
                     return 'dead'
-                return 'open'
+                return 'open'   # NEVER locked (low might still drop below floor)
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                # YES wins when final > floor. DEAD once observed < floor (can't go back up).
-                # Per WX_SNIPER_COMPLETE_REFERENCE Section 4:
-                #   LOW dead: observed_low < floor (strictly less)
-                if self.floor_strike is not None and observed_low < self.floor_strike:
+                # "37° or above": floor=36, YES wins when final > 36
+                # DEAD once observed_low <= floor (low is ≤36, can't be >36)
+                # e.g. low=36: 36 <= 36 = True → DEAD ✓
+                # e.g. low=37: 37 <= 36 = False → OPEN ✓
+                if self.floor_strike is not None and observed_low <= self.floor_strike:
                     return 'dead'
-                return 'open'
+                return 'open'   # NEVER locked (low might keep dropping)
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                # YES wins when final < cap. LOCKED once observed <= cap.
-                # Per WX_SNIPER_COMPLETE_REFERENCE Section 4:
-                #   LOW locked: observed_low <= cap (less or equal)
-                if self.cap_strike is not None and observed_low <= self.cap_strike:
+                # "34° or below": cap=35, YES wins when final < 35
+                # LOCKED once observed_low < cap (low can only go down)
+                # e.g. low=34: 34 < 35 = True → LOCKED ✓
+                # e.g. low=35: 35 < 35 = False → OPEN ✓ (hasn't hit 34 yet)
+                if self.cap_strike is not None and observed_low < self.cap_strike:
                     return 'locked'
-                return 'open'
+                return 'open'   # NEVER dead (low dropping helps this bracket)
         
         return 'open'
     
@@ -313,16 +333,20 @@ class BracketState:
         
         if self.signal_type == 'high':
             if status == 'dead':
-                # Both 'between' and 'less' use strictly greater for dead
-                return f"HIGH {observed_high}°F > cap {self.cap_strike}°F"
+                if self.strike_type in ('less', 'less_or_equal'):
+                    return f"HIGH {observed_high}°F >= cap {self.cap_strike}°F → can't be < cap"
+                else:  # between
+                    return f"HIGH {observed_high}°F > cap {self.cap_strike}°F"
             elif status == 'locked':
-                return f"HIGH {observed_high}°F >= floor {self.floor_strike}°F"
+                return f"HIGH {observed_high}°F > floor {self.floor_strike}°F → locked above"
         else:
             if status == 'dead':
-                # Both 'between' and 'greater' use strictly less for dead
-                return f"LOW {observed_low}°F < floor {self.floor_strike}°F"
+                if self.strike_type in ('greater', 'greater_or_equal'):
+                    return f"LOW {observed_low}°F <= floor {self.floor_strike}°F → can't be > floor"
+                else:  # between
+                    return f"LOW {observed_low}°F < floor {self.floor_strike}°F"
             elif status == 'locked':
-                return f"LOW {observed_low}°F <= cap {self.cap_strike}°F"
+                return f"LOW {observed_low}°F < cap {self.cap_strike}°F → locked below"
         
         return "Still open"
 
