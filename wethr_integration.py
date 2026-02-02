@@ -448,7 +448,14 @@ class ASOSScout:
         
         def window_is_active(w):
             """A window is active if we're inside it AND haven't passed peak by 2+hr."""
-            if not (w.window_start_lst <= current_lst_hour <= w.window_end_lst):
+            # Handle midnight wrap: if end < start, window spans midnight
+            if w.window_end_lst >= w.window_start_lst:
+                in_window = w.window_start_lst <= current_lst_hour <= w.window_end_lst
+            else:
+                # Wraps midnight: e.g. start=19, end=1 → active at 19-23 and 0-1
+                in_window = current_lst_hour >= w.window_start_lst or current_lst_hour <= w.window_end_lst
+            
+            if not in_window:
                 return False
             hours_past_peak = current_lst_hour - w.peak_hour_lst
             if hours_past_peak < 0:
@@ -1319,7 +1326,13 @@ class ASOSScout:
                 del self.active_snipers[station]
     
     def _check_sniper_trades(self, station: str, info: Dict):
-        """Check the sniper's CSV log for new trade events."""
+        """Check the sniper's CSV log for new trade events.
+        
+        CSV format (12 columns):
+        0:timestamp, 1:zulu, 2:temp_c, 3:omo_low, 4:omo_high,
+        5:probable_high, 6:probable_low, 7:new_high, 8:new_low,
+        9:trade, 10:qc_flag, 11:error
+        """
         csv_file = f'/tmp/{station.lower()}_stream_sniper.csv'
         try:
             if not os.path.exists(csv_file):
@@ -1336,23 +1349,29 @@ class ASOSScout:
                 lines = f.readlines()
             
             for line in lines[-20:]:
-                # CSV format: timestamp,zulu,temp_c,candidates,changed,trade,error
                 parts = line.strip().split(',')
-                if len(parts) >= 6 and parts[5] and parts[5] != 'trade':
-                    trade_str = parts[5]
-                    # Avoid double-counting — check if we've already seen this
-                    trade_key = f"{station}:{parts[0]}:{trade_str}"
-                    already_seen = any(t.get('key') == trade_key for t in self.sniper_trades)
-                    if not already_seen:
-                        self.sniper_trades.append({
-                            'key': trade_key,
-                            'station': station,
-                            'time': parts[0],
-                            'trade': trade_str,
-                            'source': 'phone',
-                        })
-                        info['trade_count'] = info.get('trade_count', 0) + 1
-                        logger.warning(f"[PHONE] 🎯 {station} TRADE: {trade_str}")
+                # Need at least 10 columns, and column 9 must be non-empty
+                if len(parts) < 10:
+                    continue
+                # Skip header row
+                if parts[0] == 'timestamp':
+                    continue
+                trade_str = parts[9].strip()
+                if not trade_str:
+                    continue
+                # Avoid double-counting
+                trade_key = f"{station}:{parts[0]}:{trade_str}"
+                already_seen = any(t.get('key') == trade_key for t in self.sniper_trades)
+                if not already_seen:
+                    self.sniper_trades.append({
+                        'key': trade_key,
+                        'station': station,
+                        'time': parts[0],
+                        'trade': trade_str,
+                        'source': 'phone',
+                    })
+                    info['trade_count'] = info.get('trade_count', 0) + 1
+                    logger.warning(f"[PHONE] 🎯 {station} TRADE: {trade_str}")
         except Exception as e:
             logger.debug(f"[PHONE] {station} trade log read error: {e}")
     
