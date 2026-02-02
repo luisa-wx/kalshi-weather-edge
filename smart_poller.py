@@ -1818,15 +1818,17 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 velocity = q2.get('velocity')
                 prox_threshold = q2.get('proximity_threshold', 3)
                 
-                # Velocity display
+                # Velocity display with readings count
+                n_readings = len(s.scout.temp_history.get(station, []))
+                readings_tag = f' <span style="color:#8b949e; font-size:10px;">({n_readings}r)</span>'
                 if velocity is not None:
                     vel_abs = abs(velocity)
                     vel_dir = '↑' if velocity > 0 else '↓' if velocity < 0 else '→'
                     vel_color = '#f85149' if vel_abs > 0.1 else '#8b949e'
-                    vel_str = f'<span style="color:{vel_color};">{vel_dir} {vel_abs:.2f}°F/min</span>'
+                    vel_str = f'<span style="color:{vel_color};">{vel_dir} {vel_abs:.2f}°F/min</span>{readings_tag}'
                     fast_tag = ' <span style="color:#f0883e; font-size:10px;">(FAST)</span>' if vel_abs > 0.1 else ''
                 else:
-                    vel_str = '<span style="color:#8b949e;">—</span>'
+                    vel_str = f'<span style="color:#8b949e;">—</span>{readings_tag}'
                     fast_tag = ''
                 
                 # Cadence display

@@ -1542,7 +1542,7 @@ class ASOSScout:
                 skipped_cadence += 1
             
             # ── mode=wethr_high: running day's high/low (Phase 2) ──
-            # Only during WATCHING/HOT phases to conserve API quota
+            # Polls during ALL phases (IDLE/WATCHING/HOT) — cadence varies
             if self.should_poll_wethr_high(station):
                 self.station_last_wethr_high_poll[station] = now
                 wh_data = self.fetch_wethr_high(station)
