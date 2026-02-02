@@ -315,9 +315,17 @@ class StationState:
     metar_time: Optional[datetime] = None
     current_local_date: Optional[str] = None
     
+    # Today's brackets (local civil date)
     high_watchlist: List[BracketState] = field(default_factory=list)
     low_watchlist: List[BracketState] = field(default_factory=list)
     resolved_brackets: List[BracketState] = field(default_factory=list)
+    market_date: Optional[str] = None  # "Feb 01" — displayed label for today's brackets
+    
+    # Tomorrow's brackets (populated during 10PM-midnight overlap)
+    tomorrow_high_watchlist: List[BracketState] = field(default_factory=list)
+    tomorrow_low_watchlist: List[BracketState] = field(default_factory=list)
+    tomorrow_resolved_brackets: List[BracketState] = field(default_factory=list)
+    tomorrow_market_date: Optional[str] = None  # "Feb 02" — displayed label
 
 # ============================================================
 # KALSHI CLIENT (with latency tracking)
@@ -515,13 +523,43 @@ class WXSniper:
         log_event('shutdown', signal=signum)
         self.running = False
     
-    def _get_today_suffix(self) -> str:
-        """Get cached date suffix (avoids repeated datetime formatting)."""
-        today = datetime.now(timezone.utc).date()
-        if self._today_suffix_date != today:
-            self._today_suffix = datetime.now(timezone.utc).strftime('%y%b%d').upper()
-            self._today_suffix_date = today
-        return self._today_suffix
+    def _get_today_suffix(self, station: str = None) -> str:
+        """Get Kalshi date suffix for today in the station's local civil time.
+        
+        If no station specified, uses ET as default (backward compat).
+        Kalshi tickers use format: YYMmmDD e.g. 26FEB01
+        """
+        if station:
+            tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
+        else:
+            tz_name = 'America/New_York'
+        tz = ZoneInfo(tz_name)
+        local_now = datetime.now(tz)
+        return local_now.strftime('%y%b%d').upper()
+    
+    def _get_tomorrow_suffix(self, station: str) -> str:
+        """Get Kalshi date suffix for tomorrow in the station's local civil time."""
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
+        tz = ZoneInfo(tz_name)
+        local_tomorrow = datetime.now(tz) + timedelta(days=1)
+        return local_tomorrow.strftime('%y%b%d').upper()
+    
+    def _get_market_date_label(self, station: str, which: str = 'today') -> str:
+        """Get human-readable date label for display: 'Feb 01' or 'Feb 02'."""
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
+        tz = ZoneInfo(tz_name)
+        dt = datetime.now(tz)
+        if which == 'tomorrow':
+            dt = dt + timedelta(days=1)
+        return dt.strftime('%b %d')
+    
+    def _is_overlap_window(self, station: str) -> bool:
+        """Check if we're in the 10PM-midnight overlap where both today's and
+        tomorrow's Kalshi markets are open simultaneously."""
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
+        tz = ZoneInfo(tz_name)
+        local_hour = datetime.now(tz).hour
+        return local_hour >= 22  # 10 PM or later
     
     def get_local_date(self, station: str) -> str:
         tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
@@ -553,19 +591,26 @@ class WXSniper:
     # ============================================================
     
     def init_watchlists(self):
-        """Initialize watchlists with all brackets from Kalshi."""
+        """Initialize watchlists with all brackets from Kalshi.
+        
+        Uses each station's local civil date for the ticker suffix.
+        During the 10PM-midnight overlap, also fetches tomorrow's brackets.
+        """
         logger.info("[INIT] Building watchlists...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
             high_ticker = cfg.get('kalshi_high_ticker')
             low_ticker = cfg.get('kalshi_low_ticker')
             
+            today_suffix = self._get_today_suffix(station)
+            state.market_date = self._get_market_date_label(station, 'today')
+            
             state.high_watchlist = []
             state.low_watchlist = []
             state.resolved_brackets = []
             
+            # ── Today's brackets ──
             if high_ticker:
                 try:
                     event = f"{high_ticker}-{today_suffix}"
@@ -590,7 +635,7 @@ class WXSniper:
                         state.high_watchlist.append(b)
                         logger.info(f"    [BRACKET] {b.subtitle} | strike_type={m.get('strike_type')} floor={floor_val} cap={cap_val} -> int floor={b.floor_strike} cap={b.cap_strike}")
                     
-                    logger.info(f"  {station} HIGH: {len(state.high_watchlist)} brackets")
+                    logger.info(f"  {station} HIGH: {len(state.high_watchlist)} brackets ({today_suffix})")
                 except Exception as e:
                     logger.error(f"  {station} HIGH: ERROR - {e}")
             
@@ -618,9 +663,73 @@ class WXSniper:
                         state.low_watchlist.append(b)
                         logger.info(f"    [BRACKET] {b.subtitle} | strike_type={m.get('strike_type')} floor={floor_val} cap={cap_val} -> int floor={b.floor_strike} cap={b.cap_strike}")
                     
-                    logger.info(f"  {station} LOW: {len(state.low_watchlist)} brackets")
+                    logger.info(f"  {station} LOW: {len(state.low_watchlist)} brackets ({today_suffix})")
                 except Exception as e:
                     logger.error(f"  {station} LOW: ERROR - {e}")
+            
+            # ── Tomorrow's brackets (overlap window only) ──
+            state.tomorrow_high_watchlist = []
+            state.tomorrow_low_watchlist = []
+            state.tomorrow_resolved_brackets = []
+            state.tomorrow_market_date = None
+            
+            if self._is_overlap_window(station):
+                tomorrow_suffix = self._get_tomorrow_suffix(station)
+                state.tomorrow_market_date = self._get_market_date_label(station, 'tomorrow')
+                
+                if high_ticker:
+                    try:
+                        event = f"{high_ticker}-{tomorrow_suffix}"
+                        event_data = self.kalshi.get_event(event)
+                        event_obj = event_data.get('event', event_data)
+                        markets = event_obj.get('markets', [])
+                        
+                        for m in markets:
+                            floor_val = m.get('floor_strike')
+                            cap_val = m.get('cap_strike')
+                            b = BracketState(
+                                ticker=m.get('ticker', ''),
+                                subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                                floor_strike=int(floor_val) if floor_val is not None else None,
+                                cap_strike=int(cap_val) if cap_val is not None else None,
+                                strike_type=m.get('strike_type', 'between'),
+                                signal_type='high',
+                                station=station
+                            )
+                            b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                            b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                            state.tomorrow_high_watchlist.append(b)
+                        
+                        logger.info(f"  {station} TOMORROW HIGH: {len(state.tomorrow_high_watchlist)} brackets ({tomorrow_suffix})")
+                    except Exception as e:
+                        logger.warning(f"  {station} TOMORROW HIGH: {e} (market may not be open yet)")
+                
+                if low_ticker:
+                    try:
+                        event = f"{low_ticker}-{tomorrow_suffix}"
+                        event_data = self.kalshi.get_event(event)
+                        event_obj = event_data.get('event', event_data)
+                        markets = event_obj.get('markets', [])
+                        
+                        for m in markets:
+                            floor_val = m.get('floor_strike')
+                            cap_val = m.get('cap_strike')
+                            b = BracketState(
+                                ticker=m.get('ticker', ''),
+                                subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                                floor_strike=int(floor_val) if floor_val is not None else None,
+                                cap_strike=int(cap_val) if cap_val is not None else None,
+                                strike_type=m.get('strike_type', 'between'),
+                                signal_type='low',
+                                station=station
+                            )
+                            b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                            b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                            state.tomorrow_low_watchlist.append(b)
+                        
+                        logger.info(f"  {station} TOMORROW LOW: {len(state.tomorrow_low_watchlist)} brackets ({tomorrow_suffix})")
+                    except Exception as e:
+                        logger.warning(f"  {station} TOMORROW LOW: {e} (market may not be open yet)")
         
         self.last_price_poll = datetime.now(timezone.utc)
     
@@ -789,14 +898,27 @@ class WXSniper:
             if state.current_local_date is not None and state.current_local_date != current_date:
                 logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
                 
+                # If we pre-fetched tomorrow's brackets, they become today's
+                had_tomorrow = bool(state.tomorrow_high_watchlist or state.tomorrow_low_watchlist)
+                
                 # Reset this station's state for the new day
                 state.observed_high = None
                 state.observed_low = None
                 state.latest_temp_f = None
-                state.high_watchlist = []
-                state.low_watchlist = []
+                state.high_watchlist = state.tomorrow_high_watchlist if had_tomorrow else []
+                state.low_watchlist = state.tomorrow_low_watchlist if had_tomorrow else []
                 state.resolved_brackets = []
+                state.market_date = state.tomorrow_market_date or self._get_market_date_label(station, 'today')
                 state.current_local_date = current_date
+                
+                # Clear tomorrow fields
+                state.tomorrow_high_watchlist = []
+                state.tomorrow_low_watchlist = []
+                state.tomorrow_resolved_brackets = []
+                state.tomorrow_market_date = None
+                
+                if had_tomorrow:
+                    logger.info(f"  [{station}] Promoted pre-fetched tomorrow brackets to today")
                 
                 any_rollover = True
             
@@ -1122,13 +1244,18 @@ class WXSniper:
     # ============================================================
     
     def refresh_prices(self):
-        """Refresh prices for watched brackets."""
+        """Refresh prices for watched brackets.
+        
+        Uses station-local dates. During overlap window, also refreshes
+        tomorrow's bracket prices.
+        """
         logger.info("[PRICES] Refreshing...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
+            today_suffix = self._get_today_suffix(station)
             
+            # ── Today's prices ──
             if state.high_watchlist:
                 high_ticker = cfg.get('kalshi_high_ticker')
                 if high_ticker:
@@ -1162,6 +1289,95 @@ class WXSniper:
                                 b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
                     except Exception as e:
                         logger.error(f"  {station} LOW prices: {e}")
+            
+            # ── Tomorrow's prices (overlap window only) ──
+            if self._is_overlap_window(station):
+                tomorrow_suffix = self._get_tomorrow_suffix(station)
+                
+                # If we don't have tomorrow's brackets yet, try to fetch them
+                if not state.tomorrow_high_watchlist and not state.tomorrow_low_watchlist:
+                    state.tomorrow_market_date = self._get_market_date_label(station, 'tomorrow')
+                    high_ticker = cfg.get('kalshi_high_ticker')
+                    low_ticker = cfg.get('kalshi_low_ticker')
+                    
+                    if high_ticker:
+                        try:
+                            event = f"{high_ticker}-{tomorrow_suffix}"
+                            event_data = self.kalshi.get_event(event)
+                            event_obj = event_data.get('event', event_data)
+                            for m in event_obj.get('markets', []):
+                                floor_val = m.get('floor_strike')
+                                cap_val = m.get('cap_strike')
+                                b = BracketState(
+                                    ticker=m.get('ticker', ''),
+                                    subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                                    floor_strike=int(floor_val) if floor_val is not None else None,
+                                    cap_strike=int(cap_val) if cap_val is not None else None,
+                                    strike_type=m.get('strike_type', 'between'),
+                                    signal_type='high',
+                                    station=station
+                                )
+                                b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                                b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                                state.tomorrow_high_watchlist.append(b)
+                            logger.info(f"  {station} TOMORROW HIGH: {len(state.tomorrow_high_watchlist)} brackets ({tomorrow_suffix})")
+                        except Exception as e:
+                            logger.debug(f"  {station} TOMORROW HIGH: {e}")
+                    
+                    if low_ticker:
+                        try:
+                            event = f"{low_ticker}-{tomorrow_suffix}"
+                            event_data = self.kalshi.get_event(event)
+                            event_obj = event_data.get('event', event_data)
+                            for m in event_obj.get('markets', []):
+                                floor_val = m.get('floor_strike')
+                                cap_val = m.get('cap_strike')
+                                b = BracketState(
+                                    ticker=m.get('ticker', ''),
+                                    subtitle=m.get('yes_sub_title', m.get('subtitle', '')),
+                                    floor_strike=int(floor_val) if floor_val is not None else None,
+                                    cap_strike=int(cap_val) if cap_val is not None else None,
+                                    strike_type=m.get('strike_type', 'between'),
+                                    signal_type='low',
+                                    station=station
+                                )
+                                b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                                b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                                state.tomorrow_low_watchlist.append(b)
+                            logger.info(f"  {station} TOMORROW LOW: {len(state.tomorrow_low_watchlist)} brackets ({tomorrow_suffix})")
+                        except Exception as e:
+                            logger.debug(f"  {station} TOMORROW LOW: {e}")
+                else:
+                    # Refresh existing tomorrow brackets
+                    high_ticker = cfg.get('kalshi_high_ticker')
+                    if high_ticker and state.tomorrow_high_watchlist:
+                        try:
+                            event = f"{high_ticker}-{tomorrow_suffix}"
+                            event_data = self.kalshi.get_event(event)
+                            event_obj = event_data.get('event', event_data)
+                            markets = {m.get('ticker'): m for m in event_obj.get('markets', [])}
+                            for b in state.tomorrow_high_watchlist:
+                                if b.ticker in markets:
+                                    m = markets[b.ticker]
+                                    b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                                    b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                        except Exception as e:
+                            logger.error(f"  {station} TOMORROW HIGH prices: {e}")
+                    
+                    low_ticker = cfg.get('kalshi_low_ticker')
+                    if low_ticker and state.tomorrow_low_watchlist:
+                        try:
+                            event = f"{low_ticker}-{tomorrow_suffix}"
+                            event_data = self.kalshi.get_event(event)
+                            event_obj = event_data.get('event', event_data)
+                            markets = {m.get('ticker'): m for m in event_obj.get('markets', [])}
+                            for b in state.tomorrow_low_watchlist:
+                                if b.ticker in markets:
+                                    m = markets[b.ticker]
+                                    b.no_ask = self._parse_price(m.get('no_ask'), m.get('no_ask_dollars'))
+                                    b.yes_ask = self._parse_price(m.get('yes_ask'), m.get('yes_ask_dollars'))
+                        except Exception as e:
+                            logger.error(f"  {station} TOMORROW LOW prices: {e}")
         
         self.last_price_poll = datetime.now(timezone.utc)
     
@@ -1273,7 +1489,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         minute = now.minute
         is_hot = minute >= 50 or minute <= 5
         
-        total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) for st in s.states.values())
+        total_watching = sum(len(st.high_watchlist) + len(st.low_watchlist) + len(st.tomorrow_high_watchlist) + len(st.tomorrow_low_watchlist) for st in s.states.values())
         total_resolved = sum(len(st.resolved_brackets) for st in s.states.values())
         
         today_et = now_et.date()
@@ -1440,7 +1656,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
             tz_name = cfg.get('timezone', 'America/New_York')
             tz = ZoneInfo(tz_name)
             
-            watching_count = len(state.high_watchlist) + len(state.low_watchlist)
+            watching_count = len(state.high_watchlist) + len(state.low_watchlist) + len(state.tomorrow_high_watchlist) + len(state.tomorrow_low_watchlist)
             if watching_count == 0 and len(state.resolved_brackets) == 0:
                 continue
             
@@ -1601,39 +1817,85 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 else:
                     return '<span class="open">OPEN</span>'
             
-            if state.high_watchlist:
-                html += '<h4>HIGH Watchlist</h4>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike if x.floor_strike is not None else -999, reverse=True):
-                    floor_display = b.floor_strike if b.floor_strike is not None else "—"
-                    cap_display = b.cap_strike if b.cap_strike is not None else "—"
-                    status_html = get_bracket_status(b)
-                    html += f'''<tr>
-                        <td>{b.subtitle}</td>
-                        <td>{floor_display}</td>
-                        <td>{cap_display}</td>
-                        <td>{b.no_ask}&#162;</td>
-                        <td>{b.yes_ask}&#162;</td>
-                        <td>{status_html}</td>
-                    </tr>'''
-                html += '</table>'
+            # ── TODAY's brackets (with date header when tomorrow visible) ──
+            date_label = state.market_date or ''
+            has_today = state.high_watchlist or state.low_watchlist
+            has_tomorrow = state.tomorrow_high_watchlist or state.tomorrow_low_watchlist
             
-            if state.low_watchlist:
-                html += '<h4>LOW Watchlist</h4>'
-                html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
-                for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike if x.cap_strike is not None else 999):
-                    floor_display = b.floor_strike if b.floor_strike is not None else "—"
-                    cap_display = b.cap_strike if b.cap_strike is not None else "—"
-                    status_html = get_bracket_status(b)
-                    html += f'''<tr>
-                        <td>{b.subtitle}</td>
-                        <td>{floor_display}</td>
-                        <td>{cap_display}</td>
-                        <td>{b.no_ask}&#162;</td>
-                        <td>{b.yes_ask}&#162;</td>
-                        <td>{status_html}</td>
-                    </tr>'''
-                html += '</table>'
+            if has_today:
+                if has_tomorrow:
+                    html += f'<h4 style="color:#3fb950; border-bottom:1px solid #30363d; padding-bottom:4px; margin-top:12px;">&#128197; Today &mdash; {date_label}</h4>'
+                
+                if state.high_watchlist:
+                    html += '<h4>HIGH Watchlist</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                    for b in sorted(state.high_watchlist, key=lambda x: x.floor_strike if x.floor_strike is not None else -999, reverse=True):
+                        floor_display = b.floor_strike if b.floor_strike is not None else "\u2014"
+                        cap_display = b.cap_strike if b.cap_strike is not None else "\u2014"
+                        status_html = get_bracket_status(b)
+                        html += f'''<tr>
+                            <td>{b.subtitle}</td>
+                            <td>{floor_display}</td>
+                            <td>{cap_display}</td>
+                            <td>{b.no_ask}&#162;</td>
+                            <td>{b.yes_ask}&#162;</td>
+                            <td>{status_html}</td>
+                        </tr>'''
+                    html += '</table>'
+                
+                if state.low_watchlist:
+                    html += '<h4>LOW Watchlist</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                    for b in sorted(state.low_watchlist, key=lambda x: x.cap_strike if x.cap_strike is not None else 999):
+                        floor_display = b.floor_strike if b.floor_strike is not None else "\u2014"
+                        cap_display = b.cap_strike if b.cap_strike is not None else "\u2014"
+                        status_html = get_bracket_status(b)
+                        html += f'''<tr>
+                            <td>{b.subtitle}</td>
+                            <td>{floor_display}</td>
+                            <td>{cap_display}</td>
+                            <td>{b.no_ask}&#162;</td>
+                            <td>{b.yes_ask}&#162;</td>
+                            <td>{status_html}</td>
+                        </tr>'''
+                    html += '</table>'
+            
+            # ── TOMORROW's brackets (overlap window: 10 PM - midnight local) ──
+            if has_tomorrow:
+                tomorrow_label = state.tomorrow_market_date or 'Tomorrow'
+                html += f'<h4 style="color:#79c0ff; border-bottom:1px solid #30363d; padding-bottom:4px; margin-top:16px;">&#127769; Tomorrow &mdash; {tomorrow_label}</h4>'
+                
+                if state.tomorrow_high_watchlist:
+                    html += '<h4>HIGH Watchlist</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                    for b in sorted(state.tomorrow_high_watchlist, key=lambda x: x.floor_strike if x.floor_strike is not None else -999, reverse=True):
+                        floor_display = b.floor_strike if b.floor_strike is not None else "\u2014"
+                        cap_display = b.cap_strike if b.cap_strike is not None else "\u2014"
+                        html += f'''<tr>
+                            <td>{b.subtitle}</td>
+                            <td>{floor_display}</td>
+                            <td>{cap_display}</td>
+                            <td>{b.no_ask}&#162;</td>
+                            <td>{b.yes_ask}&#162;</td>
+                            <td><span class="open">OPEN</span></td>
+                        </tr>'''
+                    html += '</table>'
+                
+                if state.tomorrow_low_watchlist:
+                    html += '<h4>LOW Watchlist</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>NO Ask</th><th>YES Ask</th><th>Status</th></tr>'
+                    for b in sorted(state.tomorrow_low_watchlist, key=lambda x: x.cap_strike if x.cap_strike is not None else 999):
+                        floor_display = b.floor_strike if b.floor_strike is not None else "\u2014"
+                        cap_display = b.cap_strike if b.cap_strike is not None else "\u2014"
+                        html += f'''<tr>
+                            <td>{b.subtitle}</td>
+                            <td>{floor_display}</td>
+                            <td>{cap_display}</td>
+                            <td>{b.no_ask}&#162;</td>
+                            <td>{b.yes_ask}&#162;</td>
+                            <td><span class="open">OPEN</span></td>
+                        </tr>'''
+                    html += '</table>'
             
             high_resolved = [b for b in state.resolved_brackets if b.signal_type == 'high']
             low_resolved = [b for b in state.resolved_brackets if b.signal_type == 'low']
