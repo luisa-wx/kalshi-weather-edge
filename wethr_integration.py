@@ -404,8 +404,13 @@ class ASOSScout:
         Determine the current polling phase for a station (Section 9D).
         
         Returns: (phase: str, reason: str)
-            phase: 'DORMANT', 'DEFAULT', 'WARM-UP', 'HOT'
+            phase: 'DORMANT', 'IDLE', 'WATCHING', 'HOT'
             reason: human-readable explanation for dashboard
+            
+        Phase names describe SYSTEM BEHAVIOR, not temperature direction:
+            IDLE     = far from any window, polling every 15 min
+            WATCHING = near or inside a window, polling every 5 min
+            HOT      = close to a bracket boundary, polling every 2 min
         """
         from smart_poller import STATIONS
         cfg = STATIONS.get(station, {})
@@ -417,7 +422,7 @@ class ASOSScout:
         
         # If no forecast yet, default
         if not fc:
-            return ('DEFAULT', 'no forecast loaded')
+            return ('IDLE', 'no forecast loaded')
         
         # Check OVERRIDE: LATEST temp (not day's high) beating forecast by 2°F+
         # This catches frontal passages where the current reading is way off
@@ -428,15 +433,15 @@ class ASOSScout:
             
             # For highs: latest temp is climbing well above forecast for this hour
             if latest > forecast_now + 2:
-                return ('HOT', f'latest {latest}°F >> forecast {forecast_now}°F @{current_lst_hour}LST')
+                return ('HOT', f'latest {latest}°F >> forecast {forecast_now}°F @{current_lst_hour:02d}h')
             # For lows: latest temp is dropping well below forecast for this hour
             if latest < forecast_now - 2:
-                return ('HOT', f'latest {latest}°F << forecast {forecast_now}°F @{current_lst_hour}LST')
+                return ('HOT', f'latest {latest}°F << forecast {forecast_now}°F @{current_lst_hour:02d}h')
         
         # Check if currently inside any forecast window
         window = self.is_in_forecast_window(station)
         if window:
-            return ('WARM-UP', f'in {window.upper()} window')
+            return ('WATCHING', f'in {window.upper()} window')
         
         # Check 3-hour proximity to any window
         all_windows = (fc.high_windows or []) + (fc.low_windows or [])
@@ -456,9 +461,9 @@ class ASOSScout:
             
             dist = min(abs(hours_to_start), abs(hours_to_end))
             if dist <= 3:
-                return ('WARM-UP', f'{w.signal.upper()} window in ~{dist}hr')
+                return ('WATCHING', f'{w.signal.upper()} window in ~{dist}hr')
         
-        return ('DEFAULT', 'outside all windows')
+        return ('IDLE', 'outside all windows')
 
     def is_conflict_window(self) -> bool:
         """

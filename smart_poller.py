@@ -1486,8 +1486,8 @@ summary {{ cursor: pointer; color: #8b949e; }}
                     phase_reason = phase_result[1] if isinstance(phase_result, tuple) else ''
                     
                     phase_colors = {
-                        'DORMANT': '#8b949e', 'DEFAULT': '#8b949e',
-                        'WARM-UP': '#f0883e', 'HOT': '#f85149',
+                        'DORMANT': '#8b949e', 'IDLE': '#8b949e',
+                        'WATCHING': '#f0883e', 'HOT': '#f85149',
                     }
                     phase_color = phase_colors.get(phase, '#8b949e')
                     
