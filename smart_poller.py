@@ -1859,6 +1859,94 @@ summary {{ cursor: pointer; color: #8b949e; }}
                             <td>{status_html}</td>
                         </tr>'''
                     html += '</table>'
+                
+                # Today's resolved (always under today section)
+                high_resolved = [b for b in state.resolved_brackets if b.signal_type == 'high']
+                low_resolved = [b for b in state.resolved_brackets if b.signal_type == 'low']
+                
+                if high_resolved or low_resolved:
+                    total_resolved_count = len(high_resolved) + len(low_resolved)
+                    html += f'<details><summary>Resolved ({total_resolved_count})</summary>'
+                    
+                    if high_resolved:
+                        html += '<h4>HIGH Resolved</h4>'
+                        html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                        for b in high_resolved[-15:]:
+                            status_class = "locked" if b.status == 'locked' else "dead"
+                            if b.ticker in scout_tickers:
+                                pos = scout_tickers[b.ticker]
+                                if pos.ejected:
+                                    source = '<span class="ejected-tag">EJECTED</span>'
+                                else:
+                                    source = '<span class="scout-lock">SCOUT</span>'
+                            elif b.traded:
+                                source = '<span class="metar-lock">METAR</span>'
+                            else:
+                                source = "—"
+                            html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
+                        html += '</table>'
+                    
+                    if low_resolved:
+                        html += '<h4>LOW Resolved</h4>'
+                        html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                        for b in low_resolved[-15:]:
+                            status_class = "locked" if b.status == 'locked' else "dead"
+                            if b.ticker in scout_tickers:
+                                pos = scout_tickers[b.ticker]
+                                if pos.ejected:
+                                    source = '<span class="ejected-tag">EJECTED</span>'
+                                else:
+                                    source = '<span class="scout-lock">SCOUT</span>'
+                            elif b.traded:
+                                source = '<span class="metar-lock">METAR</span>'
+                            else:
+                                source = "—"
+                            html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
+                        html += '</table>'
+                    
+                    html += '</details>'
+            
+            elif not has_today and state.resolved_brackets:
+                # No open today brackets but have resolved — still show resolved
+                if has_tomorrow:
+                    html += f'<h4 style="color:#3fb950; border-bottom:1px solid #30363d; padding-bottom:4px; margin-top:12px;">&#128197; Today &mdash; {date_label}</h4>'
+                
+                high_resolved = [b for b in state.resolved_brackets if b.signal_type == 'high']
+                low_resolved = [b for b in state.resolved_brackets if b.signal_type == 'low']
+                total_resolved_count = len(high_resolved) + len(low_resolved)
+                html += f'<details><summary>Resolved ({total_resolved_count})</summary>'
+                
+                if high_resolved:
+                    html += '<h4>HIGH Resolved</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                    for b in high_resolved[-15:]:
+                        status_class = "locked" if b.status == 'locked' else "dead"
+                        if b.ticker in scout_tickers:
+                            pos = scout_tickers[b.ticker]
+                            source = '<span class="ejected-tag">EJECTED</span>' if pos.ejected else '<span class="scout-lock">SCOUT</span>'
+                        elif b.traded:
+                            source = '<span class="metar-lock">METAR</span>'
+                        else:
+                            source = "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
+                    html += '</table>'
+                
+                if low_resolved:
+                    html += '<h4>LOW Resolved</h4>'
+                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                    for b in low_resolved[-15:]:
+                        status_class = "locked" if b.status == 'locked' else "dead"
+                        if b.ticker in scout_tickers:
+                            pos = scout_tickers[b.ticker]
+                            source = '<span class="ejected-tag">EJECTED</span>' if pos.ejected else '<span class="scout-lock">SCOUT</span>'
+                        elif b.traded:
+                            source = '<span class="metar-lock">METAR</span>'
+                        else:
+                            source = "—"
+                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
+                    html += '</table>'
+                
+                html += '</details>'
             
             # ── TOMORROW's brackets (overlap window: 10 PM - midnight local) ──
             if has_tomorrow:
@@ -1896,53 +1984,32 @@ summary {{ cursor: pointer; color: #8b949e; }}
                             <td><span class="open">OPEN</span></td>
                         </tr>'''
                     html += '</table>'
-            
-            high_resolved = [b for b in state.resolved_brackets if b.signal_type == 'high']
-            low_resolved = [b for b in state.resolved_brackets if b.signal_type == 'low']
-            
-            if high_resolved or low_resolved:
-                total_resolved_count = len(high_resolved) + len(low_resolved)
-                html += f'<details><summary>Resolved ({total_resolved_count})</summary>'
                 
-                if high_resolved:
-                    html += '<h4>HIGH Resolved</h4>'
-                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
-                    for b in high_resolved[-15:]:
-                        status_class = "locked" if b.status == 'locked' else "dead"
-                        # Check if this was a Scout trade
-                        if b.ticker in scout_tickers:
-                            pos = scout_tickers[b.ticker]
-                            if pos.ejected:
-                                source = '<span class="ejected-tag">EJECTED</span>'
-                            else:
-                                source = '<span class="scout-lock">SCOUT</span>'
-                        elif b.traded:
-                            source = '<span class="metar-lock">METAR</span>'
-                        else:
-                            source = "—"
-                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
-                    html += '</table>'
+                # Tomorrow's resolved (if any have been resolved during overlap)
+                tomorrow_high_resolved = [b for b in state.tomorrow_resolved_brackets if b.signal_type == 'high']
+                tomorrow_low_resolved = [b for b in state.tomorrow_resolved_brackets if b.signal_type == 'low']
                 
-                if low_resolved:
-                    html += '<h4>LOW Resolved</h4>'
-                    html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
-                    for b in low_resolved[-15:]:
-                        status_class = "locked" if b.status == 'locked' else "dead"
-                        # Check if this was a Scout trade
-                        if b.ticker in scout_tickers:
-                            pos = scout_tickers[b.ticker]
-                            if pos.ejected:
-                                source = '<span class="ejected-tag">EJECTED</span>'
-                            else:
-                                source = '<span class="scout-lock">SCOUT</span>'
-                        elif b.traded:
-                            source = '<span class="metar-lock">METAR</span>'
-                        else:
-                            source = "—"
-                        html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>{source}</td></tr>'
-                    html += '</table>'
-                
-                html += '</details>'
+                if tomorrow_high_resolved or tomorrow_low_resolved:
+                    tmrw_resolved_count = len(tomorrow_high_resolved) + len(tomorrow_low_resolved)
+                    html += f'<details><summary>Resolved ({tmrw_resolved_count})</summary>'
+                    
+                    if tomorrow_high_resolved:
+                        html += '<h4>HIGH Resolved</h4>'
+                        html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                        for b in tomorrow_high_resolved[-15:]:
+                            status_class = "locked" if b.status == 'locked' else "dead"
+                            html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>—</td></tr>'
+                        html += '</table>'
+                    
+                    if tomorrow_low_resolved:
+                        html += '<h4>LOW Resolved</h4>'
+                        html += '<table><tr><th>Bracket</th><th>Resolution</th><th>Source</th></tr>'
+                        for b in tomorrow_low_resolved[-15:]:
+                            status_class = "locked" if b.status == 'locked' else "dead"
+                            html += f'<tr class="resolved-row"><td>{b.subtitle}</td><td class="{status_class}">{b.status.upper()}</td><td>—</td></tr>'
+                        html += '</table>'
+                    
+                    html += '</details>'
         
         html += "</body></html>"
         return html
