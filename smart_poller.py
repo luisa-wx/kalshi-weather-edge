@@ -29,7 +29,7 @@ import signal
 import logging
 import threading
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
@@ -65,72 +65,84 @@ STATIONS = {
         "kalshi_high_ticker": "KXHIGHNY",
         "kalshi_low_ticker": "KXLOWTNYC",
         "timezone": "America/New_York",
+        "tz_offset": -5,  # EST (LST, no DST)
         "name": "NYC"
     },
     "KPHL": {
         "kalshi_high_ticker": "KXHIGHPHIL",
         "kalshi_low_ticker": "KXLOWTPHIL",
         "timezone": "America/New_York",
+        "tz_offset": -5,
         "name": "Philadelphia"
     },
     "KMDW": {
         "kalshi_high_ticker": "KXHIGHCHI",
         "kalshi_low_ticker": "KXLOWTCHI",
         "timezone": "America/Chicago",
+        "tz_offset": -6,  # CST (LST, no DST)
         "name": "Chicago"
     },
     "KLAX": {
         "kalshi_high_ticker": "KXHIGHLAX",
         "kalshi_low_ticker": "KXLOWTLAX",
         "timezone": "America/Los_Angeles",
+        "tz_offset": -8,  # PST (LST, no DST)
         "name": "Los Angeles"
     },
     "KMIA": {
         "kalshi_high_ticker": "KXHIGHMIA",
         "kalshi_low_ticker": "KXLOWTMIA",
         "timezone": "America/New_York",
+        "tz_offset": -5,
         "name": "Miami"
     },
     "KAUS": {
         "kalshi_high_ticker": "KXHIGHAUS",
         "kalshi_low_ticker": "KXLOWTAUS",
         "timezone": "America/Chicago",
+        "tz_offset": -6,
         "name": "Austin"
     },
     "KSFO": {
         "kalshi_high_ticker": "KXHIGHTSFO",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
+        "tz_offset": -8,
         "name": "San Francisco"
     },
     "KSEA": {
         "kalshi_high_ticker": "KXHIGHTSEA",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
+        "tz_offset": -8,
         "name": "Seattle"
     },
     "KDCA": {
         "kalshi_high_ticker": "KXHIGHTDC",
         "kalshi_low_ticker": None,
         "timezone": "America/New_York",
+        "tz_offset": -5,
         "name": "Washington DC"
     },
     "KMSY": {
         "kalshi_high_ticker": "KXHIGHTNOLA",
         "kalshi_low_ticker": None,
         "timezone": "America/Chicago",
+        "tz_offset": -6,
         "name": "New Orleans"
     },
     "KLAS": {
         "kalshi_high_ticker": "KXHIGHTLV",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
+        "tz_offset": -8,
         "name": "Las Vegas"
     },
     "KDEN": {
         "kalshi_high_ticker": "KXHIGHDEN",
         "kalshi_low_ticker": "KXLOWTDEN",
         "timezone": "America/Denver",
+        "tz_offset": -7,  # MST (LST, no DST)
         "name": "Denver"
     }
 }
@@ -503,10 +515,6 @@ class WXSniper:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
         
-        # Pre-compute date suffix
-        self._today_suffix = None
-        self._today_suffix_date = None
-        
         # Initialize ASOS Scout (wethr.net integration)
         self.scout = None
         try:
@@ -521,16 +529,47 @@ class WXSniper:
         log_event('shutdown', signal=signum)
         self.running = False
     
-    def _get_today_suffix(self) -> str:
-        """Get cached date suffix (avoids repeated datetime formatting)."""
-        today = datetime.now(timezone.utc).date()
-        if self._today_suffix_date != today:
-            self._today_suffix = datetime.now(timezone.utc).strftime('%y%b%d').upper()
-            self._today_suffix_date = today
-        return self._today_suffix
+    def _get_today_suffix(self, station: str = None) -> str:
+        """
+        Get Kalshi event date suffix for the station's LOCAL STANDARD TIME date.
+        
+        CRITICAL: Kalshi events and NWS CLI both use Local Standard Time (LST),
+        NOT civil time (which includes DST). Per reference doc Section 14 Note 6:
+        "Local Standard Time everywhere — NWS climate reporting and Kalshi 
+        settlement both use LST year-round."
+        
+        Using UTC would fetch tomorrow's event after 7 PM EST (bug found 2026-02-01).
+        Using ZoneInfo would be wrong during DST: midnight-1AM civil time maps to 
+        the previous LST date. We use fixed UTC offsets from STATIONS config instead.
+        
+        Example: At 8:42 PM EST on Feb 1, UTC is Feb 2, but we need 26FEB01.
+        """
+        if station:
+            cfg = STATIONS.get(station, {})
+            # Use fixed UTC offset for LST (no DST adjustment)
+            # tz_offset is hours from UTC: EST=-5, CST=-6, MST=-7, PST=-8
+            tz_offset_hours = cfg.get('tz_offset')
+            if tz_offset_hours is not None:
+                lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
+                return lst_now.strftime('%y%b%d').upper()
+            else:
+                # Fallback to ZoneInfo if no fixed offset configured
+                tz_name = cfg.get('timezone', 'America/New_York')
+                tz = ZoneInfo(tz_name)
+                local_now = datetime.now(tz)
+                return local_now.strftime('%y%b%d').upper()
+        else:
+            # Fallback for any non-station context: use UTC
+            return datetime.now(timezone.utc).strftime('%y%b%d').upper()
     
     def get_local_date(self, station: str) -> str:
-        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
+        """Get current date in station's Local Standard Time."""
+        cfg = STATIONS.get(station, {})
+        tz_offset_hours = cfg.get('tz_offset')
+        if tz_offset_hours is not None:
+            lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
+            return lst_now.strftime('%Y-%m-%d')
+        tz_name = cfg.get('timezone', 'America/New_York')
         return datetime.now(ZoneInfo(tz_name)).strftime('%Y-%m-%d')
     
     def _warm_connections(self):
@@ -561,12 +600,14 @@ class WXSniper:
     def init_watchlists(self):
         """Initialize watchlists with all brackets from Kalshi."""
         logger.info("[INIT] Building watchlists...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
             high_ticker = cfg.get('kalshi_high_ticker')
             low_ticker = cfg.get('kalshi_low_ticker')
+            today_suffix = self._get_today_suffix(station)
+            
+            logger.info(f"  [{station}] Using event suffix: {today_suffix}")
             
             state.high_watchlist = []
             state.low_watchlist = []
@@ -778,19 +819,28 @@ class WXSniper:
     
     def check_date_rollover(self):
         """
-        Check if any station's local date has changed and reinitialize if needed.
-        Uses ZoneInfo which handles DST automatically.
-        Called at the start of each main loop iteration.
+        Check if any station's LOCAL STANDARD TIME date has changed and reinitialize.
+        
+        Uses fixed UTC offset (tz_offset) to compute LST date, NOT ZoneInfo.
+        Per reference doc Section 14 Note 6: "Local Standard Time everywhere."
+        
+        During DST, ZoneInfo would trigger rollover 1 hour early (at midnight EDT
+        instead of midnight EST). Using fixed offset avoids this.
         """
         any_rollover = False
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
-            tz_name = cfg.get('timezone', 'America/New_York')
+            tz_offset_hours = cfg.get('tz_offset')
             
-            # ZoneInfo handles DST automatically - no manual adjustment needed
-            tz = ZoneInfo(tz_name)
-            current_date = datetime.now(tz).strftime('%Y-%m-%d')
+            if tz_offset_hours is not None:
+                lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
+                current_date = lst_now.strftime('%Y-%m-%d')
+            else:
+                # Fallback to ZoneInfo if no fixed offset
+                tz_name = cfg.get('timezone', 'America/New_York')
+                tz = ZoneInfo(tz_name)
+                current_date = datetime.now(tz).strftime('%Y-%m-%d')
             
             if state.current_local_date is not None and state.current_local_date != current_date:
                 logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
@@ -1130,10 +1180,10 @@ class WXSniper:
     def refresh_prices(self):
         """Refresh prices for watched brackets."""
         logger.info("[PRICES] Refreshing...")
-        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
+            today_suffix = self._get_today_suffix(station)
             
             if state.high_watchlist:
                 high_ticker = cfg.get('kalshi_high_ticker')
