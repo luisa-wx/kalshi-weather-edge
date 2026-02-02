@@ -881,8 +881,8 @@ class StreamingCall:
                     self.transcript_window += " " + transcript_chunk
                     self.transcript_window = self.transcript_window.strip()
                     
-                    logger.debug(f"[DG:final] chunk={transcript_chunk!r}")
-                    logger.debug(f"[DG:final] window={self.transcript_window!r}")
+                    logger.info(f"[DG:final] chunk={transcript_chunk!r}")
+                    logger.info(f"[DG:final] window={self.transcript_window!r}")
 
                     temp_c, temp_f = parse_temperature(self.transcript_window)
                     if temp_c is not None:
@@ -908,7 +908,7 @@ class StreamingCall:
                     # The final result will have the correct full number.
                     combined = self.transcript_window + " " + transcript_chunk
                     
-                    logger.debug(f"[DG:interim] chunk={transcript_chunk!r}")
+                    logger.info(f"[DG:interim] chunk={transcript_chunk!r}")
                     
                     temp_c, temp_f = parse_temperature(combined)
                     if temp_c is not None:
