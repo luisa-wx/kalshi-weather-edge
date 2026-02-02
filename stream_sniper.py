@@ -880,6 +880,9 @@ class StreamingCall:
                 if is_final:
                     self.transcript_window += " " + transcript_chunk
                     self.transcript_window = self.transcript_window.strip()
+                    
+                    logger.debug(f"[DG:final] chunk={transcript_chunk!r}")
+                    logger.debug(f"[DG:final] window={self.transcript_window!r}")
 
                     temp_c, temp_f = parse_temperature(self.transcript_window)
                     if temp_c is not None:
@@ -896,17 +899,23 @@ class StreamingCall:
                         self.transcript_window = self.transcript_window[-200:]
 
                 else:
-                    # Interim results — faster detection
+                    # Interim results — early detection LOGGING ONLY
+                    # DO NOT enqueue or clear window on interim matches.
+                    # Deepgram interim transcripts can contain grammatically valid 
+                    # but numerically incomplete speech, e.g. "temperature 1 degree" 
+                    # on its way to "temperature 10 degrees celsius". If we act on 
+                    # these, we get phantom readings (1°C instead of 10°C).
+                    # The final result will have the correct full number.
                     combined = self.transcript_window + " " + transcript_chunk
+                    
+                    logger.debug(f"[DG:interim] chunk={transcript_chunk!r}")
+                    
                     temp_c, temp_f = parse_temperature(combined)
                     if temp_c is not None:
                         zulu = parse_zulu_time(combined)
-                        self.total_parses += 1
                         elapsed = time.time() - self.call_start
-                        logger.info(f"[STREAM] 🎯 #{self.total_parses} (interim, {elapsed:.0f}s): "
-                                   f"{temp_c}°C → {temp_f}°F | {zulu or '????Z'}")
-                        await parse_queue.put((temp_c, zulu))
-                        self.transcript_window = ""
+                        logger.info(f"[STREAM] 👁️ interim: {temp_c}°C → {temp_f}°F | "
+                                   f"{zulu or '????Z'} (NOT acted on — waiting for final)")
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("[STREAM] Deepgram WebSocket closed")
