@@ -28,6 +28,8 @@ import os
 import time
 import logging
 import requests
+import subprocess
+import signal as _signal
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional, List, Any
@@ -77,6 +79,26 @@ PHONE_STATIONS = {
     'KLAS': '+17025297334',
     'KSEA': '+12062142592',
 }
+
+# ── Phase 5: Phone Deployment ──
+# Per-station WebSocket port for Twilio → stream_sniper communication
+SNIPER_WS_PORTS = {
+    'KPHL': 8766,
+    'KAUS': 8767,
+    'KLAS': 8768,
+    'KSEA': 8769,
+}
+
+# WS URL base — Twilio calls back to this address
+# Set via env var; falls back to server's public IP with nip.io for TLS
+SNIPER_WS_BASE = os.environ.get('SNIPER_WS_BASE', 'wss://54-91-7-11.nip.io')
+
+# Deployment behavior
+SNIPER_LINGER_GAP_F = 3         # Stay on line if next bracket within this gap
+SNIPER_COOLDOWN_SECONDS = 180   # Don't re-deploy within 3 min of hangup
+SNIPER_MAX_RUNTIME_MIN = 60     # Max call session length (safety cap)
+SNIPER_BID_PRICE = 99           # Phone sniper bids 99¢ (high-confidence kills)
+SNIPER_TRADE_QTY = int(os.environ.get('SNIPER_TRADE_QTY', '1'))
 
 logger = logging.getLogger('wx-sniper.scout')
 
@@ -190,6 +212,14 @@ class ASOSScout:
         # Q2 results per station for dashboard display
         # Key: station, Value: dict with gap info
         self.q2_results: Dict[str, Dict] = {}
+        
+        # ── Phase 5: Phone Deployment State ──
+        # Active sniper subprocesses: station -> SniperProcess info
+        self.active_snipers: Dict[str, Dict] = {}
+        # Trade events detected from sniper log files
+        self.sniper_trades: List[Dict] = []
+        # Cooldown: don't re-deploy within N seconds of hangup
+        self.sniper_cooldown: Dict[str, datetime] = {}
         
         logger.info("[SCOUT] ASOS Scout initialized")
         logger.info(f"[SCOUT] Trade quantity: {TRADE_QUANTITY}")
@@ -1094,6 +1124,318 @@ class ASOSScout:
         
         return results
     
+    # ================================================================
+    # PHASE 5: PHONE DEPLOYMENT ORCHESTRATOR
+    # ================================================================
+    
+    def _is_phone_station(self, station: str) -> bool:
+        """Check if station is phone-enabled."""
+        return station in PHONE_STATIONS and station in SNIPER_WS_PORTS
+    
+    def _sniper_is_active(self, station: str) -> bool:
+        """Check if a sniper subprocess is running for this station."""
+        info = self.active_snipers.get(station)
+        if not info:
+            return False
+        proc = info.get('process')
+        if proc is None:
+            return False
+        # poll() returns None if still running, returncode if exited
+        return proc.poll() is None
+    
+    def _in_cooldown(self, station: str) -> bool:
+        """Check if station is in post-hangup cooldown."""
+        cd = self.sniper_cooldown.get(station)
+        if not cd:
+            return False
+        elapsed = (datetime.now(timezone.utc) - cd).total_seconds()
+        return elapsed < SNIPER_COOLDOWN_SECONDS
+    
+    def deploy_sniper(self, station: str, signal_type: str = 'both'):
+        """
+        Launch stream_sniper.py as a subprocess for a phone-enabled station.
+        
+        Called when evaluate_deployment() returns DEPLOY and no sniper is active.
+        
+        Args:
+            station: ICAO code (must be in PHONE_STATIONS)
+            signal_type: 'high', 'low', or 'both'
+        """
+        if not self._is_phone_station(station):
+            return
+        
+        if self._sniper_is_active(station):
+            logger.debug(f"[PHONE] {station} sniper already active, skipping deploy")
+            return
+        
+        if self._in_cooldown(station):
+            logger.debug(f"[PHONE] {station} in cooldown, skipping deploy")
+            return
+        
+        port = SNIPER_WS_PORTS[station]
+        ws_url = f"{SNIPER_WS_BASE}:{port}/stream"
+        
+        cmd = [
+            'python3', 'stream_sniper.py',
+            '--station', station,
+            '--ws-url', ws_url,
+            '--signal', signal_type,
+            '--port', str(port),
+            '--bid', str(SNIPER_BID_PRICE),
+            '--qty', str(SNIPER_TRADE_QTY),
+            '--run-minutes', str(SNIPER_MAX_RUNTIME_MIN),
+        ]
+        
+        # Add --live if the main sniper is in live mode
+        if self.sniper.live_mode:
+            cmd.append('--live')
+        
+        try:
+            log_file = f'/tmp/{station.lower()}_phone_deploy.log'
+            log_fh = open(log_file, 'a')
+            
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                # Don't let child die when parent gets signals
+                preexec_fn=os.setpgrp,
+            )
+            
+            self.active_snipers[station] = {
+                'process': proc,
+                'pid': proc.pid,
+                'signal_type': signal_type,
+                'started_at': datetime.now(timezone.utc),
+                'log_file': log_file,
+                'log_fh': log_fh,
+                'trade_count': 0,
+                'last_trade_check': 0,
+            }
+            
+            logger.warning(f"[PHONE] 📞 DEPLOYED {station} sniper (pid={proc.pid}, "
+                         f"signal={signal_type}, port={port}, ws={ws_url})")
+            
+        except Exception as e:
+            logger.error(f"[PHONE] {station} deploy FAILED: {e}")
+    
+    def hangup_sniper(self, station: str, reason: str = 'gap too wide'):
+        """
+        Terminate a running sniper subprocess.
+        
+        Called when:
+        - Deployment evaluation goes from DEPLOY to WAIT
+        - Gap to next bracket grows past linger threshold
+        - All brackets resolved
+        - Safety timeout
+        """
+        info = self.active_snipers.get(station)
+        if not info:
+            return
+        
+        proc = info.get('process')
+        if proc is None:
+            return
+        
+        pid = proc.pid
+        
+        try:
+            # Graceful: SIGTERM first
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't stop
+                proc.kill()
+                proc.wait(timeout=3)
+        except Exception as e:
+            logger.error(f"[PHONE] {station} hangup error: {e}")
+        
+        # Close log file handle
+        log_fh = info.get('log_fh')
+        if log_fh:
+            try:
+                log_fh.close()
+            except:
+                pass
+        
+        duration_s = (datetime.now(timezone.utc) - info['started_at']).total_seconds()
+        duration_min = duration_s / 60
+        est_cost = (info.get('trade_count', 0) * 0.02) + (duration_min * 0.011)
+        
+        logger.warning(f"[PHONE] 📴 HANGUP {station} (pid={pid}, reason={reason}, "
+                      f"duration={duration_min:.1f}min, ~${est_cost:.2f})")
+        
+        # Set cooldown
+        self.sniper_cooldown[station] = datetime.now(timezone.utc)
+        
+        # Clean up
+        del self.active_snipers[station]
+    
+    def check_sniper_health(self):
+        """
+        Check all active snipers — detect crashes, read trade logs.
+        
+        Called on every poll cycle.
+        """
+        dead_stations = []
+        
+        for station, info in self.active_snipers.items():
+            proc = info.get('process')
+            if proc is None:
+                dead_stations.append(station)
+                continue
+            
+            # Check if process has exited
+            retcode = proc.poll()
+            if retcode is not None:
+                duration_s = (datetime.now(timezone.utc) - info['started_at']).total_seconds()
+                if retcode == 0:
+                    logger.info(f"[PHONE] {station} sniper exited normally "
+                              f"(duration={duration_s/60:.1f}min)")
+                else:
+                    logger.warning(f"[PHONE] {station} sniper exited with code {retcode} "
+                                 f"(duration={duration_s/60:.1f}min)")
+                dead_stations.append(station)
+                continue
+            
+            # Read trade log for new trades
+            self._check_sniper_trades(station, info)
+        
+        # Clean up dead snipers
+        for station in dead_stations:
+            info = self.active_snipers.get(station)
+            if info:
+                log_fh = info.get('log_fh')
+                if log_fh:
+                    try:
+                        log_fh.close()
+                    except:
+                        pass
+                self.sniper_cooldown[station] = datetime.now(timezone.utc)
+                del self.active_snipers[station]
+    
+    def _check_sniper_trades(self, station: str, info: Dict):
+        """Check the sniper's CSV log for new trade events."""
+        csv_file = f'/tmp/{station.lower()}_stream_sniper.csv'
+        try:
+            if not os.path.exists(csv_file):
+                return
+            
+            # Only re-read if file has been modified
+            mtime = os.path.getmtime(csv_file)
+            if mtime <= info.get('last_trade_check', 0):
+                return
+            info['last_trade_check'] = mtime
+            
+            # Read last few lines looking for trades
+            with open(csv_file, 'r') as f:
+                lines = f.readlines()
+            
+            for line in lines[-20:]:
+                # CSV format: timestamp,zulu,temp_c,candidates,changed,trade,error
+                parts = line.strip().split(',')
+                if len(parts) >= 6 and parts[5] and parts[5] != 'trade':
+                    trade_str = parts[5]
+                    # Avoid double-counting — check if we've already seen this
+                    trade_key = f"{station}:{parts[0]}:{trade_str}"
+                    already_seen = any(t.get('key') == trade_key for t in self.sniper_trades)
+                    if not already_seen:
+                        self.sniper_trades.append({
+                            'key': trade_key,
+                            'station': station,
+                            'time': parts[0],
+                            'trade': trade_str,
+                            'source': 'phone',
+                        })
+                        info['trade_count'] = info.get('trade_count', 0) + 1
+                        logger.warning(f"[PHONE] 🎯 {station} TRADE: {trade_str}")
+        except Exception as e:
+            logger.debug(f"[PHONE] {station} trade log read error: {e}")
+    
+    def evaluate_and_deploy(self, station: str):
+        """
+        Master Phase 5 decision: deploy, linger, or hangup.
+        
+        Called after evaluate_deployment() on every poll cycle for phone stations.
+        
+        Decision tree:
+        1. If DEPLOY signal AND no active sniper AND not in cooldown → deploy
+        2. If active sniper AND WAIT signal AND gap > linger threshold → hangup
+        3. If active sniper AND DEPLOY signal → linger (keep running)
+        4. If active sniper AND all brackets resolved → hangup
+        """
+        if not self._is_phone_station(station):
+            return
+        
+        deployment = self.q2_results.get(station, {}).get('deployment', {})
+        gap_info = self.q2_results.get(station, {}).get('gap_info', {})
+        
+        # Determine if either HIGH or LOW says DEPLOY
+        high_deploy = deployment.get('high', {}).get('signal') == 'DEPLOY'
+        low_deploy = deployment.get('low', {}).get('signal') == 'DEPLOY'
+        any_deploy = high_deploy or low_deploy
+        
+        # Determine the signal type for deployment
+        if high_deploy and low_deploy:
+            deploy_signal = 'both'
+        elif high_deploy:
+            deploy_signal = 'high'
+        elif low_deploy:
+            deploy_signal = 'low'
+        else:
+            deploy_signal = None
+        
+        sniper_active = self._sniper_is_active(station)
+        
+        if sniper_active:
+            # ── Sniper is running — should we linger or hangup? ──
+            
+            # Check if all brackets are resolved
+            state = self.sniper.states.get(station)
+            if state:
+                all_high_resolved = not state.high_watchlist or all(
+                    b.status != 'open' for b in state.high_watchlist)
+                all_low_resolved = not state.low_watchlist or all(
+                    b.status != 'open' for b in state.low_watchlist)
+                if all_high_resolved and all_low_resolved:
+                    self.hangup_sniper(station, 'all brackets resolved')
+                    return
+            
+            # Check linger gap
+            h_gap = gap_info.get('high_gap')
+            l_gap = gap_info.get('low_gap')
+            
+            # If we have gap data, check if we're still close enough to linger
+            nearest_gap = None
+            if h_gap is not None and l_gap is not None:
+                nearest_gap = min(h_gap, l_gap)
+            elif h_gap is not None:
+                nearest_gap = h_gap
+            elif l_gap is not None:
+                nearest_gap = l_gap
+            
+            if nearest_gap is not None and nearest_gap > SNIPER_LINGER_GAP_F and not any_deploy:
+                self.hangup_sniper(station, f'gap={nearest_gap}°F > linger threshold, WAIT')
+                return
+            
+            # Check safety timeout
+            info = self.active_snipers.get(station, {})
+            started_at = info.get('started_at')
+            if started_at:
+                runtime = (datetime.now(timezone.utc) - started_at).total_seconds()
+                if runtime > SNIPER_MAX_RUNTIME_MIN * 60:
+                    self.hangup_sniper(station, f'safety timeout ({SNIPER_MAX_RUNTIME_MIN}min)')
+                    return
+            
+            # Otherwise: linger (keep running)
+            
+        else:
+            # ── No sniper running — should we deploy? ──
+            if any_deploy:
+                self.deploy_sniper(station, deploy_signal)
+    
     def parse_observation_time(self, time_str: str) -> Optional[datetime]:
         """Parse wethr.net observation_time string to datetime."""
         try:
@@ -1568,9 +1910,17 @@ class ASOSScout:
                 
                 # ── Q1-Q4 full deployment evaluation ──
                 self.evaluate_deployment(station)
+                
+                # ── Phase 5: Phone deployment decision ──
+                self.evaluate_and_deploy(station)
+        
+        # ── Phase 5: Check health of all active snipers ──
+        self.check_sniper_health()
         
         if active_stations > 0 or skipped_cadence > 0:
-            logger.info(f"[SCOUT] Polled {active_stations} stations, {skipped_cadence} skipped (cadence) | Positions: {len(self.positions)}")
+            n_snipers = sum(1 for s in self.active_snipers if self._sniper_is_active(s))
+            sniper_str = f" | 📞 {n_snipers} active" if n_snipers > 0 else ""
+            logger.info(f"[SCOUT] Polled {active_stations} stations, {skipped_cadence} skipped (cadence) | Positions: {len(self.positions)}{sniper_str}")
 
 
 # ============================================================

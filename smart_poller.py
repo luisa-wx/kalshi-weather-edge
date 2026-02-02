@@ -1582,6 +1582,7 @@ summary {{ cursor: pointer; color: #8b949e; }}
     <div class="stat"><div class="stat-value">{total_resolved}</div><div class="stat-label">Resolved</div></div>
     <div class="stat"><div class="stat-value">{len(todays_snipes)}</div><div class="stat-label">METAR Trades</div></div>
     <div class="stat"><div class="stat-value">{len(scout_positions)}</div><div class="stat-label">Scout Trades</div></div>
+    <div class="stat"><div class="stat-value">{sum(1 for st in (s.scout.active_snipers or {}) if s.scout and s.scout._sniper_is_active(st)) if s.scout else 0}</div><div class="stat-label">📞 Active</div></div>
 </div>
 
 <p class="time">
@@ -1894,6 +1895,22 @@ summary {{ cursor: pointer; color: #8b949e; }}
                         html += f'<br/><span style="color:{sig_color};">{sig_icon}</span> '
                         html += f'{sig_html} &nbsp; '
                         html += ' '.join(q_parts)
+                
+                # ── Phase 5: Phone status indicator ──
+                if s.scout and station in (s.scout.active_snipers or {}):
+                    sniper_info = s.scout.active_snipers[station]
+                    if s.scout._sniper_is_active(station):
+                        started = sniper_info.get('started_at')
+                        if started:
+                            duration_s = (datetime.now(timezone.utc) - started).total_seconds()
+                            duration_m = int(duration_s // 60)
+                            duration_sec = int(duration_s % 60)
+                        else:
+                            duration_m, duration_sec = 0, 0
+                        trades = sniper_info.get('trade_count', 0)
+                        sig_type = sniper_info.get('signal_type', '?')
+                        html += f'<br/><span style="color:#3fb950; font-size:13px;">📞 ON CALL</span>'
+                        html += f' <span style="color:#8b949e; font-size:11px;">{duration_m}:{duration_sec:02d} | signal={sig_type} | trades={trades}</span>'
                 
                 html += f'</div>'
             
