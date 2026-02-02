@@ -716,6 +716,10 @@ async def ws_handler(websocket):
 
     await active_call.handle_twilio_ws(websocket)
 
+    # Stream ended — push sentinel so inner loop knows immediately
+    if parse_queue:
+        await parse_queue.put(('__STREAM_ENDED__', None))
+
 
 # ─── Main loop ────────────────────────────────────────────────
 
@@ -825,6 +829,8 @@ async def main_loop(args, station_cfg):
             continue
 
         # ── Inner loop: consume parsed readings while call is alive ──
+        last_parse_time = 0  # Cooldown to prevent interim+final double-fire
+
         while should_run(args, tz_offset, start_time):
 
             # Refresh brackets every 10 minutes
@@ -858,10 +864,21 @@ async def main_loop(args, station_cfg):
                     logger.warning("   📴 Call status check failed — will redial")
                     break
 
+            # Stream ended sentinel
+            if temp_c == '__STREAM_ENDED__':
+                logger.info("   📴 Stream ended — will redial")
+                break
+
             ts = datetime.now(timezone.utc).isoformat()
             state.parse_count += 1
 
-            # Deduplicate ASOS loop repeats
+            # Cooldown: skip if same temp parsed within 5 seconds (interim+final double-fire)
+            now = time.time()
+            if (now - last_parse_time) < 5 and state.last_temp_c == temp_c:
+                continue
+            last_parse_time = now
+
+            # Deduplicate ASOS loop repeats (same zulu + same temp)
             if state.is_duplicate(temp_c, zulu):
                 logger.info(f"   🔄 Same reading ({temp_c}°C {zulu}) — skipping")
                 continue
