@@ -1474,71 +1474,98 @@ summary {{ cursor: pointer; color: #8b949e; }}
             </div>'''
             
             # ── Section 9: Forecast + Orchestrator Display ──
-            if s.scout and station in ('KPHL', 'KAUS', 'KLAS', 'KSEA'):
+            # Show forecast card for phone stations (full), all others (light)
+            if s.scout:
                 fc_today = s.scout.get_forecast_for_station(station, 'today')
                 fc_tomorrow = s.scout.get_forecast_for_station(station, 'tomorrow')
-                phase = s.scout.get_current_phase(station)
-                window = s.scout.is_in_forecast_window(station)
+                is_phone_station = station in ('KPHL', 'KAUS', 'KLAS', 'KSEA')
                 
-                phase_colors = {
-                    'DORMANT': '#8b949e', 'DEFAULT': '#8b949e',
-                    'WARM-UP': '#f0883e', 'HOT': '#f85149',
-                }
-                phase_color = phase_colors.get(phase, '#8b949e')
-                window_str = window.upper() if window else 'NONE'
-                
-                html += f'<div class="metar-info" style="border-left: 3px solid {phase_color}; margin-top:4px;">'
-                html += f'<strong style="color:{phase_color};">📡 Phase: {phase}</strong>'
-                html += f' &nbsp;|&nbsp; Window: <strong>{window_str}</strong>'
-                
-                if fc_today:
-                    h_str = f"{fc_today.forecast_high}°F" if fc_today.forecast_high is not None else "?"
-                    l_str = f"{fc_today.forecast_low}°F" if fc_today.forecast_low is not None else "?"
+                if fc_today or fc_tomorrow:
+                    phase_result = s.scout.get_current_phase(station)
+                    phase = phase_result[0] if isinstance(phase_result, tuple) else phase_result
+                    phase_reason = phase_result[1] if isinstance(phase_result, tuple) else ''
                     
-                    # Find peak hours for display
-                    h_peaks = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_today.high_windows) or '?'
-                    l_troughs = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_today.low_windows) or '?'
+                    phase_colors = {
+                        'DORMANT': '#8b949e', 'DEFAULT': '#8b949e',
+                        'WARM-UP': '#f0883e', 'HOT': '#f85149',
+                    }
+                    phase_color = phase_colors.get(phase, '#8b949e')
                     
-                    age_str = f"{fc_today.age_minutes:.0f}m ago"
-                    stale_warn = ' ⚠️' if fc_today.is_stale else ''
+                    html += f'<div style="background:#161b22; border-left:3px solid {phase_color}; padding:8px 12px; border-radius:4px; margin:6px 0; font-size:13px; line-height:1.6;">'
                     
-                    html += f' &nbsp;|&nbsp; <strong>TODAY</strong> v{fc_today.version} ({age_str}{stale_warn}): '
-                    html += f'H={h_str} @{h_peaks}LST, L={l_str} @{l_troughs}LST'
-                else:
-                    html += ' &nbsp;|&nbsp; <strong>TODAY</strong>: <em>no forecast</em>'
-                
-                if fc_tomorrow:
-                    h_str = f"{fc_tomorrow.forecast_high}°F" if fc_tomorrow.forecast_high is not None else "?"
-                    l_str = f"{fc_tomorrow.forecast_low}°F" if fc_tomorrow.forecast_low is not None else "?"
-                    h_peaks = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_tomorrow.high_windows) or '?'
-                    l_troughs = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_tomorrow.low_windows) or '?'
-                    age_str = f"{fc_tomorrow.age_minutes:.0f}m ago"
+                    # ── Row 1: Phase + reason ──
+                    html += f'<span style="color:{phase_color}; font-weight:bold; font-size:14px;">{phase}</span>'
+                    if phase_reason:
+                        html += f' <span style="color:#8b949e;">— {phase_reason}</span>'
                     
-                    html += f'<br/><strong style="color:#79c0ff;">🌙 TOMORROW</strong> v{fc_tomorrow.version} ({age_str}): '
-                    html += f'H={h_str} @{h_peaks}LST, L={l_str} @{l_troughs}LST'
-                
-                # Show hourly temps sparkline for today
-                if fc_today and fc_today.hourly_temps:
-                    temps = fc_today.hourly_temps
-                    valid = [t for t in temps if t is not None]
-                    if valid:
-                        t_min, t_max = min(valid), max(valid)
-                        t_range = max(t_max - t_min, 1)
-                        bars = []
-                        for i, t in enumerate(temps):
-                            if t is None:
-                                bars.append(f'<span style="display:inline-block;width:8px;height:20px;background:#21262d;margin:0 1px;" title="hr {i}: null"></span>')
-                            else:
-                                pct = (t - t_min) / t_range
-                                h = max(3, int(pct * 20))
-                                color = '#f85149' if t == t_max else ('#3fb950' if t == t_min else '#58a6ff')
-                                bars.append(f'<span style="display:inline-block;width:8px;height:{h}px;background:{color};margin:0 1px;vertical-align:bottom;" title="hr {i} LST: {t}°F"></span>')
-                        html += '<br/><span style="font-size:11px;color:#8b949e;">Hourly: </span>'
-                        html += '<span style="display:inline-flex;align-items:flex-end;height:22px;">'
-                        html += ''.join(bars)
-                        html += '</span>'
-                
-                html += '</div>'
+                    # ── Row 2: Today's forecast ──
+                    if fc_today:
+                        age_str = f"{fc_today.age_minutes:.0f}m"
+                        stale_warn = ' <span style="color:#f0883e;">⚠ STALE</span>' if fc_today.is_stale else ''
+                        
+                        html += f'<br/><span style="color:#8b949e;">Forecast v{fc_today.version} ({age_str}){stale_warn}:</span> '
+                        
+                        # High info
+                        if fc_today.forecast_high is not None:
+                            h_peaks = ', '.join(f"{w.peak_hour_lst:02d}" for w in fc_today.high_windows) or '?'
+                            html += f'<strong style="color:#f85149;">▲ {fc_today.forecast_high}°F</strong>'
+                            html += f' <span style="color:#8b949e;">@{h_peaks}h</span>'
+                        
+                        html += ' &nbsp; '
+                        
+                        # Low info
+                        if fc_today.forecast_low is not None:
+                            l_troughs = ', '.join(f"{w.peak_hour_lst:02d}" for w in fc_today.low_windows) or '?'
+                            html += f'<strong style="color:#58a6ff;">▼ {fc_today.forecast_low}°F</strong>'
+                            html += f' <span style="color:#8b949e;">@{l_troughs}h</span>'
+                        
+                        # Gap to nearest bracket (the key number)
+                        if state.observed_high is not None and fc_today.forecast_high is not None:
+                            gap_high = fc_today.forecast_high - state.observed_high
+                            if gap_high > 0:
+                                html += f' &nbsp; <span style="color:#f0883e;">gap to forecast high: {gap_high}°F</span>'
+                    
+                    # ── Row 3: Sparkline ──
+                    if fc_today and fc_today.hourly_temps:
+                        temps = fc_today.hourly_temps
+                        valid = [t for t in temps if t is not None]
+                        if valid:
+                            t_min, t_max = min(valid), max(valid)
+                            t_range = max(t_max - t_min, 1)
+                            bars = []
+                            for i, t in enumerate(temps):
+                                if t is None:
+                                    bars.append(f'<span style="display:inline-block;width:7px;height:2px;background:#21262d;margin:0 0.5px;vertical-align:bottom;" title="hr {i}: —"></span>')
+                                else:
+                                    pct = (t - t_min) / t_range
+                                    h = max(2, int(pct * 18))
+                                    if t == t_max:
+                                        color = '#f85149'
+                                    elif t == t_min:
+                                        color = '#3fb950'
+                                    else:
+                                        color = '#58a6ff'
+                                    bars.append(f'<span style="display:inline-block;width:7px;height:{h}px;background:{color};margin:0 0.5px;vertical-align:bottom;" title="{i:02d}h: {t}°F"></span>')
+                            
+                            html += '<br/><span style="display:inline-flex;align-items:flex-end;height:20px;margin-top:2px;">'
+                            html += ''.join(bars)
+                            html += '</span>'
+                            html += f' <span style="color:#8b949e; font-size:11px;">{t_min}°–{t_max}°F (hover for hourly)</span>'
+                    
+                    # ── Row 4: Tomorrow's forecast (if available) ──
+                    if fc_tomorrow:
+                        h_str = f"{fc_tomorrow.forecast_high}°F" if fc_tomorrow.forecast_high is not None else "?"
+                        l_str = f"{fc_tomorrow.forecast_low}°F" if fc_tomorrow.forecast_low is not None else "?"
+                        h_peaks = ', '.join(f"{w.peak_hour_lst:02d}" for w in fc_tomorrow.high_windows) or '?'
+                        l_troughs = ', '.join(f"{w.peak_hour_lst:02d}" for w in fc_tomorrow.low_windows) or '?'
+                        age_str = f"{fc_tomorrow.age_minutes:.0f}m"
+                        
+                        html += f'<br/><span style="color:#79c0ff;">🌙 Tomorrow</span>'
+                        html += f' <span style="color:#8b949e;">v{fc_tomorrow.version} ({age_str}):</span> '
+                        html += f'<strong style="color:#f85149;">▲ {fc_tomorrow.forecast_high}°F</strong> @{h_peaks}h'
+                        html += f' &nbsp; <strong style="color:#58a6ff;">▼ {fc_tomorrow.forecast_low}°F</strong> @{l_troughs}h'
+                    
+                    html += '</div>'
             
             # Build Scout position lookup for this station
             scout_tickers = {}

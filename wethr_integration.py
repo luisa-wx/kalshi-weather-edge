@@ -315,7 +315,7 @@ class ASOSScout:
     
     def sync_forecasts(self):
         """
-        Fetch/refresh forecasts for all phone-enabled stations.
+        Fetch/refresh forecasts for ALL stations (forecast data is free).
         
         Called every 30 min but only reprocesses if version changed.
         After 10 PM local, also fetches tomorrow's forecast.
@@ -324,7 +324,7 @@ class ASOSScout:
         
         now = datetime.now(timezone.utc)
         
-        for station in PHONE_STATIONS:
+        for station in STATIONS:
             cfg = STATIONS.get(station, {})
             tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
             now_local = now.astimezone(tz)
@@ -399,11 +399,13 @@ class ASOSScout:
             return 'low'
         return None
     
-    def get_current_phase(self, station: str) -> str:
+    def get_current_phase(self, station: str) -> tuple:
         """
         Determine the current polling phase for a station (Section 9D).
         
-        Returns: 'DORMANT', 'DEFAULT', 'WARM-UP', 'HOT'
+        Returns: (phase: str, reason: str)
+            phase: 'DORMANT', 'DEFAULT', 'WARM-UP', 'HOT'
+            reason: human-readable explanation for dashboard
         """
         from smart_poller import STATIONS
         cfg = STATIONS.get(station, {})
@@ -415,35 +417,48 @@ class ASOSScout:
         
         # If no forecast yet, default
         if not fc:
-            return 'DEFAULT'
+            return ('DEFAULT', 'no forecast loaded')
         
-        # Check OVERRIDE: observed beating forecast by 2°F+ (Section 9D)
-        if state and fc.hourly_temps[current_lst_hour] is not None:
+        # Check OVERRIDE: LATEST temp (not day's high) beating forecast by 2°F+
+        # This catches frontal passages where the current reading is way off
+        # from what the forecast expected for this hour.
+        if state and state.latest_temp_f is not None and fc.hourly_temps[current_lst_hour] is not None:
             forecast_now = fc.hourly_temps[current_lst_hour]
-            if state.observed_high is not None and state.observed_high > forecast_now + 2:
-                return 'HOT'
-            if state.observed_low is not None and state.observed_low < forecast_now - 2:
-                return 'HOT'
+            latest = state.latest_temp_f
+            
+            # For highs: latest temp is climbing well above forecast for this hour
+            if latest > forecast_now + 2:
+                return ('HOT', f'latest {latest}°F >> forecast {forecast_now}°F @{current_lst_hour}LST')
+            # For lows: latest temp is dropping well below forecast for this hour
+            if latest < forecast_now - 2:
+                return ('HOT', f'latest {latest}°F << forecast {forecast_now}°F @{current_lst_hour}LST')
         
-        # Check proximity to bracket boundary (HOT if ≤ 4°F)
-        # We'll implement this fully in Phase 2 — for now just check windows
-        
-        # Check if in any window (WARM-UP)
+        # Check if currently inside any forecast window
         window = self.is_in_forecast_window(station)
         if window:
-            return 'WARM-UP'
+            return ('WARM-UP', f'in {window.upper()} window')
         
         # Check 3-hour proximity to any window
         all_windows = (fc.high_windows or []) + (fc.low_windows or [])
         for w in all_windows:
-            hours_to_window = min(
-                abs(current_lst_hour - w.window_start_lst),
-                abs(current_lst_hour - w.window_end_lst)
-            )
-            if hours_to_window <= 3:
-                return 'WARM-UP'
+            hours_to_start = w.window_start_lst - current_lst_hour
+            hours_to_end = w.window_end_lst - current_lst_hour
+            
+            # Handle wrapping (e.g., current=22, window_start=1)
+            if hours_to_start > 12:
+                hours_to_start -= 24
+            elif hours_to_start < -12:
+                hours_to_start += 24
+            if hours_to_end > 12:
+                hours_to_end -= 24
+            elif hours_to_end < -12:
+                hours_to_end += 24
+            
+            dist = min(abs(hours_to_start), abs(hours_to_end))
+            if dist <= 3:
+                return ('WARM-UP', f'{w.signal.upper()} window in ~{dist}hr')
         
-        return 'DEFAULT'
+        return ('DEFAULT', 'outside all windows')
 
     def is_conflict_window(self) -> bool:
         """
