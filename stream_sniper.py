@@ -1290,13 +1290,29 @@ if __name__ == '__main__':
         sys.exit(1)
 
     station_cfg = STATION_REGISTRY[station]
-    ticker = args.high_ticker or station_cfg.get(f'{args.signal}_ticker')
-    if not ticker:
-        print(f"❌ No {args.signal} ticker configured for {station}")
-        sys.exit(1)
+    
+    # Pre-flight ticker check
+    if args.signal == 'both':
+        high_ticker = args.high_ticker or station_cfg.get('high_ticker')
+        low_ticker = station_cfg.get('low_ticker')
+        if not high_ticker and not low_ticker:
+            print(f"❌ No HIGH or LOW ticker configured for {station}")
+            sys.exit(1)
+        tickers = []
+        if high_ticker:
+            tickers.append(f"HIGH={high_ticker}")
+        if low_ticker:
+            tickers.append(f"LOW={low_ticker}")
+        ticker_str = ' + '.join(tickers)
+    else:
+        ticker = args.high_ticker or station_cfg.get(f'{args.signal}_ticker')
+        if not ticker:
+            print(f"❌ No {args.signal} ticker configured for {station}")
+            sys.exit(1)
+        ticker_str = ticker
 
     logger.info(f"[CONFIG] Station={station} Phone={args.phone or station_cfg['phone']} "
-               f"Ticker={ticker} Signal={args.signal}")
+               f"Ticker={ticker_str} Signal={args.signal}")
 
     try:
         asyncio.run(run(args, station_cfg))
