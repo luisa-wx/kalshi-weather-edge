@@ -48,9 +48,12 @@ import argparse
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
