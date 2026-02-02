@@ -47,6 +47,7 @@ import base64
 import argparse
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -90,27 +91,31 @@ STATION_REGISTRY = {
     'KLAS': {
         'name': 'Las Vegas McCarran',
         'phone': '+17025825334',          # VERIFIED 2026-02-01
-        'tz_offset': -8,                  # America/Los_Angeles LST (no DST)
+        'timezone': 'America/Los_Angeles',
+        'tz_offset': -8,                  # LST (for wethr.net / NWS)
         'high_ticker': 'KXHIGHTLV',
         'low_ticker': None,
     },
     'KPHL': {
         'name': 'Philadelphia International',
         'phone': '+12154929617',          # VERIFIED 2026-02-01
-        'tz_offset': -5,                  # America/New_York LST
+        'timezone': 'America/New_York',
+        'tz_offset': -5,
         'high_ticker': 'KXHIGHPHIL',
         'low_ticker': 'KXLOWTPHIL',
     },
     'KAUS': {
         'name': 'Austin-Bergstrom',
         'phone': '+15123697881',          # VERIFIED 2026-02-01
-        'tz_offset': -6,                  # America/Chicago LST
+        'timezone': 'America/Chicago',
+        'tz_offset': -6,
         'high_ticker': 'KXHIGHAUS',
         'low_ticker': 'KXLOWTAUS',
     },
     'KSFO': {
         'name': 'San Francisco International',
         'phone': '+16508278593',
+        'timezone': 'America/Los_Angeles',
         'tz_offset': -8,
         'high_ticker': 'KXHIGHTSFO',
         'low_ticker': None,
@@ -118,6 +123,7 @@ STATION_REGISTRY = {
     'KNYC': {
         'name': 'NYC Central Park',
         'phone': '+12122159324',
+        'timezone': 'America/New_York',
         'tz_offset': -5,
         'high_ticker': 'KXHIGHNY',
         'low_ticker': 'KXLOWTNYC',
@@ -125,6 +131,7 @@ STATION_REGISTRY = {
     'KLAX': {
         'name': 'Los Angeles International',
         'phone': '+13102424750',
+        'timezone': 'America/Los_Angeles',
         'tz_offset': -8,
         'high_ticker': 'KXHIGHLAX',
         'low_ticker': 'KXLOWTLAX',
@@ -132,6 +139,7 @@ STATION_REGISTRY = {
     'KMDW': {
         'name': 'Chicago Midway',
         'phone': '+17738386336',
+        'timezone': 'America/Chicago',
         'tz_offset': -6,
         'high_ticker': 'KXHIGHCHI',
         'low_ticker': 'KXLOWTCHI',
@@ -139,6 +147,7 @@ STATION_REGISTRY = {
     'KMIA': {
         'name': 'Miami International',
         'phone': '+13058699356',
+        'timezone': 'America/New_York',
         'tz_offset': -5,
         'high_ticker': 'KXHIGHMIA',
         'low_ticker': 'KXLOWTMIA',
@@ -146,6 +155,7 @@ STATION_REGISTRY = {
     'KDEN': {
         'name': 'Denver International',
         'phone': '+13033426164',
+        'timezone': 'America/Denver',
         'tz_offset': -7,
         'high_ticker': 'KXHIGHDEN',
         'low_ticker': 'KXLOWTDEN',
@@ -153,13 +163,15 @@ STATION_REGISTRY = {
     'KSEA': {
         'name': 'Seattle-Tacoma',
         'phone': '+12062142592',          # VERIFIED 2026-02-01
-        'tz_offset': -8,                  # America/Los_Angeles LST
+        'timezone': 'America/Los_Angeles',
+        'tz_offset': -8,
         'high_ticker': 'KXHIGHTSEA',
         'low_ticker': None,
     },
     'KDCA': {
         'name': 'Washington Reagan National',
         'phone': '+17034199555',
+        'timezone': 'America/New_York',
         'tz_offset': -5,
         'high_ticker': 'KXHIGHTDC',
         'low_ticker': None,
@@ -167,6 +179,7 @@ STATION_REGISTRY = {
     'KMSY': {
         'name': 'New Orleans Lakefront',
         'phone': '+15044721412',
+        'timezone': 'America/Chicago',
         'tz_offset': -6,
         'high_ticker': 'KXHIGHTNOLA',
         'low_ticker': None,
@@ -250,9 +263,25 @@ def c_to_f_nws(temp_c: float) -> int:
 
 
 def parse_temperature(transcript: str):
+    """Parse temperature from ASOS phone transcript.
+    
+    CRITICAL: Requires an explicit terminator keyword ('celsius', 'degrees', 
+    'centigrade') after the digits. Without this, interim/partial transcripts 
+    like "temperature 1" (from a still-streaming "temperature 10 celsius") 
+    would match as 1°C instead of 10°C.
+    
+    Bug found 2026-02-01: KSEA parsed 1°C from partial "temperature 1..." 
+    then 10°C one second later from "temperature 10 celsius". The phantom 
+    1°C reading set a false low and triggered an incorrect bracket kill.
+    """
     text = transcript.lower()
+    
+    # Primary pattern: "temperature [minus] <digits> celsius/degrees/centigrade"
+    # Greedy digit capture ([\d\s]+) grabs ALL digits before terminator
+    # No $ anchor — we REQUIRE the terminator keyword
     match = re.search(
-        r'temperature[,\s]+(minus\s+|negative\s+)?([\d\s]+?)(?:\s*celsius|\s*\.|$)',
+        r'temperature[,\s]+(minus\s+|negative\s+)?([\d\s]+?)\s*'
+        r'(?:degrees?\s*)?(?:celsius|centigrade)',
         text
     )
     if match:
@@ -261,13 +290,23 @@ def parse_temperature(transcript: str):
         val = spaced_digits_to_int(("minus " if sign else "") + digit_str)
         if val is not None and -60 <= val <= 60:
             return val, c_to_f_nws(val)
-    temp_idx = text.find('temperature')
-    if temp_idx >= 0:
-        after = text[temp_idx + len('temperature'):temp_idx + len('temperature') + 30]
-        after = after.replace(',', ' ').strip()
-        val = spaced_digits_to_int(after)
+    
+    # Secondary pattern: spoken digit words before "celsius/degrees"
+    # Handles: "temperature one zero celsius", "temperature minus five degrees celsius"
+    match2 = re.search(
+        r'temperature[,\s]+(minus\s+|negative\s+)?(.+?)\s*'
+        r'(?:degrees?\s*)?(?:celsius|centigrade)',
+        text
+    )
+    if match2:
+        sign = match2.group(1)
+        digit_str = match2.group(2).strip()
+        val = spaced_digits_to_int(("minus " if sign else "") + digit_str)
         if val is not None and -60 <= val <= 60:
             return val, c_to_f_nws(val)
+    
+    # No match without terminator — do NOT fall back to bare digit grab
+    # This prevents phantom partial-number matches on interim transcripts
     return None, None
 
 
@@ -324,10 +363,16 @@ except ImportError as e:
 
 # ─── Bracket loading ─────────────────────────────────────────
 
-def get_today_suffix(tz_offset: int) -> str:
-    now_utc = datetime.now(timezone.utc)
-    local = now_utc + timedelta(hours=tz_offset)
-    return local.strftime('%y%b%d').upper()
+def get_today_suffix(station_cfg: dict) -> str:
+    """Get Kalshi event date suffix using local civil time (with DST).
+    
+    Per reference doc Section 14 Note 6: Kalshi settles on local civil date.
+    Use ZoneInfo (IANA names), not fixed offsets.
+    """
+    tz_name = station_cfg.get('timezone', 'America/New_York')
+    tz = ZoneInfo(tz_name)
+    local_now = datetime.now(tz)
+    return local_now.strftime('%y%b%d').upper()
 
 
 def parse_kalshi_price(price_raw, price_dollars) -> int:
@@ -344,8 +389,8 @@ def parse_kalshi_price(price_raw, price_dollars) -> int:
     return 100
 
 
-def load_brackets(ticker_prefix: str, tz_offset: int, station: str, signal_type: str) -> list:
-    suffix = get_today_suffix(tz_offset)
+def load_brackets(ticker_prefix: str, station_cfg: dict, station: str, signal_type: str) -> list:
+    suffix = get_today_suffix(station_cfg)
     event_ticker = f"{ticker_prefix}-{suffix}"
     logger.info(f"[BRACKETS] Fetching {event_ticker}...")
     try:
@@ -617,15 +662,14 @@ def parse_time_str(t: str) -> tuple:
     return int(parts[0]), int(parts[1])
 
 
-def should_run(args, tz_offset: int, start_time: float) -> bool:
-    now_utc = datetime.now(timezone.utc)
-
+def should_run(args, station_cfg: dict, start_time: float) -> bool:
     if args.run_minutes is not None:
         elapsed = time.time() - start_time
         return elapsed < (args.run_minutes * 60)
 
     if args.start and args.end:
-        local = now_utc + timedelta(hours=tz_offset)
+        tz = ZoneInfo(station_cfg.get('timezone', 'America/New_York'))
+        local = datetime.now(tz)
         local_hm = local.hour * 60 + local.minute
         start_h, start_m = parse_time_str(args.start)
         end_h, end_m = parse_time_str(args.end)
@@ -651,11 +695,10 @@ def should_run(args, tz_offset: int, start_time: float) -> bool:
     return elapsed < 3600
 
 
-def should_wait_to_start(args, tz_offset: int) -> bool:
-    now_utc = datetime.now(timezone.utc)
-
+def should_wait_to_start(args, station_cfg: dict) -> bool:
     if args.start:
-        local = now_utc + timedelta(hours=tz_offset)
+        tz = ZoneInfo(station_cfg.get('timezone', 'America/New_York'))
+        local = datetime.now(tz)
         local_hm = local.hour * 60 + local.minute
         start_h, start_m = parse_time_str(args.start)
         start_mins = start_h * 60 + start_m
@@ -894,7 +937,6 @@ async def main_loop(args, station_cfg):
     global active_call, call_connected_event, parse_queue, state
 
     station = args.station.upper()
-    tz_offset = station_cfg['tz_offset']
     station_phone = args.phone or station_cfg['phone']
     signal_type = args.signal
     ticker_prefix = args.high_ticker or station_cfg.get(f'{signal_type}_ticker')
@@ -906,7 +948,7 @@ async def main_loop(args, station_cfg):
     state = SniperState(signal_type=signal_type)
 
     init_log(station)
-    brackets = load_brackets(ticker_prefix, tz_offset, station, signal_type)
+    brackets = load_brackets(ticker_prefix, station_cfg, station, signal_type)
     if not brackets:
         logger.error("No brackets loaded — check Kalshi API or event ticker")
         return
@@ -943,10 +985,11 @@ async def main_loop(args, station_cfg):
     print()
 
     # Wait for start time if specified
-    while should_wait_to_start(args, tz_offset):
+    while should_wait_to_start(args, station_cfg):
+        tz = ZoneInfo(station_cfg.get('timezone', 'America/New_York'))
+        local = datetime.now(tz)
         now_utc = datetime.now(timezone.utc)
-        local = now_utc + timedelta(hours=tz_offset)
-        logger.info(f"⏳ Waiting for start time... (local: {local.strftime('%H:%M')}, UTC: {now_utc.strftime('%H:%M')})")
+        logger.info(f"⏳ Waiting for start time... (local: {local.strftime('%H:%M %Z')}, UTC: {now_utc.strftime('%H:%M')})")
         await asyncio.sleep(30)
 
     start_time = time.time()
@@ -959,7 +1002,7 @@ async def main_loop(args, station_cfg):
     total_session_readings = 0
 
     # ── Outer loop: manages calls. Expects frequent disconnects. ──
-    while should_run(args, tz_offset, start_time):
+    while should_run(args, station_cfg, start_time):
 
         active_call = StreamingCall()
         call_connected_event = asyncio.Event()
@@ -1012,12 +1055,12 @@ async def main_loop(args, station_cfg):
         last_parse_time = 0  # Cooldown to prevent interim+final double-fire
         call_readings = 0    # Readings from THIS call
 
-        while should_run(args, tz_offset, start_time):
+        while should_run(args, station_cfg, start_time):
 
             # Refresh brackets every 10 minutes
             if time.time() - last_bracket_refresh > 600:
                 try:
-                    new_brackets = load_brackets(ticker_prefix, tz_offset, station, signal_type)
+                    new_brackets = load_brackets(ticker_prefix, station_cfg, station, signal_type)
                     if new_brackets:
                         for nb in new_brackets:
                             if nb.ticker in state.traded_tickers:
@@ -1115,7 +1158,7 @@ async def main_loop(args, station_cfg):
         else:
             # Good call — reset counter, fast redial
             consecutive_zero_calls = 0
-            if should_run(args, tz_offset, start_time):
+            if should_run(args, station_cfg, start_time):
                 logger.info(f"   🔄 Redialing in {REDIAL_DELAY_NORMAL}s... "
                            f"(session total: {total_session_readings} readings from {state.call_count} calls)")
                 await asyncio.sleep(REDIAL_DELAY_NORMAL)

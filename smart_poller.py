@@ -60,12 +60,19 @@ def log_event(event_type: str, **kwargs):
 # CONFIGURATION
 # ============================================================
 
+# Station configuration
+# NOTE on timezones (ref doc Section 14 Note 6 - Timezone Bifurcation):
+#   - "timezone" (IANA name): Used for Kalshi event dates and trading windows.
+#     Kalshi settles on LOCAL CIVIL DATE, so use ZoneInfo for date rollover.
+#   - "tz_offset" (fixed UTC offset): Used by stream_sniper and for wethr.net 
+#     API calls which use Local Standard Time (no DST). Also useful reference
+#     for NWS climate data boundaries.
 STATIONS = {
     "KNYC": {
         "kalshi_high_ticker": "KXHIGHNY",
         "kalshi_low_ticker": "KXLOWTNYC",
-        "timezone": "America/New_York",
-        "tz_offset": -5,  # EST (LST, no DST)
+        "timezone": "America/New_York",  # Civil time (for Kalshi dates)
+        "tz_offset": -5,                 # EST / LST (for wethr.net / NWS)
         "name": "NYC"
     },
     "KPHL": {
@@ -531,45 +538,35 @@ class WXSniper:
     
     def _get_today_suffix(self, station: str = None) -> str:
         """
-        Get Kalshi event date suffix for the station's LOCAL STANDARD TIME date.
+        Get Kalshi event date suffix for the station's LOCAL CIVIL date.
         
-        CRITICAL: Kalshi events and NWS CLI both use Local Standard Time (LST),
-        NOT civil time (which includes DST). Per reference doc Section 14 Note 6:
-        "Local Standard Time everywhere — NWS climate reporting and Kalshi 
-        settlement both use LST year-round."
+        CRITICAL: Kalshi weather markets settle based on the Local Civil Date,
+        which INCLUDES daylight saving time adjustments. Per reference doc 
+        Section 14 Note 6 (Timezone Bifurcation):
         
-        Using UTC would fetch tomorrow's event after 7 PM EST (bug found 2026-02-01).
-        Using ZoneInfo would be wrong during DST: midnight-1AM civil time maps to 
-        the previous LST date. We use fixed UTC offsets from STATIONS config instead.
+          "Kalshi weather markets settle based on the Local Civil Date...
+           Always use zoneinfo (IANA names) rather than fixed offsets to ensure 
+           your bot rolls over at the correct civil midnight for each station."
         
-        Example: At 8:42 PM EST on Feb 1, UTC is Feb 2, but we need 26FEB01.
+        Note: wethr.net forecasts use LST, but the event tickers and trading
+        windows follow civil time. Use ZoneInfo (IANA names), NOT fixed offsets.
+        
+        Bug fixed 2026-02-01: Was using UTC, which fetched tomorrow's event
+        after 7 PM EST (midnight UTC).
         """
         if station:
             cfg = STATIONS.get(station, {})
-            # Use fixed UTC offset for LST (no DST adjustment)
-            # tz_offset is hours from UTC: EST=-5, CST=-6, MST=-7, PST=-8
-            tz_offset_hours = cfg.get('tz_offset')
-            if tz_offset_hours is not None:
-                lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
-                return lst_now.strftime('%y%b%d').upper()
-            else:
-                # Fallback to ZoneInfo if no fixed offset configured
-                tz_name = cfg.get('timezone', 'America/New_York')
-                tz = ZoneInfo(tz_name)
-                local_now = datetime.now(tz)
-                return local_now.strftime('%y%b%d').upper()
+            tz_name = cfg.get('timezone', 'America/New_York')
+            tz = ZoneInfo(tz_name)
+            local_now = datetime.now(tz)
+            return local_now.strftime('%y%b%d').upper()
         else:
-            # Fallback for any non-station context: use UTC
+            # Fallback: use UTC (shouldn't happen in normal flow)
             return datetime.now(timezone.utc).strftime('%y%b%d').upper()
     
     def get_local_date(self, station: str) -> str:
-        """Get current date in station's Local Standard Time."""
-        cfg = STATIONS.get(station, {})
-        tz_offset_hours = cfg.get('tz_offset')
-        if tz_offset_hours is not None:
-            lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
-            return lst_now.strftime('%Y-%m-%d')
-        tz_name = cfg.get('timezone', 'America/New_York')
+        """Get current date in station's local civil time (includes DST)."""
+        tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
         return datetime.now(ZoneInfo(tz_name)).strftime('%Y-%m-%d')
     
     def _warm_connections(self):
@@ -819,28 +816,23 @@ class WXSniper:
     
     def check_date_rollover(self):
         """
-        Check if any station's LOCAL STANDARD TIME date has changed and reinitialize.
+        Check if any station's local civil date has changed and reinitialize.
         
-        Uses fixed UTC offset (tz_offset) to compute LST date, NOT ZoneInfo.
-        Per reference doc Section 14 Note 6: "Local Standard Time everywhere."
+        Uses ZoneInfo (IANA timezone names) to get civil time, which includes
+        DST adjustments. Per reference doc Section 14 Note 6:
+        "Always use zoneinfo (IANA names) rather than fixed offsets to ensure 
+        your bot rolls over at the correct civil midnight for each station."
         
-        During DST, ZoneInfo would trigger rollover 1 hour early (at midnight EDT
-        instead of midnight EST). Using fixed offset avoids this.
+        Called at the start of each main loop iteration.
         """
         any_rollover = False
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
-            tz_offset_hours = cfg.get('tz_offset')
+            tz_name = cfg.get('timezone', 'America/New_York')
             
-            if tz_offset_hours is not None:
-                lst_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
-                current_date = lst_now.strftime('%Y-%m-%d')
-            else:
-                # Fallback to ZoneInfo if no fixed offset
-                tz_name = cfg.get('timezone', 'America/New_York')
-                tz = ZoneInfo(tz_name)
-                current_date = datetime.now(tz).strftime('%Y-%m-%d')
+            tz = ZoneInfo(tz_name)
+            current_date = datetime.now(tz).strftime('%Y-%m-%d')
             
             if state.current_local_date is not None and state.current_local_date != current_date:
                 logger.info(f"[ROLLOVER] {station}: {state.current_local_date} → {current_date}")
