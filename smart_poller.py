@@ -29,7 +29,7 @@ import signal
 import logging
 import threading
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
@@ -60,96 +60,77 @@ def log_event(event_type: str, **kwargs):
 # CONFIGURATION
 # ============================================================
 
-# Station configuration
-# NOTE on timezones (ref doc Section 14 Note 6 - Timezone Bifurcation):
-#   - "timezone" (IANA name): Used for Kalshi event dates and trading windows.
-#     Kalshi settles on LOCAL CIVIL DATE, so use ZoneInfo for date rollover.
-#   - "tz_offset" (fixed UTC offset): Used by stream_sniper and for wethr.net 
-#     API calls which use Local Standard Time (no DST). Also useful reference
-#     for NWS climate data boundaries.
 STATIONS = {
     "KNYC": {
         "kalshi_high_ticker": "KXHIGHNY",
         "kalshi_low_ticker": "KXLOWTNYC",
-        "timezone": "America/New_York",  # Civil time (for Kalshi dates)
-        "tz_offset": -5,                 # EST / LST (for wethr.net / NWS)
+        "timezone": "America/New_York",
         "name": "NYC"
     },
     "KPHL": {
         "kalshi_high_ticker": "KXHIGHPHIL",
         "kalshi_low_ticker": "KXLOWTPHIL",
         "timezone": "America/New_York",
-        "tz_offset": -5,
         "name": "Philadelphia"
     },
     "KMDW": {
         "kalshi_high_ticker": "KXHIGHCHI",
         "kalshi_low_ticker": "KXLOWTCHI",
         "timezone": "America/Chicago",
-        "tz_offset": -6,  # CST (LST, no DST)
         "name": "Chicago"
     },
     "KLAX": {
         "kalshi_high_ticker": "KXHIGHLAX",
         "kalshi_low_ticker": "KXLOWTLAX",
         "timezone": "America/Los_Angeles",
-        "tz_offset": -8,  # PST (LST, no DST)
         "name": "Los Angeles"
     },
     "KMIA": {
         "kalshi_high_ticker": "KXHIGHMIA",
         "kalshi_low_ticker": "KXLOWTMIA",
         "timezone": "America/New_York",
-        "tz_offset": -5,
         "name": "Miami"
     },
     "KAUS": {
         "kalshi_high_ticker": "KXHIGHAUS",
         "kalshi_low_ticker": "KXLOWTAUS",
         "timezone": "America/Chicago",
-        "tz_offset": -6,
         "name": "Austin"
     },
     "KSFO": {
         "kalshi_high_ticker": "KXHIGHTSFO",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
-        "tz_offset": -8,
         "name": "San Francisco"
     },
     "KSEA": {
         "kalshi_high_ticker": "KXHIGHTSEA",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
-        "tz_offset": -8,
         "name": "Seattle"
     },
     "KDCA": {
         "kalshi_high_ticker": "KXHIGHTDC",
         "kalshi_low_ticker": None,
         "timezone": "America/New_York",
-        "tz_offset": -5,
         "name": "Washington DC"
     },
     "KMSY": {
         "kalshi_high_ticker": "KXHIGHTNOLA",
         "kalshi_low_ticker": None,
         "timezone": "America/Chicago",
-        "tz_offset": -6,
         "name": "New Orleans"
     },
     "KLAS": {
         "kalshi_high_ticker": "KXHIGHTLV",
         "kalshi_low_ticker": None,
         "timezone": "America/Los_Angeles",
-        "tz_offset": -8,
         "name": "Las Vegas"
     },
     "KDEN": {
         "kalshi_high_ticker": "KXHIGHDEN",
         "kalshi_low_ticker": "KXLOWTDEN",
         "timezone": "America/Denver",
-        "tz_offset": -7,  # MST (LST, no DST)
         "name": "Denver"
     }
 }
@@ -249,22 +230,10 @@ class BracketState:
     def check_status(self, observed_high: Optional[int], observed_low: Optional[int]) -> str:
         """Determine current status based on observations.
         
-        CRITICAL — Kalshi API encoding (verified 2026-02-01 against KLAX data):
-        
-          greater: floor_strike = X-1   (e.g. "80° or above" → floor=79)
-                   YES wins when final > floor  (i.e. final >= 80)
-                   
-          less:    cap_strike = X+1     (e.g. "71° or below" → cap=72)
-                   YES wins when final < cap    (i.e. final <= 71)
-                   
-          between: floor_strike/cap_strike are the ACTUAL boundaries (no offset)
-                   (e.g. "72° to 73°" → floor=72, cap=73)
-                   YES wins when floor <= final <= cap
-        
-        The operators below use STRICT comparisons (> and <) for greater/less
-        because floor/cap are already offset by 1 from the displayed boundary.
-        The reference doc Section 4 uses >= and <= but assumes non-offset values.
-        Both are equivalent; this code matches Kalshi's raw API data.
+        Kalshi convention (from API data):
+          greater: floor = X-1, YES wins when final > floor  (e.g. "30° or above" = floor 29)
+          less:    cap = X+1,   YES wins when final < cap    (e.g. "21° or below" = cap 22)
+          between: floor/cap,   YES wins when floor <= final <= cap
         """
         
         if self.signal_type == 'high':
@@ -272,58 +241,42 @@ class BracketState:
                 return 'open'
             
             if self.strike_type == 'between':
-                # between: floor/cap are actual boundaries
-                # DEAD when high exceeds cap (can never come back down)
                 if self.cap_strike is not None and observed_high > self.cap_strike:
                     return 'dead'
-                return 'open'   # NEVER locked (high might still rise past cap)
+                return 'open'
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                # "80° or above": floor=79, YES wins when final > 79
-                # LOCKED once observed_high > floor (high can only go up)
-                # e.g. high=80: 80 > 79 = True → LOCKED ✓
-                # e.g. high=79: 79 > 79 = False → OPEN ✓ (hasn't hit 80 yet)
+                # YES wins when final > floor. LOCKED once observed > floor.
                 if self.floor_strike is not None and observed_high > self.floor_strike:
                     return 'locked'
-                return 'open'   # NEVER dead (high can only go up)
+                return 'open'
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                # "71° or below": cap=72, YES wins when final < 72
-                # DEAD once observed_high >= cap (high already ≥72, can't be <72)
-                # e.g. high=72: 72 >= 72 = True → DEAD ✓ (already ≥72)
-                # e.g. high=71: 71 >= 72 = False → OPEN ✓ (still ≤71)
+                # YES wins when final < cap. DEAD once observed >= cap (can't go back down).
                 if self.cap_strike is not None and observed_high >= self.cap_strike:
                     return 'dead'
-                return 'open'   # NEVER locked (high might still rise past boundary)
+                return 'open'
         
         elif self.signal_type == 'low':
             if observed_low is None:
                 return 'open'
             
             if self.strike_type == 'between':
-                # between: floor/cap are actual boundaries
-                # DEAD when low drops below floor (can never come back up)
                 if self.floor_strike is not None and observed_low < self.floor_strike:
                     return 'dead'
-                return 'open'   # NEVER locked (low might still drop below floor)
+                return 'open'
             
             elif self.strike_type in ('greater', 'greater_or_equal'):
-                # "37° or above": floor=36, YES wins when final > 36
-                # DEAD once observed_low <= floor (low is ≤36, can't be >36)
-                # e.g. low=36: 36 <= 36 = True → DEAD ✓
-                # e.g. low=37: 37 <= 36 = False → OPEN ✓
+                # YES wins when final > floor. DEAD once observed <= floor (can't go back up).
                 if self.floor_strike is not None and observed_low <= self.floor_strike:
                     return 'dead'
-                return 'open'   # NEVER locked (low might keep dropping)
+                return 'open'
             
             elif self.strike_type in ('less', 'less_or_equal'):
-                # "34° or below": cap=35, YES wins when final < 35
-                # LOCKED once observed_low < cap (low can only go down)
-                # e.g. low=34: 34 < 35 = True → LOCKED ✓
-                # e.g. low=35: 35 < 35 = False → OPEN ✓ (hasn't hit 34 yet)
+                # YES wins when final < cap. LOCKED once observed < cap.
                 if self.cap_strike is not None and observed_low < self.cap_strike:
                     return 'locked'
-                return 'open'   # NEVER dead (low dropping helps this bracket)
+                return 'open'
         
         return 'open'
     
@@ -334,19 +287,17 @@ class BracketState:
         if self.signal_type == 'high':
             if status == 'dead':
                 if self.strike_type in ('less', 'less_or_equal'):
-                    return f"HIGH {observed_high}°F >= cap {self.cap_strike}°F → can't be < cap"
-                else:  # between
-                    return f"HIGH {observed_high}°F > cap {self.cap_strike}°F"
+                    return f"HIGH {observed_high}°F >= cap {self.cap_strike}°F"
+                return f"HIGH {observed_high}°F > cap {self.cap_strike}°F"
             elif status == 'locked':
-                return f"HIGH {observed_high}°F > floor {self.floor_strike}°F → locked above"
+                return f"HIGH {observed_high}°F > floor {self.floor_strike}°F"
         else:
             if status == 'dead':
                 if self.strike_type in ('greater', 'greater_or_equal'):
-                    return f"LOW {observed_low}°F <= floor {self.floor_strike}°F → can't be > floor"
-                else:  # between
-                    return f"LOW {observed_low}°F < floor {self.floor_strike}°F"
+                    return f"LOW {observed_low}°F <= floor {self.floor_strike}°F"
+                return f"LOW {observed_low}°F < floor {self.floor_strike}°F"
             elif status == 'locked':
-                return f"LOW {observed_low}°F < cap {self.cap_strike}°F → locked below"
+                return f"LOW {observed_low}°F < cap {self.cap_strike}°F"
         
         return "Still open"
 
@@ -546,6 +497,10 @@ class WXSniper:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
         
+        # Pre-compute date suffix
+        self._today_suffix = None
+        self._today_suffix_date = None
+        
         # Initialize ASOS Scout (wethr.net integration)
         self.scout = None
         try:
@@ -560,36 +515,15 @@ class WXSniper:
         log_event('shutdown', signal=signum)
         self.running = False
     
-    def _get_today_suffix(self, station: str = None) -> str:
-        """
-        Get Kalshi event date suffix for the station's LOCAL CIVIL date.
-        
-        CRITICAL: Kalshi weather markets settle based on the Local Civil Date,
-        which INCLUDES daylight saving time adjustments. Per reference doc 
-        Section 14 Note 6 (Timezone Bifurcation):
-        
-          "Kalshi weather markets settle based on the Local Civil Date...
-           Always use zoneinfo (IANA names) rather than fixed offsets to ensure 
-           your bot rolls over at the correct civil midnight for each station."
-        
-        Note: wethr.net forecasts use LST, but the event tickers and trading
-        windows follow civil time. Use ZoneInfo (IANA names), NOT fixed offsets.
-        
-        Bug fixed 2026-02-01: Was using UTC, which fetched tomorrow's event
-        after 7 PM EST (midnight UTC).
-        """
-        if station:
-            cfg = STATIONS.get(station, {})
-            tz_name = cfg.get('timezone', 'America/New_York')
-            tz = ZoneInfo(tz_name)
-            local_now = datetime.now(tz)
-            return local_now.strftime('%y%b%d').upper()
-        else:
-            # Fallback: use UTC (shouldn't happen in normal flow)
-            return datetime.now(timezone.utc).strftime('%y%b%d').upper()
+    def _get_today_suffix(self) -> str:
+        """Get cached date suffix (avoids repeated datetime formatting)."""
+        today = datetime.now(timezone.utc).date()
+        if self._today_suffix_date != today:
+            self._today_suffix = datetime.now(timezone.utc).strftime('%y%b%d').upper()
+            self._today_suffix_date = today
+        return self._today_suffix
     
     def get_local_date(self, station: str) -> str:
-        """Get current date in station's local civil time (includes DST)."""
         tz_name = STATIONS.get(station, {}).get('timezone', 'America/New_York')
         return datetime.now(ZoneInfo(tz_name)).strftime('%Y-%m-%d')
     
@@ -621,14 +555,12 @@ class WXSniper:
     def init_watchlists(self):
         """Initialize watchlists with all brackets from Kalshi."""
         logger.info("[INIT] Building watchlists...")
+        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
             high_ticker = cfg.get('kalshi_high_ticker')
             low_ticker = cfg.get('kalshi_low_ticker')
-            today_suffix = self._get_today_suffix(station)
-            
-            logger.info(f"  [{station}] Using event suffix: {today_suffix}")
             
             state.high_watchlist = []
             state.low_watchlist = []
@@ -840,13 +772,8 @@ class WXSniper:
     
     def check_date_rollover(self):
         """
-        Check if any station's local civil date has changed and reinitialize.
-        
-        Uses ZoneInfo (IANA timezone names) to get civil time, which includes
-        DST adjustments. Per reference doc Section 14 Note 6:
-        "Always use zoneinfo (IANA names) rather than fixed offsets to ensure 
-        your bot rolls over at the correct civil midnight for each station."
-        
+        Check if any station's local date has changed and reinitialize if needed.
+        Uses ZoneInfo which handles DST automatically.
         Called at the start of each main loop iteration.
         """
         any_rollover = False
@@ -855,6 +782,7 @@ class WXSniper:
             cfg = STATIONS.get(station, {})
             tz_name = cfg.get('timezone', 'America/New_York')
             
+            # ZoneInfo handles DST automatically - no manual adjustment needed
             tz = ZoneInfo(tz_name)
             current_date = datetime.now(tz).strftime('%Y-%m-%d')
             
@@ -1196,10 +1124,10 @@ class WXSniper:
     def refresh_prices(self):
         """Refresh prices for watched brackets."""
         logger.info("[PRICES] Refreshing...")
+        today_suffix = self._get_today_suffix()
         
         for station, state in self.states.items():
             cfg = STATIONS.get(station, {})
-            today_suffix = self._get_today_suffix(station)
             
             if state.high_watchlist:
                 high_ticker = cfg.get('kalshi_high_ticker')
@@ -1544,6 +1472,73 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 <strong>Latest METAR:</strong> {metar_local_str} local &nbsp;&nbsp; <span class="current-temp">{current_temp_str}</span> &nbsp;&nbsp;|&nbsp;&nbsp;
                 {range_label} <strong>HIGH</strong> {high_val} &nbsp; <strong>LOW</strong> {low_val}
             </div>'''
+            
+            # ── Section 9: Forecast + Orchestrator Display ──
+            if s.scout and station in ('KPHL', 'KAUS', 'KLAS', 'KSEA'):
+                fc_today = s.scout.get_forecast_for_station(station, 'today')
+                fc_tomorrow = s.scout.get_forecast_for_station(station, 'tomorrow')
+                phase = s.scout.get_current_phase(station)
+                window = s.scout.is_in_forecast_window(station)
+                
+                phase_colors = {
+                    'DORMANT': '#8b949e', 'DEFAULT': '#8b949e',
+                    'WARM-UP': '#f0883e', 'HOT': '#f85149',
+                }
+                phase_color = phase_colors.get(phase, '#8b949e')
+                window_str = window.upper() if window else 'NONE'
+                
+                html += f'<div class="metar-info" style="border-left: 3px solid {phase_color}; margin-top:4px;">'
+                html += f'<strong style="color:{phase_color};">📡 Phase: {phase}</strong>'
+                html += f' &nbsp;|&nbsp; Window: <strong>{window_str}</strong>'
+                
+                if fc_today:
+                    h_str = f"{fc_today.forecast_high}°F" if fc_today.forecast_high is not None else "?"
+                    l_str = f"{fc_today.forecast_low}°F" if fc_today.forecast_low is not None else "?"
+                    
+                    # Find peak hours for display
+                    h_peaks = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_today.high_windows) or '?'
+                    l_troughs = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_today.low_windows) or '?'
+                    
+                    age_str = f"{fc_today.age_minutes:.0f}m ago"
+                    stale_warn = ' ⚠️' if fc_today.is_stale else ''
+                    
+                    html += f' &nbsp;|&nbsp; <strong>TODAY</strong> v{fc_today.version} ({age_str}{stale_warn}): '
+                    html += f'H={h_str} @{h_peaks}LST, L={l_str} @{l_troughs}LST'
+                else:
+                    html += ' &nbsp;|&nbsp; <strong>TODAY</strong>: <em>no forecast</em>'
+                
+                if fc_tomorrow:
+                    h_str = f"{fc_tomorrow.forecast_high}°F" if fc_tomorrow.forecast_high is not None else "?"
+                    l_str = f"{fc_tomorrow.forecast_low}°F" if fc_tomorrow.forecast_low is not None else "?"
+                    h_peaks = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_tomorrow.high_windows) or '?'
+                    l_troughs = ', '.join(f"{w.peak_hour_lst}:00" for w in fc_tomorrow.low_windows) or '?'
+                    age_str = f"{fc_tomorrow.age_minutes:.0f}m ago"
+                    
+                    html += f'<br/><strong style="color:#79c0ff;">🌙 TOMORROW</strong> v{fc_tomorrow.version} ({age_str}): '
+                    html += f'H={h_str} @{h_peaks}LST, L={l_str} @{l_troughs}LST'
+                
+                # Show hourly temps sparkline for today
+                if fc_today and fc_today.hourly_temps:
+                    temps = fc_today.hourly_temps
+                    valid = [t for t in temps if t is not None]
+                    if valid:
+                        t_min, t_max = min(valid), max(valid)
+                        t_range = max(t_max - t_min, 1)
+                        bars = []
+                        for i, t in enumerate(temps):
+                            if t is None:
+                                bars.append(f'<span style="display:inline-block;width:8px;height:20px;background:#21262d;margin:0 1px;" title="hr {i}: null"></span>')
+                            else:
+                                pct = (t - t_min) / t_range
+                                h = max(3, int(pct * 20))
+                                color = '#f85149' if t == t_max else ('#3fb950' if t == t_min else '#58a6ff')
+                                bars.append(f'<span style="display:inline-block;width:8px;height:{h}px;background:{color};margin:0 1px;vertical-align:bottom;" title="hr {i} LST: {t}°F"></span>')
+                        html += '<br/><span style="font-size:11px;color:#8b949e;">Hourly: </span>'
+                        html += '<span style="display:inline-flex;align-items:flex-end;height:22px;">'
+                        html += ''.join(bars)
+                        html += '</span>'
+                
+                html += '</div>'
             
             # Build Scout position lookup for this station
             scout_tickers = {}

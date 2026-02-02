@@ -46,6 +46,7 @@ BID_PRICE = int(os.environ.get('SCOUT_BID_PRICE', '99'))
 # Wethr.net API configuration
 WETHR_API_KEY = os.environ.get('WETHR_API_KEY', 'da0c8fe4607429123437c3d55cbfd5117652ac24506a9f8af45696a82e0fd652')
 WETHR_BASE_URL = "https://wethr.net/api/v2/observations.php"
+WETHR_FORECAST_URL = "https://wethr.net/api/v2/nws_forecasts.php"
 
 # Safety thresholds
 MAX_TEMP_JUMP = 2.0  # Reject readings that jump more than 2°F
@@ -55,7 +56,50 @@ MAX_STALENESS_MINUTES = 15  # Reject observations older than 15 minutes
 # Professional tier allows 60 req/min, so 12 stations x 2/min = 24 req/min is safe
 SCOUT_POLL_INTERVAL_SECONDS = 30
 
+# Phone-enabled stations (Section 9 orchestrator)
+PHONE_STATIONS = {
+    'KPHL': '+12154929617',
+    'KAUS': '+15123697881',
+    'KLAS': '+17025297334',
+    'KSEA': '+12062142592',
+}
+
 logger = logging.getLogger('wx-sniper.scout')
+
+# ============================================================
+# FORECAST STATE (Section 9B)
+# ============================================================
+
+@dataclass
+class ForecastWindow:
+    """A time window where an extreme (high or low) might be set."""
+    signal: str          # 'high' or 'low'
+    peak_hour_lst: int   # Hour in LST (0-23) when extreme is forecast
+    forecast_temp: int   # Forecast temperature in °F
+    window_start_lst: int  # peak_hour - 3, clamped to 0-23
+    window_end_lst: int    # peak_hour + 3, clamped to 0-23
+
+@dataclass
+class StationForecast:
+    """Forecast state for one station, one day."""
+    station: str
+    forecast_date: str          # YYYY-MM-DD (LST)
+    version: int                # NWS forecast version number
+    hourly_temps: list          # 24-element array, index = LST hour
+    forecast_high: Optional[int]
+    forecast_low: Optional[int]
+    high_windows: List[ForecastWindow]  # 1-2 windows for high
+    low_windows: List[ForecastWindow]   # 1-2 windows for low
+    fetched_at: datetime        # When we fetched this
+    
+    @property
+    def age_minutes(self) -> float:
+        return (datetime.now(timezone.utc) - self.fetched_at).total_seconds() / 60
+    
+    @property
+    def is_stale(self) -> bool:
+        """Forecast is stale if we haven't refreshed in 45 min."""
+        return self.age_minutes > 45
 
 # ============================================================
 # SCOUT STATE TRACKING
@@ -111,9 +155,296 @@ class ASOSScout:
         # Dormant mode flag
         self.dormant = False
         
+        # ── Section 9 Forecast State ──
+        # Today and tomorrow forecasts per station
+        self.forecasts: Dict[str, StationForecast] = {}    # key: "KPHL_today"
+        self.tomorrow_forecasts: Dict[str, StationForecast] = {}  # key: "KPHL_tomorrow"
+        self.last_forecast_poll: Optional[datetime] = None
+        
+        # Latest observation cache for trend tracking (Section 9E/Q4)
+        # Key: station, Value: list of (timestamp, temp_f) tuples, max 5
+        self.temp_history: Dict[str, List[tuple]] = {}
+        
         logger.info("[SCOUT] ASOS Scout initialized")
         logger.info(f"[SCOUT] Trade quantity: {TRADE_QUANTITY}")
     
+    # ================================================================
+    # SECTION 9B: FORECAST SYNC
+    # ================================================================
+    
+    def fetch_forecast(self, station: str, date: Optional[str] = None) -> Optional[StationForecast]:
+        """
+        Fetch NWS hourly forecast from wethr.net for a station/date.
+        
+        Args:
+            station: ICAO code (e.g., 'KPHL')
+            date: YYYY-MM-DD in LST, or None for today
+            
+        Returns:
+            StationForecast or None on error
+        """
+        try:
+            params = {'station_code': station, 'mode': 'latest'}
+            if date:
+                params['date'] = date
+            
+            resp = self.session.get(WETHR_FORECAST_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if 'error' in data:
+                logger.warning(f"[FORECAST] {station} API error: {data['error']}")
+                return None
+            
+            hourly = data.get('hourly_temps', [])
+            if not hourly or len(hourly) < 24:
+                # Pad to 24 if short
+                hourly = hourly + [None] * (24 - len(hourly))
+            
+            # Extract windows (Section 9C: bimodal for both highs and lows)
+            high_windows = self._extract_high_windows(station, hourly)
+            low_windows = self._extract_low_windows(station, hourly)
+            
+            # Get forecast high/low from non-null values
+            valid_temps = [t for t in hourly if t is not None]
+            forecast_high = max(valid_temps) if valid_temps else None
+            forecast_low = min(valid_temps) if valid_temps else None
+            
+            fc = StationForecast(
+                station=station,
+                forecast_date=data.get('forecast_date', date or '?'),
+                version=data.get('version', 0),
+                hourly_temps=hourly[:24],
+                forecast_high=forecast_high,
+                forecast_low=forecast_low,
+                high_windows=high_windows,
+                low_windows=low_windows,
+                fetched_at=datetime.now(timezone.utc),
+            )
+            
+            logger.info(
+                f"[FORECAST] {station} {fc.forecast_date} v{fc.version}: "
+                f"H={forecast_high}°F L={forecast_low}°F | "
+                f"High windows: {[(w.peak_hour_lst, w.forecast_temp) for w in high_windows]} | "
+                f"Low windows: {[(w.peak_hour_lst, w.forecast_temp) for w in low_windows]}"
+            )
+            return fc
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[FORECAST] {station} fetch error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[FORECAST] {station} unexpected error: {e}")
+            return None
+    
+    def _extract_high_windows(self, station: str, hourly: list) -> List[ForecastWindow]:
+        """
+        Extract 1-2 high windows from hourly temps (Section 9C).
+        
+        Split day into first half (0-11 LST) and second half (12-23 LST).
+        Each half gets a window if its max is within 4°F of the overall max.
+        """
+        first_half = [(i, t) for i, t in enumerate(hourly[:12]) if t is not None]
+        second_half = [(i, t) for i, t in enumerate(hourly[12:24], start=12) if t is not None]
+        
+        windows = []
+        
+        first_max = max(first_half, key=lambda x: x[1]) if first_half else None
+        second_max = max(second_half, key=lambda x: x[1]) if second_half else None
+        
+        # Determine primary (higher max) and secondary
+        candidates = []
+        if first_max:
+            candidates.append(first_max)
+        if second_max:
+            candidates.append(second_max)
+        
+        if not candidates:
+            return windows
+        
+        overall_max = max(c[1] for c in candidates)
+        
+        for hour, temp in candidates:
+            if temp >= overall_max - 4:
+                windows.append(ForecastWindow(
+                    signal='high',
+                    peak_hour_lst=hour,
+                    forecast_temp=temp,
+                    window_start_lst=max(0, hour - 3),
+                    window_end_lst=min(23, hour + 3),
+                ))
+        
+        return windows
+    
+    def _extract_low_windows(self, station: str, hourly: list) -> List[ForecastWindow]:
+        """
+        Extract 1-2 low windows from hourly temps (Section 9C).
+        
+        Same bimodal logic as highs but looking for minima.
+        """
+        first_half = [(i, t) for i, t in enumerate(hourly[:12]) if t is not None]
+        second_half = [(i, t) for i, t in enumerate(hourly[12:24], start=12) if t is not None]
+        
+        windows = []
+        
+        first_min = min(first_half, key=lambda x: x[1]) if first_half else None
+        second_min = min(second_half, key=lambda x: x[1]) if second_half else None
+        
+        candidates = []
+        if first_min:
+            candidates.append(first_min)
+        if second_min:
+            candidates.append(second_min)
+        
+        if not candidates:
+            return windows
+        
+        overall_min = min(c[1] for c in candidates)
+        
+        for hour, temp in candidates:
+            if temp <= overall_min + 4:
+                windows.append(ForecastWindow(
+                    signal='low',
+                    peak_hour_lst=hour,
+                    forecast_temp=temp,
+                    window_start_lst=max(0, hour - 3),
+                    window_end_lst=min(23, hour + 3),
+                ))
+        
+        return windows
+    
+    def sync_forecasts(self):
+        """
+        Fetch/refresh forecasts for all phone-enabled stations.
+        
+        Called every 30 min but only reprocesses if version changed.
+        After 10 PM local, also fetches tomorrow's forecast.
+        """
+        from smart_poller import STATIONS
+        
+        now = datetime.now(timezone.utc)
+        
+        for station in PHONE_STATIONS:
+            cfg = STATIONS.get(station, {})
+            tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+            now_local = now.astimezone(tz)
+            today_str = now_local.strftime('%Y-%m-%d')
+            
+            # ── Today's forecast ──
+            key = f"{station}_today"
+            existing = self.forecasts.get(key)
+            
+            # Fetch if: no forecast yet, or stale (>45 min), or different date
+            if not existing or existing.is_stale or existing.forecast_date != today_str:
+                fc = self.fetch_forecast(station, today_str)
+                if fc:
+                    # Only update if version changed or first fetch
+                    if not existing or fc.version != existing.version or existing.forecast_date != today_str:
+                        self.forecasts[key] = fc
+                        logger.info(f"[FORECAST] {station} today updated: v{fc.version}")
+                    else:
+                        # Same version, just update fetched_at
+                        existing.fetched_at = now
+            
+            # ── Tomorrow's forecast (after 10 PM local) ──
+            if now_local.hour >= 22:
+                tomorrow_local = now_local + timedelta(days=1)
+                tomorrow_str = tomorrow_local.strftime('%Y-%m-%d')
+                tkey = f"{station}_tomorrow"
+                existing_t = self.tomorrow_forecasts.get(tkey)
+                
+                if not existing_t or existing_t.is_stale or existing_t.forecast_date != tomorrow_str:
+                    fc = self.fetch_forecast(station, tomorrow_str)
+                    if fc:
+                        if not existing_t or fc.version != existing_t.version or existing_t.forecast_date != tomorrow_str:
+                            self.tomorrow_forecasts[tkey] = fc
+                            logger.info(f"[FORECAST] {station} TOMORROW updated: v{fc.version}")
+                        else:
+                            existing_t.fetched_at = now
+        
+        self.last_forecast_poll = now
+    
+    def get_forecast_for_station(self, station: str, which: str = 'today') -> Optional[StationForecast]:
+        """Get the current forecast for a station. which='today' or 'tomorrow'."""
+        if which == 'tomorrow':
+            return self.tomorrow_forecasts.get(f"{station}_tomorrow")
+        return self.forecasts.get(f"{station}_today")
+    
+    def is_in_forecast_window(self, station: str) -> Optional[str]:
+        """
+        Check if current time is in any forecast window for this station.
+        
+        Returns:
+            'high', 'low', 'both', or None
+        """
+        from smart_poller import STATIONS
+        cfg = STATIONS.get(station, {})
+        tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+        current_lst_hour = datetime.now(tz).hour  # Approx — exact LST requires offset
+        
+        fc = self.get_forecast_for_station(station)
+        if not fc:
+            return None
+        
+        in_high = any(w.window_start_lst <= current_lst_hour <= w.window_end_lst 
+                      for w in fc.high_windows)
+        in_low = any(w.window_start_lst <= current_lst_hour <= w.window_end_lst 
+                     for w in fc.low_windows)
+        
+        if in_high and in_low:
+            return 'both'
+        elif in_high:
+            return 'high'
+        elif in_low:
+            return 'low'
+        return None
+    
+    def get_current_phase(self, station: str) -> str:
+        """
+        Determine the current polling phase for a station (Section 9D).
+        
+        Returns: 'DORMANT', 'DEFAULT', 'WARM-UP', 'HOT'
+        """
+        from smart_poller import STATIONS
+        cfg = STATIONS.get(station, {})
+        tz = ZoneInfo(cfg.get('timezone', 'America/New_York'))
+        current_lst_hour = datetime.now(tz).hour
+        
+        fc = self.get_forecast_for_station(station)
+        state = self.sniper.states.get(station)
+        
+        # If no forecast yet, default
+        if not fc:
+            return 'DEFAULT'
+        
+        # Check OVERRIDE: observed beating forecast by 2°F+ (Section 9D)
+        if state and fc.hourly_temps[current_lst_hour] is not None:
+            forecast_now = fc.hourly_temps[current_lst_hour]
+            if state.observed_high is not None and state.observed_high > forecast_now + 2:
+                return 'HOT'
+            if state.observed_low is not None and state.observed_low < forecast_now - 2:
+                return 'HOT'
+        
+        # Check proximity to bracket boundary (HOT if ≤ 4°F)
+        # We'll implement this fully in Phase 2 — for now just check windows
+        
+        # Check if in any window (WARM-UP)
+        window = self.is_in_forecast_window(station)
+        if window:
+            return 'WARM-UP'
+        
+        # Check 3-hour proximity to any window
+        all_windows = (fc.high_windows or []) + (fc.low_windows or [])
+        for w in all_windows:
+            hours_to_window = min(
+                abs(current_lst_hour - w.window_start_lst),
+                abs(current_lst_hour - w.window_end_lst)
+            )
+            if hours_to_window <= 3:
+                return 'WARM-UP'
+        
+        return 'DEFAULT'
+
     def is_conflict_window(self) -> bool:
         """
         Check if we're in smart_poller's hot window.
@@ -579,6 +910,15 @@ class ASOSScout:
         
         Should be called from smart_poller's main loop.
         """
+        now = datetime.now(timezone.utc)
+        
+        # ── Forecast sync (every 30 min, or first run) ──
+        if not self.last_forecast_poll or (now - self.last_forecast_poll).total_seconds() > 1800:
+            try:
+                self.sync_forecasts()
+            except Exception as e:
+                logger.error(f"[FORECAST] Sync error: {e}")
+        
         # Check for conflict window (METAR drop time)
         if self.is_conflict_window():
             if not self.dormant:
