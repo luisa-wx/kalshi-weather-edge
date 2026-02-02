@@ -78,6 +78,7 @@ PHONE_STATIONS = {
     'KAUS': '+15123697881',
     'KLAS': '+17025297334',
     'KSEA': '+12062142592',
+    'KSFO': '+16508278593',
 }
 
 # ── Phase 5: Phone Deployment ──
@@ -87,6 +88,7 @@ SNIPER_WS_PORTS = {
     'KAUS': 8767,
     'KLAS': 8768,
     'KSEA': 8769,
+    'KSFO': 8770,
 }
 
 # WS URL base — Twilio calls back to this address
@@ -1817,11 +1819,6 @@ class ASOSScout:
         
         # Poll each active station (variable cadence per station)
         for station, state in self.sniper.states.items():
-            # KLAS is handled by klas_phone_sniper.py — skip in Scout
-            # KSFO is handled by stream sniper — skip in Scout
-            if station in ('KLAS', 'KSFO'):
-                continue
-            
             # Skip stations with no open brackets
             if not state.high_watchlist and not state.low_watchlist:
                 continue

@@ -1662,6 +1662,20 @@ summary {{ cursor: pointer; color: #8b949e; }}
                 </tr>'''
             html += '</table>'
         
+        # Phone Trades Section
+        phone_trades = s.scout.sniper_trades if s.scout else []
+        if phone_trades:
+            html += f"<h2>&#128222; Phone Trades ({len(phone_trades)})</h2>"
+            html += '<table><tr><th>Time</th><th>Station</th><th>Trade</th><th>Source</th></tr>'
+            for pt in reversed(phone_trades[-20:]):
+                html += f'''<tr class="scout">
+                    <td class="time">{pt.get("time", "?")[:19]}</td>
+                    <td>{pt.get("station", "?")}</td>
+                    <td>{pt.get("trade", "?")}</td>
+                    <td>📞 {pt.get("source", "phone")}</td>
+                </tr>'''
+            html += '</table>'
+        
         # Watchlists
         html += "<h2>Watchlists</h2>"
         
