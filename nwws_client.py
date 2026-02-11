@@ -291,38 +291,36 @@ class NWWSOIClient(slixmpp.ClientXMPP):
         """
         Check if this product is one we want to parse.
 
-        We filter on:
-        1. Product type (DSM, METAR, SPECI, CLI)
-        2. Station relevance (from a watched WFO or contains a watched station)
+        Strict filtering:
+        1. DSM: Must match a watched DSM awipsid exactly (e.g., DSMNYC)
+        2. CLI: Must match a watched station suffix from a watched WFO
+        3. METAR/SPECI: We'll check for station in the raw text during parsing
+           - For now, accept SA/SP products from watched WFOs
         """
         if not awipsid:
             return False
 
-        base = awipsid[:3].upper()
+        upper_id = awipsid.upper()
+        base = upper_id[:3]
 
-        # DSM: Check if it's for one of our watched stations
+        # DSM: exact match only
         if base == "DSM":
-            return awipsid.upper() in WATCHED_DSM_IDS
+            return upper_id in WATCHED_DSM_IDS
 
-        # CLI: Check the station suffix
+        # CLI: check station suffix matches one of ours
         if base == "CLI":
-            # CLI awipsids are like CLINEW (for KNYC/NYC area)
-            # This needs more nuanced matching - for now, pass through
-            # if from a watched WFO
-            return cccc in WATCHED_WFOS
+            suffix = upper_id[3:]
+            for station in STATIONS:
+                # CLI uses various suffixes, check if our station's 3-char code matches
+                if suffix == station[1:]:  # e.g., CLI + NYC for KNYC
+                    return True
+            return False
 
-        # METAR/SPECI: Check if from a watched WFO
-        # Note: METARs on NWWS-OI often come as SA/SP products
-        # with ttaaii starting with SA or SP
-        if base in ("MTR", "SPE", "SA ", "SP "):
+        # METAR/SPECI: Only from watched WFOs
+        # The ttaaii for surface obs starts with SA (routine) or SP (special)
+        # awipsid for METARs varies, but we filter by WFO
+        if base in ("MTR", "SPE"):
             return cccc in WATCHED_WFOS
-
-        # Also catch products where the awipsid contains a known station
-        # suffix (e.g., last 3 chars match a station)
-        suffix = awipsid[3:].upper()
-        for station in STATIONS:
-            if suffix == station[1:]:  # e.g., "NYC" matches KNYC
-                return True
 
         return False
 
