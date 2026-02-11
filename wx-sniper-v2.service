@@ -1,0 +1,23 @@
+[Unit]
+Description=WX Sniper V2 - NWWS-OI Product Ingestor
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/wx_sniper_v2
+EnvironmentFile=/home/ubuntu/wx_sniper_v2/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/wx_sniper_v2/nwws_client.py --jid %i@${NWWS_SERVER} --password ${NWWS_PASSWORD}
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wx-sniper-v2
+
+[Install]
+WantedBy=multi-user.target
