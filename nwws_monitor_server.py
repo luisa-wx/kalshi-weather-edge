@@ -1,14 +1,12 @@
 """
-NWWS-OI WebSocket Monitor Server
+NWWS-OI WebSocket Monitor Server — v2 with Kalshi Integration
 
-Runs the NWWS-OI XMPP client and broadcasts parsed CLI/DSM products
-to connected web dashboard clients via WebSocket.
+Runs the NWWS-OI XMPP client, loads Kalshi brackets on startup,
+and when CLI/DSM products arrive, resolves brackets and broadcasts
+opportunities to the dashboard.
 
 Usage:
     python3 nwws_monitor_server.py
-
-Serves:
-    - ws://0.0.0.0:8766  — WebSocket for real-time product feed
 """
 
 import asyncio
@@ -37,31 +35,14 @@ logger = logging.getLogger("nwws_monitor")
 NWWS_ROOM = "nwws@conference.nwws-oi.weather.gov"
 NWWS_OI_NS = "nwws-oi"
 
-# Our 19 watched stations
-STATIONS = {
-    "KNYC": {"city": "NYC", "tz": "ET", "cli_suffix": "NYC"},
-    "KPHL": {"city": "Philadelphia", "tz": "ET", "cli_suffix": "PHL"},
-    "KMDW": {"city": "Chicago", "tz": "CT", "cli_suffix": "MDW"},
-    "KLAX": {"city": "Los Angeles", "tz": "PT", "cli_suffix": "LAX"},
-    "KMIA": {"city": "Miami", "tz": "ET", "cli_suffix": "MIA"},
-    "KAUS": {"city": "Austin", "tz": "CT", "cli_suffix": "AUS"},
-    "KDEN": {"city": "Denver", "tz": "MT", "cli_suffix": "DEN"},
-    "KSFO": {"city": "San Francisco", "tz": "PT", "cli_suffix": "SFO"},
-    "KSEA": {"city": "Seattle", "tz": "PT", "cli_suffix": "SEA"},
-    "KDCA": {"city": "Washington DC", "tz": "ET", "cli_suffix": "DCA"},
-    "KMSY": {"city": "New Orleans", "tz": "CT", "cli_suffix": "MSY"},
-    "KLAS": {"city": "Las Vegas", "tz": "PT", "cli_suffix": "LAS"},
-    "KDFW": {"city": "Dallas", "tz": "CT", "cli_suffix": "DFW"},
-    "KHOU": {"city": "Houston", "tz": "CT", "cli_suffix": "HOU"},
-    "KBOS": {"city": "Boston", "tz": "ET", "cli_suffix": "BOS"},
-    "KMSP": {"city": "Minneapolis", "tz": "CT", "cli_suffix": "MSP"},
-    "KSAT": {"city": "San Antonio", "tz": "CT", "cli_suffix": "SAT"},
-    "KOKC": {"city": "Oklahoma City", "tz": "CT", "cli_suffix": "OKC"},
-    "KPHX": {"city": "Phoenix", "tz": "MST", "cli_suffix": "PHX"},
-}
+# Import station config and Kalshi client
+from stations import STATIONS
 
-# Reverse lookups
-CLI_SUFFIX_TO_STATION = {v["cli_suffix"]: k for k, v in STATIONS.items()}
+CLI_SUFFIX_TO_STATION = {}
+for k, v in STATIONS.items():
+    suffix = k[1:]  # KNYC -> NYC
+    CLI_SUFFIX_TO_STATION[suffix] = k
+
 DSM_SUFFIX_TO_STATION = {k[1:]: k for k in STATIONS}
 WATCHED_DSM_IDS = {f"DSM{k[1:]}" for k in STATIONS}
 
@@ -74,7 +55,6 @@ os.makedirs("logs", exist_ok=True)
 
 
 def save_product(product: dict):
-    """Append product to persistent JSONL file."""
     try:
         with open(PRODUCT_FILE, "a") as f:
             f.write(json.dumps(product) + "\n")
@@ -83,7 +63,6 @@ def save_product(product: dict):
 
 
 def load_products() -> list:
-    """Load all products from persistent file."""
     products = []
     if os.path.exists(PRODUCT_FILE):
         with open(PRODUCT_FILE, "r") as f:
@@ -101,7 +80,6 @@ def load_products() -> list:
 # ---------------------------------------------------------------------------
 
 def parse_cli(raw: str) -> dict:
-    """Parse a CLI (Climate Report) for high/low temps."""
     result = {
         "high": None, "low": None,
         "high_time": None, "low_time": None,
@@ -132,7 +110,6 @@ def parse_cli(raw: str) -> dict:
 
 
 def parse_dsm(raw: str) -> dict:
-    """Parse a DSM (Daily Summary Message) for high/low temps."""
     result = {
         "high": None, "low": None,
         "high_time": None, "low_time": None,
@@ -169,6 +146,113 @@ def resolve_dsm_station(awipsid: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Kalshi Bracket State
+# ---------------------------------------------------------------------------
+
+BRACKETS = {}
+KALSHI_CLIENT = None
+OPPORTUNITIES = []
+SNIPE_LOG = []
+PROCESSED_TICKERS = set()
+
+LIVE_MODE = os.environ.get("LIVE_MODE", "false").lower() == "true"
+ORDER_SIZE = int(os.environ.get("ORDER_SIZE", "10"))
+MAX_PRICE = int(os.environ.get("MAX_PRICE", "98"))
+
+
+def init_kalshi():
+    global KALSHI_CLIENT, BRACKETS
+
+    try:
+        from kalshi_client import KalshiClient, load_all_brackets
+        KALSHI_CLIENT = KalshiClient()
+
+        if KALSHI_CLIENT.private_key:
+            BRACKETS = load_all_brackets(KALSHI_CLIENT, STATIONS)
+            total_h = sum(len(v["high"]) for v in BRACKETS.values())
+            total_l = sum(len(v["low"]) for v in BRACKETS.values())
+            logger.info(f"Kalshi: {total_h} HIGH + {total_l} LOW brackets loaded")
+        else:
+            logger.warning("Kalshi: no credentials, bracket loading skipped")
+    except Exception as e:
+        logger.error(f"Kalshi init failed: {e}")
+        KALSHI_CLIENT = None
+
+
+def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None) -> list:
+    global OPPORTUNITIES
+
+    if not BRACKETS or station not in BRACKETS:
+        return []
+
+    try:
+        from kalshi_client import find_opportunities, execute_snipe
+
+        opps = find_opportunities(
+            BRACKETS,
+            cli_high=cli_high,
+            cli_low=cli_low,
+            station=station,
+            max_price=MAX_PRICE,
+        )
+
+        if opps:
+            logger.info(f"🎯 {station}: {len(opps)} opportunities found!")
+            for opp in opps:
+                b = opp["bracket"]
+                logger.info(f"  {opp['action']} {b.subtitle} @ {opp['price']}¢ (edge={opp['edge_cents']}¢)")
+
+                record = execute_snipe(
+                    KALSHI_CLIENT,
+                    opp,
+                    order_size=ORDER_SIZE,
+                    live_mode=LIVE_MODE,
+                    processed_tickers=PROCESSED_TICKERS,
+                )
+                SNIPE_LOG.append(record)
+
+                try:
+                    with open("logs/snipes.jsonl", "a") as f:
+                        f.write(json.dumps(record) + "\n")
+                except Exception:
+                    pass
+
+            OPPORTUNITIES.extend(opps)
+            if len(OPPORTUNITIES) > 100:
+                OPPORTUNITIES = OPPORTUNITIES[-100:]
+
+        return opps
+
+    except Exception as e:
+        logger.error(f"Opportunity check failed: {e}")
+        return []
+
+
+def get_brackets_summary() -> list:
+    summary = []
+    for station, data in BRACKETS.items():
+        cfg = STATIONS.get(station, {})
+        for signal_type in ("high", "low"):
+            for b in data.get(signal_type, []):
+                summary.append({
+                    "station": station,
+                    "city": cfg.get("city", station),
+                    "signal_type": signal_type,
+                    "ticker": b.ticker,
+                    "subtitle": b.subtitle,
+                    "floor": b.floor_strike,
+                    "cap": b.cap_strike,
+                    "yes_ask": b.yes_ask,
+                    "no_ask": b.no_ask,
+                    "yes_bid": b.yes_bid,
+                    "no_bid": b.no_bid,
+                    "status": b.status,
+                    "traded": b.traded,
+                })
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # WebSocket broadcast
 # ---------------------------------------------------------------------------
 
@@ -178,7 +262,6 @@ MAX_LOG = 500
 
 
 async def broadcast(message: dict):
-    """Send a JSON message to all connected WebSocket clients."""
     global CLIENTS
     payload = json.dumps(message)
     dead = set()
@@ -191,18 +274,33 @@ async def broadcast(message: dict):
 
 
 async def ws_handler(websocket):
-    """Handle a new WebSocket connection — send history then stream."""
     CLIENTS.add(websocket)
     logger.info(f"Dashboard connected ({len(CLIENTS)} total)")
 
     try:
-        # Send full history on connect
         await websocket.send(json.dumps({
-            "type": "history",
-            "data": PRODUCT_LOG[-200:],
+            "type": "init",
+            "products": PRODUCT_LOG[-200:],
+            "brackets": get_brackets_summary(),
+            "opportunities": [
+                {
+                    "action": o["action"],
+                    "price": o["price"],
+                    "edge_cents": o["edge_cents"],
+                    "reason": o["reason"],
+                    "station": o["bracket"].station,
+                    "subtitle": o["bracket"].subtitle,
+                }
+                for o in OPPORTUNITIES[-50:]
+            ],
+            "snipes": SNIPE_LOG[-50:],
+            "live_mode": LIVE_MODE,
+            "station_count": len(STATIONS),
+            "bracket_count": sum(
+                len(v["high"]) + len(v["low"]) for v in BRACKETS.values()
+            ),
         }))
 
-        # Listen for injected test products
         async for msg in websocket:
             try:
                 data = json.loads(msg)
@@ -211,6 +309,12 @@ async def ws_handler(websocket):
                     PRODUCT_LOG.append(product)
                     save_product(product)
                     await broadcast(data)
+                elif data.get("type") == "refresh_brackets":
+                    init_kalshi()
+                    await websocket.send(json.dumps({
+                        "type": "brackets_updated",
+                        "brackets": get_brackets_summary(),
+                    }))
             except Exception:
                 pass
     except Exception:
@@ -302,6 +406,27 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             self.stats["cli"] += 1
             self._emit(product)
 
+            if station and (parsed["high"] is not None or parsed["low"] is not None):
+                opps = check_cli_opportunities(station, cli_high=parsed["high"], cli_low=parsed["low"])
+                if opps:
+                    asyncio.ensure_future(broadcast({
+                        "type": "opportunities",
+                        "station": station,
+                        "cli_high": parsed["high"],
+                        "cli_low": parsed["low"],
+                        "opportunities": [
+                            {
+                                "action": o["action"],
+                                "price": o["price"],
+                                "edge_cents": o["edge_cents"],
+                                "reason": o["reason"],
+                                "subtitle": o["bracket"].subtitle,
+                                "ticker": o["bracket"].ticker,
+                            }
+                            for o in opps
+                        ],
+                    }))
+
         elif prefix == "DSM":
             station = resolve_dsm_station(awipsid)
             parsed = parse_dsm(raw)
@@ -324,8 +449,28 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             self.stats["dsm"] += 1
             self._emit(product)
 
+            if station and (parsed["high"] is not None or parsed["low"] is not None):
+                opps = check_cli_opportunities(station, cli_high=parsed["high"], cli_low=parsed["low"])
+                if opps:
+                    asyncio.ensure_future(broadcast({
+                        "type": "opportunities",
+                        "station": station,
+                        "cli_high": parsed["high"],
+                        "cli_low": parsed["low"],
+                        "opportunities": [
+                            {
+                                "action": o["action"],
+                                "price": o["price"],
+                                "edge_cents": o["edge_cents"],
+                                "reason": o["reason"],
+                                "subtitle": o["bracket"].subtitle,
+                                "ticker": o["bracket"].ticker,
+                            }
+                            for o in opps
+                        ],
+                    }))
+
     def _emit(self, product):
-        """Log, persist, and broadcast a parsed product."""
         tag = "🟢" if product["high"] is not None else "⚪"
         w = "★" if product["watched"] else " "
         logger.info(
@@ -335,15 +480,11 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             f"valid={product['valid_as']}"
         )
 
-        # Always save to file (watched and unwatched)
         save_product(product)
-
-        # Always add to in-memory log
         PRODUCT_LOG.append(product)
         if len(PRODUCT_LOG) > MAX_LOG:
             PRODUCT_LOG.pop(0)
 
-        # Broadcast to dashboards
         asyncio.ensure_future(broadcast({
             "type": "product",
             "data": product,
@@ -368,11 +509,9 @@ async def main():
 
     jid = f"{user_id}@{server}"
 
-    # Load historical products
     PRODUCT_LOG.extend(load_products())
-    logger.info(f"Product log has {len(PRODUCT_LOG)} entries")
+    init_kalshi()
 
-    # Start WebSocket server
     try:
         import websockets
     except ImportError:
@@ -384,13 +523,25 @@ async def main():
     ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8766)
     logger.info("WebSocket server running on ws://0.0.0.0:8766")
 
-    # Start NWWS-OI client
     client = NWWSMonitorClient(jid, password)
     client.connect((server, 5222))
 
     logger.info(f"Connecting to NWWS-OI as {jid}...")
     logger.info(f"Watching {len(STATIONS)} stations for CLI/DSM products")
+    logger.info(f"Mode: {'🔴 LIVE' if LIVE_MODE else '🧪 DRY RUN'} | Max price: {MAX_PRICE}¢ | Order size: {ORDER_SIZE}")
     logger.info(f"Dashboard: http://YOUR_EC2_IP:8080/nwws_monitor.html")
+
+    async def refresh_loop():
+        while True:
+            await asyncio.sleep(1800)
+            logger.info("Refreshing Kalshi brackets...")
+            init_kalshi()
+            await broadcast({
+                "type": "brackets_updated",
+                "brackets": get_brackets_summary(),
+            })
+
+    asyncio.ensure_future(refresh_loop())
 
     try:
         await asyncio.Future()
