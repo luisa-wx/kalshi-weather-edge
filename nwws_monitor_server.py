@@ -227,7 +227,35 @@ def init_kalshi():
         KALSHI_CLIENT = None
 
 
-def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None) -> list:
+def _cli_date_matches_brackets(station: str, valid_as: str) -> bool:
+    """Check if CLI date matches the bracket date for this station.
+    
+    valid_as is like 'FEBRUARY 11 2026' from CLI parser.
+    Brackets have suffix like '26FEB11'.
+    Only apply eliminations if they match — don't use yesterday's CLI on today's brackets.
+    """
+    if not valid_as or station not in BRACKETS:
+        return False
+
+    bracket_suffix = BRACKETS[station].get("suffix", "")
+    if not bracket_suffix:
+        return True  # No suffix info, assume match
+
+    try:
+        # Parse "FEBRUARY 11 2026" → datetime → "26FEB11"
+        from datetime import datetime as dt_cls
+        cli_date = dt_cls.strptime(valid_as.strip(), "%B %d %Y")
+        cli_suffix = cli_date.strftime("%y%b%d").upper()
+        matches = cli_suffix == bracket_suffix
+        if not matches:
+            logger.info(f"⏭️ {station}: CLI date {valid_as} ({cli_suffix}) != bracket date ({bracket_suffix}), skipping")
+        return matches
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"Could not parse CLI date '{valid_as}': {e}")
+        return True  # Can't parse, assume match to be safe
+
+
+def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None, valid_as: str = None) -> list:
     """When a CLI/DSM arrives, eliminate dead brackets and find opportunities.
     
     Uses ELIMINATION ONLY:
@@ -240,6 +268,10 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
     global OPPORTUNITIES
 
     if not BRACKETS or station not in BRACKETS:
+        return []
+
+    # Don't apply yesterday's CLI to today's brackets
+    if valid_as and not _cli_date_matches_brackets(station, valid_as):
         return []
 
     try:
@@ -526,6 +558,7 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             if station and (parsed["high"] is not None or parsed["low"] is not None):
                 opps = check_cli_opportunities(
                     station, cli_high=parsed["high"], cli_low=parsed["low"],
+                    valid_as=parsed.get("valid_as"),
                 )
                 if opps:
                     asyncio.ensure_future(broadcast({
@@ -642,6 +675,12 @@ async def main():
                 station = p["station"]
                 cli_high = p.get("high")
                 cli_low = p.get("low")
+                valid_as = p.get("valid_as")
+
+                # Skip if CLI date doesn't match bracket date
+                if valid_as and not _cli_date_matches_brackets(station, valid_as):
+                    continue
+
                 if cli_high is not None or cli_low is not None:
                     station_data = BRACKETS[station]
 
@@ -688,6 +727,30 @@ async def main():
     logger.info(f"Watching {len(STATIONS)} stations for CLI/DSM products")
     logger.info(f"Mode: {'🔴 LIVE' if LIVE_MODE else '🧪 DRY RUN'} | Max price: {MAX_PRICE}¢ | Order size: {ORDER_SIZE}")
     logger.info(f"Dashboard: http://YOUR_EC2_IP:8080/nwws_monitor.html")
+
+    # Start Kalshi WebSocket for real-time orderbook/ticker data
+    kalshi_ws = None
+    if KALSHI_CLIENT and KALSHI_CLIENT.private_key and BRACKETS:
+        try:
+            from kalshi_ws import KalshiWebSocket
+
+            def on_ticker_update(ticker, bracket):
+                """When a ticker updates, broadcast to dashboard."""
+                # Only broadcast periodically to avoid flooding
+                if kalshi_ws and kalshi_ws.stats["ticker_updates"] % 50 == 0:
+                    asyncio.ensure_future(broadcast({
+                        "type": "brackets_updated",
+                        "brackets": get_brackets_summary(),
+                    }))
+
+            kalshi_ws = KalshiWebSocket(
+                KALSHI_CLIENT, BRACKETS,
+                on_ticker_update=on_ticker_update,
+            )
+            asyncio.ensure_future(kalshi_ws.run())
+            logger.info("📡 Kalshi WebSocket streaming started")
+        except Exception as e:
+            logger.error(f"Failed to start Kalshi WebSocket: {e}")
 
     async def refresh_loop():
         while True:

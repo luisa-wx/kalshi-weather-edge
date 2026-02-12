@@ -410,10 +410,21 @@ function renderProducts() {
     let html = '';
     for (const p of watched.slice().reverse().slice(0, 100)) {
         const ts = p.timestamp ? new Date(p.timestamp).toLocaleTimeString() : '';
+        const dt = p.timestamp ? new Date(p.timestamp).toLocaleDateString('en-US', {month:'numeric', day:'numeric'}) : '';
         const badgeClass = p.product_type === 'CLI' ? 'badge-cli' : 'badge-dsm';
+        // valid_as contains "PRELIMINARY" or the date — use it to determine type
+        const validAs = (p.valid_as || '').toUpperCase();
+        const isPrelim = validAs.includes('PRELIM');
+        const isFinal = validAs && !isPrelim;
+        const typeTag = isPrelim
+            ? '<span style="color:#d29922;font-size:11px;margin-left:6px;">PRELIM</span>'
+            : isFinal
+            ? '<span style="color:#3fb950;font-size:11px;margin-left:6px;">FINAL</span>'
+            : '';
         html += `<div class="product-row watched">
-            <span class="product-time">${ts}</span>
+            <span class="product-time">${dt} ${ts}</span>
             <span class="product-badge ${badgeClass}">${p.product_type}</span>
+            ${typeTag}
             <span class="product-station">${p.station || '?'}</span>
             <span class="product-city">${p.city || ''}</span>
             <span class="product-temp">
