@@ -18,6 +18,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -211,14 +212,70 @@ class Bracket:
         self.status: str = "open"    # open / locked / dead
         self.traded: bool = False
 
+    # Alias: default check_temp uses intraday (elimination only)
     def check_temp(self, temp: int) -> str:
+        return self.check_temp_intraday(temp)
+
+    def check_temp_intraday(self, temp: int) -> str:
         """
-        Given a FINAL confirmed temperature (from CLI), determine bracket outcome.
+        ELIMINATION ONLY. Given an intraday observation, determine if this
+        bracket is provably DEAD (can never win).
         
-        Kalshi API encoding (strikes offset for greater/less):
-          greater "80° or above": floor=79, YES wins when final > 79
-          less "70° or below":    cap=71,   YES wins when final < 71  
-          between "72° to 73°":   floor=72, cap=73, YES wins when 72 <= final <= 73
+        Returns 'dead' or 'open'. NEVER returns 'locked' — we don't assert
+        winners from intraday data. Winners are inferred by exclusion 
+        (last-man-standing) at a higher level.
+        
+        HIGH markets (observed_high can only go UP):
+          - between: DEAD when observed > cap (high already past ceiling)
+          - greater: NEVER dead (high might still reach floor)
+          - less: DEAD when observed >= cap (high already too high)
+        
+        LOW markets (observed_low can only go DOWN):
+          - between: DEAD when observed < floor (low already below floor)
+          - greater: DEAD when observed <= floor (low already at/below floor)
+          - less: NEVER dead (low dropping helps it)
+        """
+        if self.signal_type == "high":
+            return self._eliminate_high(temp)
+        elif self.signal_type == "low":
+            return self._eliminate_low(temp)
+        return "open"
+
+    def _eliminate_high(self, observed_high: int) -> str:
+        """Can we prove this HIGH bracket is dead given observed high?"""
+        if self.strike_type == "between":
+            # "72° to 73°" cap=73: dead if high already > 73
+            if self.cap_strike is not None and observed_high > self.cap_strike:
+                return "dead"
+        elif self.strike_type in ("greater", "greater_or_equal"):
+            # "80° or above" floor=79: NEVER dead — high might still rise
+            pass
+        elif self.strike_type in ("less", "less_or_equal"):
+            # "70° or below" cap=71: dead if high already >= 71
+            if self.cap_strike is not None and observed_high >= self.cap_strike:
+                return "dead"
+        return "open"
+
+    def _eliminate_low(self, observed_low: int) -> str:
+        """Can we prove this LOW bracket is dead given observed low?"""
+        if self.strike_type == "between":
+            # "35° to 36°" floor=35: dead if low already < 35
+            if self.floor_strike is not None and observed_low < self.floor_strike:
+                return "dead"
+        elif self.strike_type in ("greater", "greater_or_equal"):
+            # "37° or above" floor=36: dead if low already <= 36
+            if self.floor_strike is not None and observed_low <= self.floor_strike:
+                return "dead"
+        elif self.strike_type in ("less", "less_or_equal"):
+            # "34° or below" cap=35: NEVER dead — low dropping helps it
+            pass
+        return "open"
+
+    def check_temp_final(self, temp: int) -> str:
+        """
+        Given a FINAL confirmed temperature, determine definitive outcome.
+        Only used when we're 100% certain the value won't change (e.g. 
+        last-man-standing, or manual override).
         """
         if self.signal_type == "high":
             return self._resolve_final_high(temp)
@@ -227,40 +284,33 @@ class Bracket:
         return "open"
 
     def _resolve_final_high(self, high: int) -> str:
-        """Resolve HIGH bracket given final CLI high temperature."""
+        """Resolve HIGH bracket given final high temperature."""
         if self.strike_type == "between":
-            # "72° to 73°": floor=72, cap=73 (actual boundaries, inclusive)
             if self.floor_strike is not None and self.cap_strike is not None:
                 if self.floor_strike <= high <= self.cap_strike:
                     return "locked"
                 return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
-            # "80° or above": floor=79. YES wins when final > 79.
             if self.floor_strike is not None:
                 return "locked" if high > self.floor_strike else "dead"
         elif self.strike_type in ("less", "less_or_equal"):
-            # "70° or below": cap=71. YES wins when final < 71.
             if self.cap_strike is not None:
                 return "locked" if high < self.cap_strike else "dead"
         return "open"
 
     def _resolve_final_low(self, low: int) -> str:
-        """Resolve LOW bracket given final CLI low temperature."""
+        """Resolve LOW bracket given final low temperature."""
         if self.strike_type == "between":
-            # "35° to 36°": floor=35, cap=36 (actual boundaries, inclusive)
             if self.floor_strike is not None and self.cap_strike is not None:
                 if self.floor_strike <= low <= self.cap_strike:
                     return "locked"
                 return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
-            # "37° or above": floor=36. YES wins when final > 36.
             if self.floor_strike is not None:
                 return "locked" if low > self.floor_strike else "dead"
         elif self.strike_type in ("less", "less_or_equal"):
-            # "34° or below": cap=35. YES wins when final < 35.
             if self.cap_strike is not None:
                 return "locked" if low < self.cap_strike else "dead"
-        return "open"
         return "open"
 
     def to_dict(self) -> dict:
@@ -434,11 +484,15 @@ def find_opportunities(
     max_price: int = 98,
 ) -> List[dict]:
     """
-    Given CLI temperatures, find brackets where:
-    1. The CLI temp resolves the bracket (locked or dead)
-    2. The winning side is priced below max_price
+    ELIMINATION-BASED opportunity detection.
 
-    Returns list of opportunity dicts.
+    Strategy:
+    1. BUY NO on dead brackets priced below max_price (safe: bracket provably can't win)
+    2. LAST-MAN-STANDING: if all but one bracket in a group are dead,
+       the survivor wins by exclusion → BUY YES on it if priced below max_price
+
+    We NEVER BUY YES on a bracket just because the CLI temp falls in its range.
+    That would be gambling on the temp not changing further.
     """
     opportunities = []
 
@@ -447,46 +501,54 @@ def find_opportunities(
     else:
         return opportunities
 
-    # Check HIGH brackets
-    if cli_high is not None:
-        for b in station_brackets.get("high", []):
-            result = b.check_temp(cli_high)
-            if result == "locked" and b.yes_ask > 0 and b.yes_ask <= max_price:
-                opportunities.append({
-                    "action": "BUY_YES",
-                    "bracket": b,
-                    "price": b.yes_ask,
-                    "reason": f"CLI HIGH={cli_high}°F resolves {b.subtitle} → LOCKED (yes_ask={b.yes_ask}¢)",
-                    "edge_cents": 100 - b.yes_ask,
-                })
-            elif result == "dead" and b.no_ask > 0 and b.no_ask <= max_price:
+    # Process each signal type (high, low) separately
+    for signal_type, temp in [("high", cli_high), ("low", cli_low)]:
+        if temp is None:
+            continue
+
+        group = station_brackets.get(signal_type, [])
+        if not group:
+            continue
+
+        # Run elimination on all brackets
+        alive = []
+        dead_list = []
+        for b in group:
+            result = b.check_temp_intraday(temp)
+            if result == "dead":
+                dead_list.append(b)
+            else:
+                alive.append(b)
+
+        # Opportunity 1: BUY NO on dead brackets that aren't already at 99-100¢
+        for b in dead_list:
+            if b.no_ask > 0 and b.no_ask <= max_price:
                 opportunities.append({
                     "action": "BUY_NO",
                     "bracket": b,
                     "price": b.no_ask,
-                    "reason": f"CLI HIGH={cli_high}°F resolves {b.subtitle} → DEAD (no_ask={b.no_ask}¢)",
+                    "reason": (
+                        f"CLI {signal_type.upper()}={temp}°F eliminates "
+                        f"{b.subtitle} → DEAD (no_ask={b.no_ask}¢)"
+                    ),
                     "edge_cents": 100 - b.no_ask,
                 })
 
-    # Check LOW brackets
-    if cli_low is not None:
-        for b in station_brackets.get("low", []):
-            result = b.check_temp(cli_low)
-            if result == "locked" and b.yes_ask > 0 and b.yes_ask <= max_price:
+        # Opportunity 2: LAST-MAN-STANDING
+        # If exactly 1 bracket survives elimination, it MUST win
+        if len(alive) == 1:
+            survivor = alive[0]
+            if survivor.yes_ask > 0 and survivor.yes_ask <= max_price:
                 opportunities.append({
                     "action": "BUY_YES",
-                    "bracket": b,
-                    "price": b.yes_ask,
-                    "reason": f"CLI LOW={cli_low}°F resolves {b.subtitle} → LOCKED (yes_ask={b.yes_ask}¢)",
-                    "edge_cents": 100 - b.yes_ask,
-                })
-            elif result == "dead" and b.no_ask > 0 and b.no_ask <= max_price:
-                opportunities.append({
-                    "action": "BUY_NO",
-                    "bracket": b,
-                    "price": b.no_ask,
-                    "reason": f"CLI LOW={cli_low}°F resolves {b.subtitle} → DEAD (no_ask={b.no_ask}¢)",
-                    "edge_cents": 100 - b.no_ask,
+                    "bracket": survivor,
+                    "price": survivor.yes_ask,
+                    "reason": (
+                        f"LAST-MAN-STANDING: CLI {signal_type.upper()}={temp}°F "
+                        f"eliminated {len(dead_list)} brackets, only "
+                        f"{survivor.subtitle} survives (yes_ask={survivor.yes_ask}¢)"
+                    ),
+                    "edge_cents": 100 - survivor.yes_ask,
                 })
 
     return sorted(opportunities, key=lambda x: x["edge_cents"], reverse=True)

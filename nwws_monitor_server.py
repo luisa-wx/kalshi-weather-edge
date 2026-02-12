@@ -228,7 +228,15 @@ def init_kalshi():
 
 
 def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None) -> list:
-    """When a CLI/DSM arrives, resolve ALL brackets and find cheap opportunities."""
+    """When a CLI/DSM arrives, eliminate dead brackets and find opportunities.
+    
+    Uses ELIMINATION ONLY:
+      - Marks brackets as dead if the observed temp proves they can't win
+      - BUY NO on dead brackets below max_price
+      - If all but one bracket eliminated → last-man-standing BUY YES
+    
+    Never asserts a bracket has won just because the temp is in its range.
+    """
     global OPPORTUNITIES
 
     if not BRACKETS or station not in BRACKETS:
@@ -237,34 +245,44 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
     try:
         from kalshi_client import find_opportunities, execute_snipe
 
-        # Step 1: Mark ALL brackets as locked/dead based on CLI temps
         station_data = BRACKETS[station]
         resolved_count = 0
 
+        # Eliminate HIGH brackets
         if cli_high is not None:
             for b in station_data.get("high", []):
-                new_status = b.check_temp(cli_high)
-                if new_status in ("locked", "dead") and b.status == "open":
-                    b.status = new_status
+                new_status = b.check_temp_intraday(cli_high)
+                if new_status == "dead" and b.status == "open":
+                    b.status = "dead"
                     resolved_count += 1
 
+        # Eliminate LOW brackets
         if cli_low is not None:
             for b in station_data.get("low", []):
-                new_status = b.check_temp(cli_low)
-                if new_status in ("locked", "dead") and b.status == "open":
-                    b.status = new_status
+                new_status = b.check_temp_intraday(cli_low)
+                if new_status == "dead" and b.status == "open":
+                    b.status = "dead"
                     resolved_count += 1
+
+        # Check for last-man-standing
+        for signal_type in ("high", "low"):
+            group = station_data.get(signal_type, [])
+            alive = [b for b in group if b.status != "dead"]
+            if len(alive) == 1 and alive[0].status == "open":
+                alive[0].status = "locked"
+                resolved_count += 1
+                logger.info(f"🏆 {station} {signal_type.upper()}: LAST-MAN-STANDING → {alive[0].subtitle}")
 
         if resolved_count > 0:
             logger.info(f"📊 {station}: {resolved_count} brackets resolved (H={cli_high} L={cli_low})")
 
-        # Step 2: Broadcast updated brackets to all dashboards
+        # Broadcast updated brackets
         asyncio.ensure_future(broadcast({
             "type": "brackets_updated",
             "brackets": get_brackets_summary(),
         }))
 
-        # Step 3: Find cheap opportunities (below threshold)
+        # Find cheap opportunities
         opps = find_opportunities(
             BRACKETS,
             cli_high=cli_high,
@@ -506,7 +524,9 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             self._emit(product)
 
             if station and (parsed["high"] is not None or parsed["low"] is not None):
-                opps = check_cli_opportunities(station, cli_high=parsed["high"], cli_low=parsed["low"])
+                opps = check_cli_opportunities(
+                    station, cli_high=parsed["high"], cli_low=parsed["low"],
+                )
                 if opps:
                     asyncio.ensure_future(broadcast({
                         "type": "opportunities",
@@ -549,7 +569,9 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
             self._emit(product)
 
             if station and (parsed["high"] is not None or parsed["low"] is not None):
-                opps = check_cli_opportunities(station, cli_high=parsed["high"], cli_low=parsed["low"])
+                opps = check_cli_opportunities(
+                    station, cli_high=parsed["high"], cli_low=parsed["low"],
+                )
                 if opps:
                     asyncio.ensure_future(broadcast({
                         "type": "opportunities",
@@ -612,7 +634,7 @@ async def main():
     cleanup_product_file(max_age_hours=48)
     init_kalshi()
 
-    # Replay CLI resolutions from historical products so brackets show correct status
+    # Replay CLI/DSM eliminations from historical products
     if BRACKETS:
         replayed = 0
         for p in PRODUCT_LOG:
@@ -622,20 +644,31 @@ async def main():
                 cli_low = p.get("low")
                 if cli_high is not None or cli_low is not None:
                     station_data = BRACKETS[station]
+
                     if cli_high is not None:
                         for b in station_data.get("high", []):
-                            new_status = b.check_temp(cli_high)
-                            if new_status in ("locked", "dead") and b.status == "open":
-                                b.status = new_status
+                            if b.status == "open" and b.check_temp_intraday(cli_high) == "dead":
+                                b.status = "dead"
                                 replayed += 1
+
                     if cli_low is not None:
                         for b in station_data.get("low", []):
-                            new_status = b.check_temp(cli_low)
-                            if new_status in ("locked", "dead") and b.status == "open":
-                                b.status = new_status
+                            if b.status == "open" and b.check_temp_intraday(cli_low) == "dead":
+                                b.status = "dead"
                                 replayed += 1
+
+        # Check for last-man-standing after all eliminations
+        for station, data in BRACKETS.items():
+            for signal_type in ("high", "low"):
+                group = data.get(signal_type, [])
+                alive = [b for b in group if b.status != "dead"]
+                if len(alive) == 1 and alive[0].status == "open":
+                    alive[0].status = "locked"
+                    replayed += 1
+                    logger.info(f"🏆 {station} {signal_type.upper()}: LAST-MAN-STANDING → {alive[0].subtitle}")
+
         if replayed:
-            logger.info(f"Replayed {replayed} bracket resolutions from historical products")
+            logger.info(f"Replayed {replayed} bracket eliminations from historical products")
 
     try:
         import websockets
