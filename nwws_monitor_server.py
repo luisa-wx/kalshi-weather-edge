@@ -62,17 +62,65 @@ def save_product(product: dict):
         logger.error(f"Failed to save product: {e}")
 
 
-def load_products() -> list:
+def load_products(max_age_hours: int = 48) -> list:
+    """Load products from JSONL, filtering to last max_age_hours."""
     products = []
+    cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+
     if os.path.exists(PRODUCT_FILE):
+        kept = 0
+        total = 0
         with open(PRODUCT_FILE, "r") as f:
             for line in f:
+                total += 1
                 try:
-                    products.append(json.loads(line.strip()))
+                    p = json.loads(line.strip())
+                    # Parse timestamp and filter
+                    ts = p.get("timestamp", "")
+                    if ts:
+                        try:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            if dt.timestamp() < cutoff:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    products.append(p)
+                    kept += 1
                 except Exception:
                     pass
-    logger.info(f"Loaded {len(products)} historical products from {PRODUCT_FILE}")
+        logger.info(f"Loaded {kept}/{total} products from {PRODUCT_FILE} (last {max_age_hours}h)")
     return products
+
+
+def cleanup_product_file(max_age_hours: int = 48):
+    """Rewrite JSONL file, removing products older than max_age_hours."""
+    if not os.path.exists(PRODUCT_FILE):
+        return
+
+    cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+    kept = []
+
+    with open(PRODUCT_FILE, "r") as f:
+        for line in f:
+            try:
+                p = json.loads(line.strip())
+                ts = p.get("timestamp", "")
+                if ts:
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if dt.timestamp() < cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                kept.append(line.strip())
+            except Exception:
+                pass
+
+    with open(PRODUCT_FILE, "w") as f:
+        for line in kept:
+            f.write(line + "\n")
+
+    logger.info(f"Cleaned product file: kept {len(kept)} records (last {max_age_hours}h)")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +306,7 @@ def get_brackets_summary() -> list:
 
 CLIENTS = set()
 PRODUCT_LOG = []
-MAX_LOG = 500
+MAX_LOG = 2000  # ~48h worth at typical volume
 
 
 async def broadcast(message: dict):
@@ -278,10 +326,27 @@ async def ws_handler(websocket):
     logger.info(f"Dashboard connected ({len(CLIENTS)} total)")
 
     try:
+        # Build cliData from product history (latest CLI/DSM per watched station)
+        cli_data = {}
+        for p in PRODUCT_LOG:
+            if p.get("watched") and p.get("station"):
+                station = p["station"]
+                # Always update with latest product for this station
+                cli_data[station] = {
+                    "high": p.get("high"),
+                    "low": p.get("low"),
+                    "high_time": p.get("high_time"),
+                    "low_time": p.get("low_time"),
+                    "product_type": p.get("product_type"),
+                    "valid_as": p.get("valid_as"),
+                    "timestamp": p.get("timestamp"),
+                }
+
         await websocket.send(json.dumps({
             "type": "init",
-            "products": PRODUCT_LOG[-200:],
+            "products": PRODUCT_LOG,
             "brackets": get_brackets_summary(),
+            "cliData": cli_data,
             "opportunities": [
                 {
                     "action": o["action"],
@@ -509,7 +574,8 @@ async def main():
 
     jid = f"{user_id}@{server}"
 
-    PRODUCT_LOG.extend(load_products())
+    PRODUCT_LOG.extend(load_products(max_age_hours=48))
+    cleanup_product_file(max_age_hours=48)
     init_kalshi()
 
     try:
@@ -540,6 +606,8 @@ async def main():
                 "type": "brackets_updated",
                 "brackets": get_brackets_summary(),
             })
+            # Cleanup old products every refresh cycle
+            cleanup_product_file(max_age_hours=48)
 
     asyncio.ensure_future(refresh_loop())
 

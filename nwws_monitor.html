@@ -1,334 +1,489 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>WX SNIPER — NWWS Monitor</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WX SNIPER — v2 Dashboard</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #0a0a0a;
-    color: #e0e0e0;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 13px;
-  }
-  .header {
-    border-bottom: 1px solid #1a1a2e;
-    padding: 14px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: linear-gradient(180deg, #0f0f1a 0%, #0a0a0a 100%);
-  }
-  .header-left { display: flex; align-items: center; gap: 12px; }
-  .logo { font-size: 18px; font-weight: 700; color: #f0f0f0; letter-spacing: -0.5px; }
-  .subtitle { font-size: 11px; color: #666; }
-  .header-right { display: flex; align-items: center; gap: 16px; }
-  .dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    display: inline-block; margin-right: 6px;
-  }
-  .dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-  .dot.off { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
-  .status { font-size: 11px; }
-  .status.on { color: #22c55e; }
-  .status.off { color: #ef4444; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0d1117; color:#c9d1d9; font-family:'SF Mono',Monaco,'Cascadia Code',monospace; font-size:13px; }
+.header { padding:12px 20px; border-bottom:1px solid #21262d; display:flex; justify-content:space-between; align-items:center; }
+.header h1 { font-size:20px; color:#f0f6fc; letter-spacing:2px; }
+.header h1 span { color:#58a6ff; font-size:12px; font-weight:400; margin-left:8px; }
+.status-bar { display:flex; gap:16px; align-items:center; font-size:12px; }
+.status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:4px; }
+.dot-green { background:#3fb950; }
+.dot-red { background:#f85149; }
+.dot-yellow { background:#d29922; }
+.mode-live { color:#f85149; font-weight:bold; }
+.mode-dry { color:#d29922; }
+.tabs { display:flex; gap:2px; padding:8px 20px; border-bottom:1px solid #21262d; }
+.tab { padding:6px 16px; cursor:pointer; border-radius:6px 6px 0 0; color:#8b949e; }
+.tab.active { background:#161b22; color:#58a6ff; border:1px solid #21262d; border-bottom:1px solid #161b22; }
+.tab .badge { background:#30363d; color:#c9d1d9; padding:1px 6px; border-radius:10px; font-size:11px; margin-left:4px; }
+.tab.active .badge { background:#1f6feb; color:#fff; }
 
-  .controls {
-    padding: 12px 24px;
-    display: flex; gap: 8px; align-items: center;
-    border-bottom: 1px solid #111;
-  }
-  .controls label { font-size: 11px; color: #555; margin-right: 8px; }
-  .controls input {
-    background: #111; border: 1px solid #222; color: #ccc;
-    padding: 4px 10px; border-radius: 4px; font-family: inherit; font-size: 12px;
-    width: 260px;
-  }
-  .controls input:focus { outline: none; border-color: #444; }
-  .btn {
-    padding: 4px 14px; font-size: 11px; font-family: inherit;
-    border: 1px solid transparent; border-radius: 4px;
-    background: transparent; color: #555; cursor: pointer;
-    text-transform: uppercase; letter-spacing: 0.5px;
-  }
-  .btn.active { border-color: #333; background: #1a1a2e; color: #fff; }
-  .btn:hover { color: #aaa; }
+.panel { display:none; padding:16px 20px; }
+.panel.active { display:block; }
 
-  .section-label {
-    font-size: 11px; color: #555; padding: 16px 24px 8px;
-    text-transform: uppercase; letter-spacing: 1px;
-  }
-  .empty {
-    padding: 40px 0; text-align: center; color: #333; font-size: 13px;
-  }
+/* --- Brackets panel --- */
+.station-group { margin-bottom:20px; }
+.station-header { display:flex; align-items:center; gap:10px; padding:8px 12px; background:#161b22; border:1px solid #21262d; border-radius:6px 6px 0 0; cursor:pointer; }
+.station-header:hover { background:#1c2128; }
+.station-header h3 { font-size:14px; color:#f0f6fc; }
+.station-header .city { color:#8b949e; font-weight:400; }
+.station-header .cli-temp { margin-left:auto; }
+.station-header .cli-temp .val { font-size:16px; font-weight:bold; }
+.station-header .cli-temp .high { color:#f97583; }
+.station-header .cli-temp .low { color:#79c0ff; }
 
-  .product-row {
-    display: grid;
-    grid-template-columns: 95px 55px 70px 1fr 110px;
-    align-items: center;
-    padding: 10px 12px;
-    margin: 1px 24px;
-    border-radius: 4px;
-    font-size: 12px;
-  }
-  .product-row.watched {
-    background: #0d0d1a;
-    border: 1px solid #111;
-  }
-  .product-row.watched.has-temp {
-    border-color: #1a1a3a;
-  }
-  .product-row.other {
-    background: #080808;
-    border: 1px solid #0a0a0a;
-  }
-  .time { color: #444; font-size: 11px; }
-  .badge {
-    font-size: 10px; padding: 2px 8px; border-radius: 3px;
-    font-weight: 600; text-align: center; display: inline-block;
-  }
-  .badge.cli { background: #1a1a3a; color: #818cf8; }
-  .badge.dsm { background: #1a1500; color: #fbbf24; }
-  .station-watched { color: #e0e0e0; font-weight: 600; }
-  .station-other { color: #555; }
-  .temp-high { color: #f87171; font-weight: 700; font-size: 16px; }
-  .temp-low { color: #60a5fa; font-weight: 700; font-size: 16px; }
-  .temp-label { color: #777; font-size: 10px; }
-  .temp-time { color: #555; font-size: 10px; margin-left: 4px; }
-  .valid-as { color: #444; font-size: 10px; text-align: right; }
-  .city-name { color: #333; font-size: 11px; }
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; padding:4px 8px; color:#8b949e; font-size:11px; font-weight:500; text-transform:uppercase; border-bottom:1px solid #21262d; }
+td { padding:5px 8px; border-bottom:1px solid #161b22; }
+tr:hover { background:#161b22; }
 
-  .raw-feed {
-    margin: 16px 24px; padding: 12px;
-    background: #050508; border: 1px solid #151520; border-radius: 6px;
-    max-height: 200px; overflow-y: auto;
-    font-size: 11px; color: #444; line-height: 1.7;
-  }
-  .raw-time { color: #333; }
-  .raw-cli { color: #6366f1; }
-  .raw-dsm { color: #f59e0b; }
-  .raw-cccc { color: #555; }
-  .raw-awips { color: #777; }
-  .raw-high { color: #ef4444; }
-  .raw-low { color: #3b82f6; margin-left: 8px; }
+.price { font-weight:bold; }
+.price-hot { color:#f97583; }  /* below 98 */
+.price-warm { color:#d29922; } /* 98 */
+.price-cold { color:#3fb950; } /* 99+ */
 
-  .count-badge {
-    background: #1a1a1a; color: #666; font-size: 10px;
-    padding: 1px 6px; border-radius: 3px; margin-left: 4px;
-  }
+.status-locked { color:#3fb950; font-weight:bold; }
+.status-dead { color:#f85149; }
+.status-open { color:#8b949e; }
+.status-traded { color:#d29922; font-weight:bold; }
+
+/* --- Opportunities panel --- */
+.opp-card { background:#161b22; border:1px solid #1f6feb; border-radius:8px; padding:12px 16px; margin-bottom:10px; }
+.opp-card.snipe { border-color:#3fb950; }
+.opp-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+.opp-action { font-weight:bold; font-size:14px; }
+.opp-action.buy-yes { color:#3fb950; }
+.opp-action.buy-no { color:#f97583; }
+.opp-edge { font-size:18px; font-weight:bold; color:#d29922; }
+.opp-detail { color:#8b949e; font-size:12px; }
+
+/* --- Products panel --- */
+.product-row { display:flex; gap:12px; padding:6px 0; border-bottom:1px solid #161b22; align-items:center; }
+.product-row.watched { background:#161b22; border-left:3px solid #1f6feb; padding-left:9px; }
+.product-time { color:#8b949e; min-width:85px; }
+.product-badge { padding:2px 8px; border-radius:4px; font-size:11px; font-weight:bold; min-width:36px; text-align:center; }
+.badge-cli { background:#1f6feb; color:#fff; }
+.badge-dsm { background:#238636; color:#fff; }
+.product-station { font-weight:bold; color:#f0f6fc; min-width:50px; }
+.product-city { color:#8b949e; min-width:120px; }
+.product-temp .high { color:#f97583; font-weight:bold; }
+.product-temp .low { color:#79c0ff; font-weight:bold; }
+
+/* --- Snipe log --- */
+.snipe-row { display:flex; gap:10px; padding:6px 0; border-bottom:1px solid #161b22; align-items:center; }
+.snipe-action { font-weight:bold; padding:2px 8px; border-radius:4px; font-size:11px; }
+.snipe-buy-yes { background:#238636; color:#fff; }
+.snipe-buy-no { background:#da3633; color:#fff; }
+.snipe-success { color:#3fb950; }
+.snipe-fail { color:#f85149; }
+
+.empty-state { text-align:center; padding:40px; color:#484f58; }
+
+/* Collapsible */
+.collapsible-body { display:none; border:1px solid #21262d; border-top:none; border-radius:0 0 6px 6px; }
+.station-group.open .collapsible-body { display:block; }
+.station-group.open .station-header { border-radius:6px 6px 0 0; }
 </style>
 </head>
 <body>
 
 <div class="header">
-  <div class="header-left">
-    <span class="logo">WX SNIPER</span>
-    <span class="subtitle">NWWS-OI MONITOR</span>
-  </div>
-  <div class="header-right">
-    <span class="dot off" id="dot"></span>
-    <span class="status off" id="status-text">DISCONNECTED</span>
-    <span style="font-size:11px;color:#555" id="clock"></span>
-  </div>
+    <h1>WX SNIPER <span>NWWS-OI v2</span></h1>
+    <div class="status-bar">
+        <div id="connStatus"><span class="status-dot dot-red"></span> Connecting...</div>
+        <div id="modeDisplay" class="mode-dry">DRY RUN</div>
+        <div id="bracketCount">0 brackets</div>
+    </div>
 </div>
 
-<div class="controls">
-  <label>WS:</label>
-  <input type="text" id="ws-url" value="ws://54.91.7.11:8766" />
-  <button class="btn active" id="btn-connect" onclick="toggleConnect()">Connect</button>
-  <span style="width:20px"></span>
-  <button class="btn active" id="btn-all" onclick="setFilter('all')">All <span class="count-badge" id="count-all">0</span></button>
-  <button class="btn" id="btn-cli" onclick="setFilter('cli')">CLI <span class="count-badge" id="count-cli">0</span></button>
-  <button class="btn" id="btn-dsm" onclick="setFilter('dsm')">DSM <span class="count-badge" id="count-dsm">0</span></button>
+<div class="tabs">
+    <div class="tab active" data-panel="brackets">BRACKETS <span class="badge" id="bracketBadge">0</span></div>
+    <div class="tab" data-panel="opportunities">OPPORTUNITIES <span class="badge" id="oppBadge">0</span></div>
+    <div class="tab" data-panel="products">PRODUCTS <span class="badge" id="productBadge">0</span></div>
+    <div class="tab" data-panel="snipes">SNIPES <span class="badge" id="snipeBadge">0</span></div>
 </div>
 
-<div class="section-label">Watched Stations</div>
-<div id="watched-products"><div class="empty">Waiting for CLI/DSM products for watched stations...</div></div>
-
-<div class="section-label">Other Stations</div>
-<div id="other-products"><div class="empty">—</div></div>
-
-<div class="section-label">Raw Feed</div>
-<div class="raw-feed" id="raw-feed"></div>
+<div class="panel active" id="panel-brackets"></div>
+<div class="panel" id="panel-opportunities"></div>
+<div class="panel" id="panel-products"></div>
+<div class="panel" id="panel-snipes"></div>
 
 <script>
-const WATCHED_STATIONS = new Set([
-  'KNYC','KPHL','KMDW','KLAX','KMIA','KAUS','KDEN','KSFO','KSEA',
-  'KDCA','KMSY','KLAS','KDFW','KHOU','KBOS','KMSP','KSAT','KOKC','KPHX'
-]);
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let ws = null;
+let brackets = [];
+let products = [];
+let opportunities = [];
+let snipes = [];
+let cliData = {};  // station -> {high, low, high_time, low_time}
 
-const STATION_NAMES = {
-  KNYC:'NYC', KPHL:'Philadelphia', KMDW:'Chicago', KLAX:'Los Angeles',
-  KMIA:'Miami', KAUS:'Austin', KDEN:'Denver', KSFO:'San Francisco',
-  KSEA:'Seattle', KDCA:'Washington DC', KMSY:'New Orleans', KLAS:'Las Vegas',
-  KDFW:'Dallas', KHOU:'Houston', KBOS:'Boston', KMSP:'Minneapolis',
-  KSAT:'San Antonio', KOKC:'Oklahoma City', KPHX:'Phoenix'
+const WS_URL = `ws://${location.hostname}:8766`;
+
+// Station config (matches stations.py)
+const STATIONS = {
+    KNYC:{city:"NYC"}, KPHL:{city:"Philadelphia"}, KMDW:{city:"Chicago"},
+    KLAX:{city:"Los Angeles"}, KMIA:{city:"Miami"}, KAUS:{city:"Austin"},
+    KDEN:{city:"Denver"}, KSFO:{city:"San Francisco"}, KSEA:{city:"Seattle"},
+    KDCA:{city:"Washington DC"}, KMSY:{city:"New Orleans"}, KLAS:{city:"Las Vegas"},
+    KDFW:{city:"Dallas"}, KHOU:{city:"Houston"}, KBOS:{city:"Boston"},
+    KMSP:{city:"Minneapolis"}, KSAT:{city:"San Antonio"}, KOKC:{city:"Oklahoma City"},
+    KPHX:{city:"Phoenix"},
 };
 
-let ws = null;
-let products = [];
-let filter = 'all';
-
-function setFilter(f) {
-  filter = f;
-  document.querySelectorAll('.controls .btn').forEach(b => {
-    if(b.id === 'btn-connect') return;
-    b.classList.toggle('active', b.id === 'btn-' + f);
-  });
-  render();
-}
-
-function toggleConnect() {
-  if (ws && ws.readyState <= 1) {
-    ws.close();
-    return;
-  }
-  const url = document.getElementById('ws-url').value;
-  ws = new WebSocket(url);
-  ws.onopen = () => {
-    document.getElementById('dot').className = 'dot on';
-    document.getElementById('status-text').className = 'status on';
-    document.getElementById('status-text').textContent = 'CONNECTED';
-    document.getElementById('btn-connect').textContent = 'Disconnect';
-  };
-  ws.onclose = () => {
-    document.getElementById('dot').className = 'dot off';
-    document.getElementById('status-text').className = 'status off';
-    document.getElementById('status-text').textContent = 'DISCONNECTED';
-    document.getElementById('btn-connect').textContent = 'Connect';
-  };
-  ws.onerror = () => {
-    document.getElementById('dot').className = 'dot off';
-    document.getElementById('status-text').className = 'status off';
-    document.getElementById('status-text').textContent = 'ERROR';
-  };
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'product') {
-        const p = msg.data;
-        p.receivedAt = new Date();
-        products.unshift(p);
-        if (products.length > 500) products.pop();
-        render();
-      } else if (msg.type === 'history') {
-        msg.data.forEach(p => {
-          p.receivedAt = new Date(p.timestamp || Date.now());
-          products.push(p);
-        });
-        render();
-      }
-    } catch(err) { console.error('Parse error:', err); }
-  };
-}
-
-function fmtTime(d) {
-  if (typeof d === 'string') d = new Date(d);
-  if (!(d instanceof Date) || isNaN(d)) return '--:--:--';
-  return d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
-}
-
-function render() {
-  const filtered = products.filter(p => {
-    if (filter === 'cli') return (p.product_type || p.type || '').toUpperCase() === 'CLI';
-    if (filter === 'dsm') return (p.product_type || p.type || '').toUpperCase() === 'DSM';
-    return true;
-  });
-
-  const cliCount = products.filter(p => (p.product_type||p.type||'').toUpperCase() === 'CLI').length;
-  const dsmCount = products.filter(p => (p.product_type||p.type||'').toUpperCase() === 'DSM').length;
-  document.getElementById('count-all').textContent = products.length;
-  document.getElementById('count-cli').textContent = cliCount;
-  document.getElementById('count-dsm').textContent = dsmCount;
-
-  const watched = filtered.filter(p => p.station && WATCHED_STATIONS.has(p.station));
-  const other = filtered.filter(p => !p.station || !WATCHED_STATIONS.has(p.station));
-
-  const watchedDiv = document.getElementById('watched-products');
-  const otherDiv = document.getElementById('other-products');
-  const rawDiv = document.getElementById('raw-feed');
-
-  if (watched.length === 0) {
-    watchedDiv.innerHTML = '<div class="empty">Waiting for CLI/DSM products for watched stations...</div>';
-  } else {
-    watchedDiv.innerHTML = watched.map(p => productRowHTML(p, true)).join('');
-  }
-
-  if (other.length === 0) {
-    otherDiv.innerHTML = '<div class="empty">—</div>';
-  } else {
-    otherDiv.innerHTML = other.map(p => productRowHTML(p, false)).join('');
-  }
-
-  rawDiv.innerHTML = filtered.slice(0, 100).map(p => {
-    const ptype = (p.product_type || p.type || '').toUpperCase();
-    const cls = ptype === 'CLI' ? 'raw-cli' : 'raw-dsm';
-    let temps = '';
-    if (p.high != null) temps += `<span class="raw-high">H:${p.high}°F</span>`;
-    if (p.low != null) temps += `<span class="raw-low">L:${p.low}°F</span>`;
-    return `<div><span class="raw-time">${fmtTime(p.receivedAt)}</span> <span class="${cls}">${ptype}</span> <span class="raw-cccc">${p.cccc||''}</span> <span class="raw-awips">${p.awipsid||''}</span> ${temps}</div>`;
-  }).join('');
-}
-
-function productRowHTML(p, isWatched) {
-  const ptype = (p.product_type || p.type || '').toUpperCase();
-  const hasTemp = p.high != null || p.low != null;
-  const rowClass = isWatched
-    ? `product-row watched${hasTemp ? ' has-temp' : ''}`
-    : 'product-row other';
-
-  const stationLabel = p.station
-    ? `${p.station} <span style="color:#555;font-weight:400;font-size:10px">${STATION_NAMES[p.station]||''}</span>`
-    : (p.awipsid || '').slice(3);
-
-  let tempHTML = '';
-  if (p.high != null) {
-    tempHTML += `<span><span class="temp-label">HIGH </span><span class="temp-high">${p.high}°F</span>`;
-    if (p.high_time) tempHTML += `<span class="temp-time">@ ${p.high_time}</span>`;
-    tempHTML += '</span>';
-  }
-  if (p.low != null) {
-    tempHTML += `<span style="margin-left:16px"><span class="temp-label">LOW </span><span class="temp-low">${p.low}°F</span>`;
-    if (p.low_time) tempHTML += `<span class="temp-time">@ ${p.low_time}</span>`;
-    tempHTML += '</span>';
-  }
-  if (!hasTemp) {
-    tempHTML = `<span class="city-name">${p.city || p.awipsid || '—'}</span>`;
-  }
-
-  const validAs = p.valid_as ? `as of ${p.valid_as}` : '';
-
-  return `<div class="${rowClass}">
-    <span class="time">${fmtTime(p.receivedAt)}</span>
-    <span class="badge ${ptype.toLowerCase()}">${ptype}</span>
-    <span class="${isWatched ? 'station-watched' : 'station-other'}">${stationLabel}</span>
-    <div>${tempHTML}</div>
-    <span class="valid-as">${validAs}</span>
-  </div>`;
-}
-
-// Clock
-setInterval(() => {
-  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
-}, 1000);
-
-// Auto-reconnect logic
-let reconnectTimer = null;
-function autoReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setInterval(() => {
-    if (!ws || ws.readyState > 1) {
-      toggleConnect();
-    }
-  }, 3000);
-}
-
-// Auto-connect on load
-window.addEventListener('load', () => {
-  setTimeout(toggleConnect, 500);
-  autoReconnect();
+// ---------------------------------------------------------------------------
+// Tab switching
+// ---------------------------------------------------------------------------
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+    });
 });
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+function connect() {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+        document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-green"></span> Connected';
+    };
+
+    ws.onclose = () => {
+        document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-red"></span> Disconnected';
+        setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => {
+        document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-red"></span> Error';
+    };
+
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'init') {
+            brackets = msg.brackets || [];
+            products = msg.products || [];
+            opportunities = msg.opportunities || [];
+            snipes = msg.snipes || [];
+
+            // Restore CLI data per station from server
+            if (msg.cliData) {
+                cliData = msg.cliData;
+            } else {
+                // Rebuild from products
+                cliData = {};
+                for (const p of products) {
+                    if (p.watched && p.station) {
+                        cliData[p.station] = {
+                            high: p.high,
+                            low: p.low,
+                            high_time: p.high_time,
+                            low_time: p.low_time,
+                            product_type: p.product_type,
+                            valid_as: p.valid_as,
+                            timestamp: p.timestamp,
+                        };
+                    }
+                }
+            }
+
+            if (msg.live_mode) {
+                document.getElementById('modeDisplay').className = 'mode-live';
+                document.getElementById('modeDisplay').textContent = '🔴 LIVE';
+            }
+            document.getElementById('bracketCount').textContent = msg.bracket_count + ' brackets';
+
+            // Extract CLI data from historical products
+            for (const p of products) {
+                if (p.watched && p.station && p.high !== null) {
+                    cliData[p.station] = {
+                        high: p.high, low: p.low,
+                        high_time: p.high_time, low_time: p.low_time,
+                        product_type: p.product_type,
+                    };
+                }
+            }
+
+            renderAll();
+
+        } else if (msg.type === 'product') {
+            const p = msg.data;
+            products.push(p);
+            if (p.watched && p.station && p.high !== null) {
+                cliData[p.station] = {
+                    high: p.high, low: p.low,
+                    high_time: p.high_time, low_time: p.low_time,
+                    product_type: p.product_type,
+                };
+            }
+            renderProducts();
+            renderBrackets();  // re-render to show CLI temps
+            updateBadges();
+
+        } else if (msg.type === 'opportunities') {
+            for (const o of (msg.opportunities || [])) {
+                o.station = msg.station;
+                o.cli_high = msg.cli_high;
+                o.cli_low = msg.cli_low;
+                o.time = new Date().toLocaleTimeString();
+                opportunities.push(o);
+            }
+            renderOpportunities();
+            updateBadges();
+            // Flash the opportunities tab
+            document.querySelector('[data-panel="opportunities"]').style.background = '#1f6feb33';
+            setTimeout(() => {
+                document.querySelector('[data-panel="opportunities"]').style.background = '';
+            }, 2000);
+
+        } else if (msg.type === 'brackets_updated') {
+            brackets = msg.brackets || [];
+            renderBrackets();
+            updateBadges();
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Render functions
+// ---------------------------------------------------------------------------
+function renderAll() {
+    renderBrackets();
+    renderProducts();
+    renderOpportunities();
+    renderSnipes();
+    updateBadges();
+}
+
+function updateBadges() {
+    document.getElementById('bracketBadge').textContent = brackets.length;
+    document.getElementById('oppBadge').textContent = opportunities.length;
+    document.getElementById('productBadge').textContent = products.filter(p => p.watched).length;
+    document.getElementById('snipeBadge').textContent = snipes.length;
+}
+
+function priceClass(price) {
+    if (price <= 0) return '';
+    if (price < 98) return 'price-hot';
+    if (price === 98) return 'price-warm';
+    return 'price-cold';
+}
+
+function renderBrackets() {
+    const panel = document.getElementById('panel-brackets');
+
+    // Group by station
+    const byStation = {};
+    for (const b of brackets) {
+        if (!byStation[b.station]) byStation[b.station] = [];
+        byStation[b.station].push(b);
+    }
+
+    // Sort stations: ones with CLI data first, then alphabetical by city
+    const stationOrder = Object.keys(byStation).sort((a, b) => {
+        const aHasCli = cliData[a] ? 1 : 0;
+        const bHasCli = cliData[b] ? 1 : 0;
+        if (aHasCli !== bHasCli) return bHasCli - aHasCli;
+        return (STATIONS[a]?.city || a).localeCompare(STATIONS[b]?.city || b);
+    });
+
+    let html = '';
+    for (const station of stationOrder) {
+        const bkts = byStation[station];
+        const city = STATIONS[station]?.city || station;
+        const cli = cliData[station];
+
+        const highBrackets = bkts.filter(b => b.signal_type === 'high')
+            .sort((a, b) => (a.floor || -999) - (b.floor || -999));
+        const lowBrackets = bkts.filter(b => b.signal_type === 'low')
+            .sort((a, b) => (a.floor || -999) - (b.floor || -999));
+
+        // Determine which bracket is resolved by CLI
+        let resolvedTicker = null;
+        if (cli && cli.high !== null) {
+            for (const b of highBrackets) {
+                if (b.floor !== null && b.cap !== null && b.floor <= cli.high && cli.high <= b.cap) {
+                    resolvedTicker = b.ticker;
+                }
+                if (b.floor !== null && b.cap === null && cli.high >= b.floor) {
+                    resolvedTicker = b.ticker;  // "X or above"
+                }
+                if (b.floor === null && b.cap !== null && cli.high < b.cap) {
+                    resolvedTicker = b.ticker;  // "X or below"
+                }
+            }
+        }
+
+        let cliHtml = '';
+        if (cli) {
+            cliHtml = `
+                <span class="cli-temp">
+                    <span class="val high">${cli.high !== null ? cli.high + '°F' : '—'}</span>
+                    <span style="color:#484f58"> / </span>
+                    <span class="val low">${cli.low !== null ? cli.low + '°F' : '—'}</span>
+                    <span style="color:#484f58;font-size:11px;margin-left:6px">${cli.product_type}</span>
+                </span>`;
+        }
+
+        const isOpen = cli ? ' open' : '';
+
+        html += `<div class="station-group${isOpen}" onclick="this.classList.toggle('open')">
+            <div class="station-header">
+                <h3>${station} <span class="city">${city}</span></h3>
+                ${cliHtml}
+            </div>
+            <div class="collapsible-body">`;
+
+        if (highBrackets.length > 0) {
+            html += `<table>
+                <tr><th colspan="6" style="color:#f97583;padding:6px 8px;">HIGH TEMP</th></tr>
+                <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
+            for (const b of highBrackets) {
+                const isResolved = b.ticker === resolvedTicker;
+                const rowStyle = isResolved ? 'background:#23863622;' : '';
+                const statusHtml = b.traded
+                    ? '<span class="status-traded">TRADED</span>'
+                    : isResolved
+                        ? '<span class="status-locked">✅ LOCKED</span>'
+                        : (cli ? '<span class="status-dead">DEAD</span>' : '<span class="status-open">OPEN</span>');
+
+                html += `<tr style="${rowStyle}">
+                    <td>${b.subtitle}</td>
+                    <td>${b.floor ?? '—'}</td>
+                    <td>${b.cap ?? '—'}</td>
+                    <td class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
+                    <td class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
+                    <td>${statusHtml}</td>
+                </tr>`;
+            }
+            html += '</table>';
+        }
+
+        if (lowBrackets.length > 0) {
+            html += `<table style="margin-top:8px">
+                <tr><th colspan="6" style="color:#79c0ff;padding:6px 8px;">LOW TEMP</th></tr>
+                <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
+            for (const b of lowBrackets) {
+                html += `<tr>
+                    <td>${b.subtitle}</td>
+                    <td>${b.floor ?? '—'}</td>
+                    <td>${b.cap ?? '—'}</td>
+                    <td class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
+                    <td class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
+                    <td><span class="status-open">OPEN</span></td>
+                </tr>`;
+            }
+            html += '</table>';
+        }
+
+        html += '</div></div>';
+    }
+
+    if (!html) html = '<div class="empty-state">Loading brackets...</div>';
+    panel.innerHTML = html;
+}
+
+function renderProducts() {
+    const panel = document.getElementById('panel-products');
+    // Only show watched station products
+    const watched = products.filter(p => p.watched);
+
+    if (watched.length === 0) {
+        panel.innerHTML = '<div class="empty-state">Waiting for CLI/DSM products...</div>';
+        return;
+    }
+
+    let html = '';
+    for (const p of watched.slice().reverse().slice(0, 100)) {
+        const ts = p.timestamp ? new Date(p.timestamp).toLocaleTimeString() : '';
+        const badgeClass = p.product_type === 'CLI' ? 'badge-cli' : 'badge-dsm';
+        html += `<div class="product-row watched">
+            <span class="product-time">${ts}</span>
+            <span class="product-badge ${badgeClass}">${p.product_type}</span>
+            <span class="product-station">${p.station || '?'}</span>
+            <span class="product-city">${p.city || ''}</span>
+            <span class="product-temp">
+                <span class="high">${p.high !== null ? p.high + '°F' : '—'}</span>
+                <span style="color:#484f58">@${p.high_time || '?'}</span>
+                &nbsp;
+                <span class="low">${p.low !== null ? p.low + '°F' : '—'}</span>
+                <span style="color:#484f58">@${p.low_time || '?'}</span>
+            </span>
+        </div>`;
+    }
+    panel.innerHTML = html;
+}
+
+function renderOpportunities() {
+    const panel = document.getElementById('panel-opportunities');
+
+    if (opportunities.length === 0) {
+        panel.innerHTML = '<div class="empty-state">No opportunities yet.<br>When a CLI drops and a bracket is below 98¢, it will appear here.</div>';
+        return;
+    }
+
+    let html = '';
+    for (const o of opportunities.slice().reverse()) {
+        const actionClass = o.action === 'BUY_YES' ? 'buy-yes' : 'buy-no';
+        html += `<div class="opp-card">
+            <div class="opp-header">
+                <span>
+                    <span class="opp-action ${actionClass}">${o.action}</span>
+                    <span style="margin-left:8px">${o.subtitle}</span>
+                    <span style="color:#8b949e;margin-left:8px">${o.station || ''}</span>
+                </span>
+                <span class="opp-edge">${o.edge_cents}¢ edge</span>
+            </div>
+            <div class="opp-detail">${o.reason}</div>
+            ${o.time ? '<div class="opp-detail" style="margin-top:2px">' + o.time + '</div>' : ''}
+        </div>`;
+    }
+    panel.innerHTML = html;
+}
+
+function renderSnipes() {
+    const panel = document.getElementById('panel-snipes');
+
+    if (snipes.length === 0) {
+        panel.innerHTML = '<div class="empty-state">No snipes executed yet.</div>';
+        return;
+    }
+
+    let html = '<table><tr><th>Time</th><th>Action</th><th>Station</th><th>Bracket</th><th>Price</th><th>Edge</th><th>Live</th><th>Status</th></tr>';
+    for (const s of snipes.slice().reverse()) {
+        const ts = s.time ? new Date(s.time).toLocaleTimeString() : '';
+        const actionClass = s.action === 'BUY_YES' ? 'snipe-buy-yes' : 'snipe-buy-no';
+        const statusClass = s.success ? 'snipe-success' : 'snipe-fail';
+        html += `<tr>
+            <td>${ts}</td>
+            <td><span class="snipe-action ${actionClass}">${s.action}</span></td>
+            <td>${s.station}</td>
+            <td>${s.subtitle || s.ticker}</td>
+            <td>${s.original_ask}¢ → ${s.price}¢</td>
+            <td>${s.edge_cents || '?'}¢</td>
+            <td>${s.live ? '🔴' : '🧪'}</td>
+            <td class="${statusClass}">${s.success ? '✅' : '❌'}</td>
+        </tr>`;
+    }
+    html += '</table>';
+    panel.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+connect();
 </script>
 </body>
 </html>
