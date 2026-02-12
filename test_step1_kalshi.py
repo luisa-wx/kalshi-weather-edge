@@ -139,53 +139,97 @@ if client.private_key:
 
 else:
     # No credentials — test with mock data
-    print("\n  Testing bracket logic with mock data...")
+    print("\n  Testing bracket logic with mock data (per reference doc)...")
+    
+    # HIGH between: "64° to 65°" → floor=64, cap=65
     b = Bracket(
-        ticker="KXHIGHTSEA-26FEB11-T52.5",
-        subtitle="52° to 53°",
-        floor_strike=52,
-        cap_strike=53,
-        strike_type="between",
-        signal_type="high",
-        station="KSEA",
+        ticker="TEST-B64.5", subtitle="64° to 65°",
+        floor_strike=64, cap_strike=65,
+        strike_type="between", signal_type="high", station="KLAX",
     )
-    b.yes_ask = 50
-    b.no_ask = 50
+    print(f"\n  HIGH between: {b.subtitle} (floor={b.floor_strike}, cap={b.cap_strike})")
+    print(f"    check_temp(64) = {b.check_temp(64)} (expect locked)")
+    print(f"    check_temp(65) = {b.check_temp(65)} (expect locked)")
+    print(f"    check_temp(63) = {b.check_temp(63)} (expect dead)")
+    print(f"    check_temp(66) = {b.check_temp(66)} (expect dead)")
+    assert b.check_temp(64) == "locked"
+    assert b.check_temp(65) == "locked"
+    assert b.check_temp(63) == "dead"
+    assert b.check_temp(66) == "dead"
+    print("    ✅ All correct")
 
-    print(f"  Bracket: {b}")
-    print(f"  check_temp(52) = {b.check_temp(52)}")  # Should be "locked"
-    print(f"  check_temp(54) = {b.check_temp(54)}")  # Should be "dead"
-    print(f"  check_temp(51) = {b.check_temp(51)}")  # Should be "dead"
-
-    # Test greater_or_equal
+    # HIGH greater: "72° or above" → floor=71 (offset by 1), YES wins when final > 71
     b2 = Bracket(
-        ticker="KXHIGHTSEA-26FEB11-B55",
-        subtitle="55° or above",
-        floor_strike=54,
-        cap_strike=None,
-        strike_type="greater",
-        signal_type="high",
-        station="KSEA",
+        ticker="TEST-G72", subtitle="72° or above",
+        floor_strike=71, cap_strike=None,
+        strike_type="greater", signal_type="high", station="KLAX",
     )
-    print(f"\n  Bracket: {b2}")
-    print(f"  check_temp(55) = {b2.check_temp(55)}")  # Should be "locked"
-    print(f"  check_temp(54) = {b2.check_temp(54)}")  # Should be "locked" (>= floor)
-    print(f"  check_temp(53) = {b2.check_temp(53)}")  # Should be "dead"
+    print(f"\n  HIGH greater: {b2.subtitle} (floor={b2.floor_strike})")
+    print(f"    check_temp(72) = {b2.check_temp(72)} (expect locked, 72>71)")
+    print(f"    check_temp(71) = {b2.check_temp(71)} (expect dead, 71>71 is false)")
+    print(f"    check_temp(80) = {b2.check_temp(80)} (expect locked)")
+    assert b2.check_temp(72) == "locked"
+    assert b2.check_temp(71) == "dead"
+    assert b2.check_temp(80) == "locked"
+    print("    ✅ All correct")
 
-    # Test less
+    # HIGH less: "61° or below" → cap=62 (offset by 1), YES wins when final < 62
     b3 = Bracket(
-        ticker="KXHIGHTSEA-26FEB11-L48",
-        subtitle="47° or below",
-        floor_strike=None,
-        cap_strike=48,
-        strike_type="less",
-        signal_type="high",
-        station="KSEA",
+        ticker="TEST-L61", subtitle="61° or below",
+        floor_strike=None, cap_strike=62,
+        strike_type="less", signal_type="high", station="KLAX",
     )
-    print(f"\n  Bracket: {b3}")
-    print(f"  check_temp(47) = {b3.check_temp(47)}")  # Should be "locked"
-    print(f"  check_temp(48) = {b3.check_temp(48)}")  # Should be "dead"
-    print(f"  check_temp(49) = {b3.check_temp(49)}")  # Should be "dead"
+    print(f"\n  HIGH less: {b3.subtitle} (cap={b3.cap_strike})")
+    print(f"    check_temp(61) = {b3.check_temp(61)} (expect locked, 61<62)")
+    print(f"    check_temp(62) = {b3.check_temp(62)} (expect dead, 62<62 is false)")
+    print(f"    check_temp(50) = {b3.check_temp(50)} (expect locked)")
+    assert b3.check_temp(61) == "locked"
+    assert b3.check_temp(62) == "dead"
+    assert b3.check_temp(50) == "locked"
+    print("    ✅ All correct")
+
+    # LOW between: "35° to 36°" → floor=35, cap=36
+    b4 = Bracket(
+        ticker="TEST-LB35", subtitle="35° to 36°",
+        floor_strike=35, cap_strike=36,
+        strike_type="between", signal_type="low", station="KNYC",
+    )
+    print(f"\n  LOW between: {b4.subtitle} (floor={b4.floor_strike}, cap={b4.cap_strike})")
+    print(f"    check_temp(35) = {b4.check_temp(35)} (expect locked)")
+    print(f"    check_temp(36) = {b4.check_temp(36)} (expect locked)")
+    print(f"    check_temp(34) = {b4.check_temp(34)} (expect dead)")
+    print(f"    check_temp(37) = {b4.check_temp(37)} (expect dead)")
+    assert b4.check_temp(35) == "locked"
+    assert b4.check_temp(36) == "locked"
+    assert b4.check_temp(34) == "dead"
+    assert b4.check_temp(37) == "dead"
+    print("    ✅ All correct")
+
+    # LOW greater: "37° or above" → floor=36, YES wins when final > 36
+    b5 = Bracket(
+        ticker="TEST-LG37", subtitle="37° or above",
+        floor_strike=36, cap_strike=None,
+        strike_type="greater", signal_type="low", station="KNYC",
+    )
+    print(f"\n  LOW greater: {b5.subtitle} (floor={b5.floor_strike})")
+    print(f"    check_temp(37) = {b5.check_temp(37)} (expect locked, 37>36)")
+    print(f"    check_temp(36) = {b5.check_temp(36)} (expect dead, 36>36 is false)")
+    assert b5.check_temp(37) == "locked"
+    assert b5.check_temp(36) == "dead"
+    print("    ✅ All correct")
+
+    # LOW less: "34° or below" → cap=35, YES wins when final < 35
+    b6 = Bracket(
+        ticker="TEST-LL34", subtitle="34° or below",
+        floor_strike=None, cap_strike=35,
+        strike_type="less", signal_type="low", station="KNYC",
+    )
+    print(f"\n  LOW less: {b6.subtitle} (cap={b6.cap_strike})")
+    print(f"    check_temp(34) = {b6.check_temp(34)} (expect locked, 34<35)")
+    print(f"    check_temp(35) = {b6.check_temp(35)} (expect dead, 35<35 is false)")
+    assert b6.check_temp(34) == "locked"
+    assert b6.check_temp(35) == "dead"
+    print("    ✅ All correct")
 
 print("\n" + "=" * 70)
 print("STEP 1 QC COMPLETE")

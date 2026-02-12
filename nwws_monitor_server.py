@@ -228,6 +228,7 @@ def init_kalshi():
 
 
 def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None) -> list:
+    """When a CLI/DSM arrives, resolve ALL brackets and find cheap opportunities."""
     global OPPORTUNITIES
 
     if not BRACKETS or station not in BRACKETS:
@@ -236,6 +237,34 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
     try:
         from kalshi_client import find_opportunities, execute_snipe
 
+        # Step 1: Mark ALL brackets as locked/dead based on CLI temps
+        station_data = BRACKETS[station]
+        resolved_count = 0
+
+        if cli_high is not None:
+            for b in station_data.get("high", []):
+                new_status = b.check_temp(cli_high)
+                if new_status in ("locked", "dead") and b.status == "open":
+                    b.status = new_status
+                    resolved_count += 1
+
+        if cli_low is not None:
+            for b in station_data.get("low", []):
+                new_status = b.check_temp(cli_low)
+                if new_status in ("locked", "dead") and b.status == "open":
+                    b.status = new_status
+                    resolved_count += 1
+
+        if resolved_count > 0:
+            logger.info(f"📊 {station}: {resolved_count} brackets resolved (H={cli_high} L={cli_low})")
+
+        # Step 2: Broadcast updated brackets to all dashboards
+        asyncio.ensure_future(broadcast({
+            "type": "brackets_updated",
+            "brackets": get_brackets_summary(),
+        }))
+
+        # Step 3: Find cheap opportunities (below threshold)
         opps = find_opportunities(
             BRACKETS,
             cli_high=cli_high,
@@ -577,6 +606,31 @@ async def main():
     PRODUCT_LOG.extend(load_products(max_age_hours=48))
     cleanup_product_file(max_age_hours=48)
     init_kalshi()
+
+    # Replay CLI resolutions from historical products so brackets show correct status
+    if BRACKETS:
+        replayed = 0
+        for p in PRODUCT_LOG:
+            if p.get("watched") and p.get("station") and p["station"] in BRACKETS:
+                station = p["station"]
+                cli_high = p.get("high")
+                cli_low = p.get("low")
+                if cli_high is not None or cli_low is not None:
+                    station_data = BRACKETS[station]
+                    if cli_high is not None:
+                        for b in station_data.get("high", []):
+                            new_status = b.check_temp(cli_high)
+                            if new_status in ("locked", "dead") and b.status == "open":
+                                b.status = new_status
+                                replayed += 1
+                    if cli_low is not None:
+                        for b in station_data.get("low", []):
+                            new_status = b.check_temp(cli_low)
+                            if new_status in ("locked", "dead") and b.status == "open":
+                                b.status = new_status
+                                replayed += 1
+        if replayed:
+            logger.info(f"Replayed {replayed} bracket resolutions from historical products")
 
     try:
         import websockets

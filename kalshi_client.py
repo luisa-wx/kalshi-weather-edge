@@ -207,47 +207,54 @@ class Bracket:
 
     def check_temp(self, temp: int) -> str:
         """
-        Given a confirmed temperature (from CLI/DSM), determine bracket status.
-
-        Kalshi convention:
-          greater: YES wins when final > floor
-          less:    YES wins when final < cap
-          between: YES wins when floor <= final <= cap
+        Given a FINAL confirmed temperature (from CLI), determine bracket outcome.
+        
+        Kalshi API encoding (strikes offset for greater/less):
+          greater "80° or above": floor=79, YES wins when final > 79
+          less "70° or below":    cap=71,   YES wins when final < 71  
+          between "72° to 73°":   floor=72, cap=73, YES wins when 72 <= final <= 73
         """
         if self.signal_type == "high":
-            return self._check_high(temp)
+            return self._resolve_final_high(temp)
         elif self.signal_type == "low":
-            return self._check_low(temp)
+            return self._resolve_final_low(temp)
         return "open"
 
-    def _check_high(self, high: int) -> str:
+    def _resolve_final_high(self, high: int) -> str:
+        """Resolve HIGH bracket given final CLI high temperature."""
         if self.strike_type == "between":
+            # "72° to 73°": floor=72, cap=73 (actual boundaries, inclusive)
             if self.floor_strike is not None and self.cap_strike is not None:
                 if self.floor_strike <= high <= self.cap_strike:
                     return "locked"
-                else:
-                    return "dead"
+                return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
+            # "80° or above": floor=79. YES wins when final > 79.
             if self.floor_strike is not None:
-                return "locked" if high >= self.floor_strike else "dead"
+                return "locked" if high > self.floor_strike else "dead"
         elif self.strike_type in ("less", "less_or_equal"):
+            # "70° or below": cap=71. YES wins when final < 71.
             if self.cap_strike is not None:
                 return "locked" if high < self.cap_strike else "dead"
         return "open"
 
-    def _check_low(self, low: int) -> str:
+    def _resolve_final_low(self, low: int) -> str:
+        """Resolve LOW bracket given final CLI low temperature."""
         if self.strike_type == "between":
+            # "35° to 36°": floor=35, cap=36 (actual boundaries, inclusive)
             if self.floor_strike is not None and self.cap_strike is not None:
                 if self.floor_strike <= low <= self.cap_strike:
                     return "locked"
-                else:
-                    return "dead"
+                return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
+            # "37° or above": floor=36. YES wins when final > 36.
             if self.floor_strike is not None:
                 return "locked" if low > self.floor_strike else "dead"
         elif self.strike_type in ("less", "less_or_equal"):
+            # "34° or below": cap=35. YES wins when final < 35.
             if self.cap_strike is not None:
-                return "locked" if low <= self.cap_strike else "dead"
+                return "locked" if low < self.cap_strike else "dead"
+        return "open"
         return "open"
 
     def to_dict(self) -> dict:

@@ -204,17 +204,6 @@ function connect() {
             }
             document.getElementById('bracketCount').textContent = msg.bracket_count + ' brackets';
 
-            // Extract CLI data from historical products
-            for (const p of products) {
-                if (p.watched && p.station && p.high !== null) {
-                    cliData[p.station] = {
-                        high: p.high, low: p.low,
-                        high_time: p.high_time, low_time: p.low_time,
-                        product_type: p.product_type,
-                    };
-                }
-            }
-
             renderAll();
 
         } else if (msg.type === 'product') {
@@ -350,13 +339,19 @@ function renderBrackets() {
                 <tr><th colspan="6" style="color:#f97583;padding:6px 8px;">HIGH TEMP</th></tr>
                 <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
             for (const b of highBrackets) {
-                const isResolved = b.ticker === resolvedTicker;
-                const rowStyle = isResolved ? 'background:#23863622;' : '';
-                const statusHtml = b.traded
-                    ? '<span class="status-traded">TRADED</span>'
-                    : isResolved
-                        ? '<span class="status-locked">✅ LOCKED</span>'
-                        : (cli ? '<span class="status-dead">DEAD</span>' : '<span class="status-open">OPEN</span>');
+                const isLocked = b.status === 'locked';
+                const isDead = b.status === 'dead';
+                const rowStyle = isLocked ? 'background:#23863622;' : isDead ? 'background:#f8514911;' : '';
+                let statusHtml;
+                if (b.traded) {
+                    statusHtml = '<span class="status-traded">💰 TRADED</span>';
+                } else if (isLocked) {
+                    statusHtml = '<span class="status-locked">✅ LOCKED</span>';
+                } else if (isDead) {
+                    statusHtml = '<span class="status-dead">❌ DEAD</span>';
+                } else {
+                    statusHtml = '<span class="status-open">OPEN</span>';
+                }
 
                 html += `<tr style="${rowStyle}">
                     <td>${b.subtitle}</td>
@@ -375,13 +370,26 @@ function renderBrackets() {
                 <tr><th colspan="6" style="color:#79c0ff;padding:6px 8px;">LOW TEMP</th></tr>
                 <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
             for (const b of lowBrackets) {
-                html += `<tr>
+                const isLocked = b.status === 'locked';
+                const isDead = b.status === 'dead';
+                const rowStyle = isLocked ? 'background:#1f6feb22;' : isDead ? 'background:#f8514911;' : '';
+                let statusHtml;
+                if (b.traded) {
+                    statusHtml = '<span class="status-traded">💰 TRADED</span>';
+                } else if (isLocked) {
+                    statusHtml = '<span class="status-locked">✅ LOCKED</span>';
+                } else if (isDead) {
+                    statusHtml = '<span class="status-dead">❌ DEAD</span>';
+                } else {
+                    statusHtml = '<span class="status-open">OPEN</span>';
+                }
+                html += `<tr style="${rowStyle}">
                     <td>${b.subtitle}</td>
                     <td>${b.floor ?? '—'}</td>
                     <td>${b.cap ?? '—'}</td>
                     <td class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
                     <td class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
-                    <td><span class="status-open">OPEN</span></td>
+                    <td>${statusHtml}</td>
                 </tr>`;
             }
             html += '</table>';
