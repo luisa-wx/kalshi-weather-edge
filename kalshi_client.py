@@ -1,0 +1,518 @@
+"""
+Kalshi API Client for WX Sniper v2.
+
+Handles RSA-PSS authentication, market data retrieval, bracket loading,
+and order execution. Extracted from v1 smart_poller.py.
+
+Environment variables:
+    KALSHI_API_KEY_ID   — API key identifier
+    KALSHI_PRIVATE_KEY  — RSA private key (PEM format)
+    LIVE_MODE           — "true" for real trading
+"""
+
+import base64
+import json
+import logging
+import math
+import os
+import re
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+from requests.adapters import HTTPAdapter
+
+logger = logging.getLogger("kalshi_client")
+
+# ---------------------------------------------------------------------------
+# Kalshi REST Client
+# ---------------------------------------------------------------------------
+
+class KalshiClient:
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(self):
+        self.api_key_id = os.environ.get("KALSHI_API_KEY_ID", "")
+        self.private_key_str = os.environ.get("KALSHI_PRIVATE_KEY", "")
+
+        # Optimised HTTP session (persistent connections)
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
+        self.session.mount("https://", adapter)
+
+        self.last_latency_ms: float = 0
+        self.private_key = None
+
+        if self.api_key_id and self.private_key_str:
+            self.private_key = self._load_private_key()
+            logger.info("Kalshi credentials loaded (key_id=%s…)", self.api_key_id[:8])
+        else:
+            logger.warning("No Kalshi API credentials — dry-run only")
+
+    # -- key loading ----------------------------------------------------------
+
+    def _load_private_key(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
+
+        key_str = self.private_key_str.strip().replace("\\n", "\n").replace("\\r", "")
+
+        if "\n" not in key_str and "PRIVATE KEY" in key_str:
+            match = re.search(
+                r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)\s*"
+                r"([A-Za-z0-9+/=\s]+?)\s*"
+                r"(-----END [A-Z ]*PRIVATE KEY-----)",
+                key_str,
+            )
+            if match:
+                header, content, footer = match.groups()
+                content = "".join(content.split())
+                lines = [content[i : i + 64] for i in range(0, len(content), 64)]
+                key_str = header + "\n" + "\n".join(lines) + "\n" + footer + "\n"
+
+        if not key_str.endswith("\n"):
+            key_str += "\n"
+
+        return serialization.load_pem_private_key(
+            key_str.encode(), password=None, backend=default_backend()
+        )
+
+    # -- request signing ------------------------------------------------------
+
+    def _sign_request(self, timestamp_ms: int, method: str, path: str) -> str:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        message = f"{timestamp_ms}{method}{path}"
+        signature = self.private_key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode()
+
+    # -- HTTP -----------------------------------------------------------------
+
+    def _make_request(
+        self, method: str, endpoint: str, params: Dict = None, data: Dict = None
+    ) -> Dict:
+        start = time.perf_counter()
+
+        timestamp_ms = int(time.time() * 1000)
+        sign_path = f"/trade-api/v2{endpoint}"
+        url = f"{self.BASE_URL}{endpoint}"
+
+        if params:
+            query_string = "&".join(f"{k}={v}" for k, v in params.items())
+            sign_path = f"/trade-api/v2{endpoint}?{query_string}"
+            url = f"{self.BASE_URL}{endpoint}?{query_string}"
+
+        signature = self._sign_request(timestamp_ms, method.upper(), sign_path)
+
+        headers = {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+            "Content-Type": "application/json",
+        }
+
+        if method.upper() == "GET":
+            resp = self.session.get(url, headers=headers, timeout=10)
+        elif method.upper() == "POST":
+            resp = self.session.post(url, headers=headers, json=data, timeout=10)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+        self.last_latency_ms = (time.perf_counter() - start) * 1000
+        resp.raise_for_status()
+        return resp.json()
+
+    # -- public API methods ---------------------------------------------------
+
+    def get_exchange_status(self) -> Dict:
+        return self._make_request("GET", "/exchange/status")
+
+    def get_event(self, event_ticker: str) -> Dict:
+        return self._make_request(
+            "GET", f"/events/{event_ticker}", params={"with_nested_markets": "true"}
+        )
+
+    def get_market(self, ticker: str) -> Dict:
+        return self._make_request("GET", f"/markets/{ticker}")
+
+    def create_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        order_type: str = "limit",
+        price_cents: int = None,
+    ) -> Dict:
+        data = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": order_type,
+        }
+        if order_type == "limit" and price_cents is not None:
+            if side == "yes":
+                data["yes_price"] = price_cents
+            else:
+                data["no_price"] = price_cents
+
+        logger.info("ORDER: %s %s %s x%d @ %s¢", action, side, ticker, count, price_cents)
+        result = self._make_request("POST", "/portfolio/orders", data=data)
+        logger.info("ORDER OK: latency=%dms", self.last_latency_ms)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Bracket State
+# ---------------------------------------------------------------------------
+
+class Bracket:
+    """Tracks a single Kalshi bracket (market)."""
+
+    def __init__(
+        self,
+        ticker: str,
+        subtitle: str,
+        floor_strike: Optional[int],
+        cap_strike: Optional[int],
+        strike_type: str,
+        signal_type: str,   # 'high' or 'low'
+        station: str,
+    ):
+        self.ticker = ticker
+        self.subtitle = subtitle
+        self.floor_strike = floor_strike
+        self.cap_strike = cap_strike
+        self.strike_type = strike_type
+        self.signal_type = signal_type
+        self.station = station
+
+        self.yes_ask: int = 0
+        self.no_ask: int = 0
+        self.yes_bid: int = 0
+        self.no_bid: int = 0
+        self.status: str = "open"    # open / locked / dead
+        self.traded: bool = False
+
+    def check_temp(self, temp: int) -> str:
+        """
+        Given a confirmed temperature (from CLI/DSM), determine bracket status.
+
+        Kalshi convention:
+          greater: YES wins when final > floor
+          less:    YES wins when final < cap
+          between: YES wins when floor <= final <= cap
+        """
+        if self.signal_type == "high":
+            return self._check_high(temp)
+        elif self.signal_type == "low":
+            return self._check_low(temp)
+        return "open"
+
+    def _check_high(self, high: int) -> str:
+        if self.strike_type == "between":
+            if self.floor_strike is not None and self.cap_strike is not None:
+                if self.floor_strike <= high <= self.cap_strike:
+                    return "locked"
+                else:
+                    return "dead"
+        elif self.strike_type in ("greater", "greater_or_equal"):
+            if self.floor_strike is not None:
+                return "locked" if high >= self.floor_strike else "dead"
+        elif self.strike_type in ("less", "less_or_equal"):
+            if self.cap_strike is not None:
+                return "locked" if high < self.cap_strike else "dead"
+        return "open"
+
+    def _check_low(self, low: int) -> str:
+        if self.strike_type == "between":
+            if self.floor_strike is not None and self.cap_strike is not None:
+                if self.floor_strike <= low <= self.cap_strike:
+                    return "locked"
+                else:
+                    return "dead"
+        elif self.strike_type in ("greater", "greater_or_equal"):
+            if self.floor_strike is not None:
+                return "locked" if low > self.floor_strike else "dead"
+        elif self.strike_type in ("less", "less_or_equal"):
+            if self.cap_strike is not None:
+                return "locked" if low <= self.cap_strike else "dead"
+        return "open"
+
+    def to_dict(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "subtitle": self.subtitle,
+            "floor": self.floor_strike,
+            "cap": self.cap_strike,
+            "strike_type": self.strike_type,
+            "signal_type": self.signal_type,
+            "station": self.station,
+            "yes_ask": self.yes_ask,
+            "no_ask": self.no_ask,
+            "yes_bid": self.yes_bid,
+            "no_bid": self.no_bid,
+            "status": self.status,
+        }
+
+    def __repr__(self):
+        return f"<Bracket {self.ticker} {self.subtitle} yes={self.yes_ask}¢ status={self.status}>"
+
+
+# ---------------------------------------------------------------------------
+# Bracket Loader — fetches all brackets for all stations from Kalshi
+# ---------------------------------------------------------------------------
+
+def _parse_price(price_raw, price_dollars) -> int:
+    """Parse Kalshi API price into cents."""
+    if price_dollars:
+        try:
+            val = int(float(price_dollars) * 100)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    if price_raw is not None:
+        try:
+            if isinstance(price_raw, str):
+                val = int(float(price_raw) * 100)
+            elif price_raw < 2:
+                val = int(price_raw * 100)
+            else:
+                val = int(price_raw)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def get_today_suffix() -> str:
+    """Kalshi event date suffix like '26FEB11'."""
+    return datetime.now(timezone.utc).strftime("%y%b%d").upper()
+
+
+def load_brackets_for_station(
+    client: KalshiClient,
+    station: str,
+    ticker_base: str,
+    signal_type: str,
+    today_suffix: str = None,
+) -> List[Bracket]:
+    """Load all brackets for one event (e.g. KXHIGHNY-26FEB11)."""
+    if today_suffix is None:
+        today_suffix = get_today_suffix()
+
+    event_ticker = f"{ticker_base}-{today_suffix}"
+    brackets = []
+
+    try:
+        event_data = client.get_event(event_ticker)
+        event_obj = event_data.get("event", event_data)
+        markets = event_obj.get("markets", [])
+
+        for m in markets:
+            floor_val = m.get("floor_strike")
+            cap_val = m.get("cap_strike")
+            b = Bracket(
+                ticker=m.get("ticker", ""),
+                subtitle=m.get("yes_sub_title", m.get("subtitle", "")),
+                floor_strike=int(floor_val) if floor_val is not None else None,
+                cap_strike=int(cap_val) if cap_val is not None else None,
+                strike_type=m.get("strike_type", "between"),
+                signal_type=signal_type,
+                station=station,
+            )
+            b.yes_ask = _parse_price(m.get("yes_ask"), m.get("yes_ask_dollars"))
+            b.no_ask = _parse_price(m.get("no_ask"), m.get("no_ask_dollars"))
+            b.yes_bid = _parse_price(m.get("yes_bid"), m.get("yes_bid_dollars"))
+            b.no_bid = _parse_price(m.get("no_bid"), m.get("no_bid_dollars"))
+            brackets.append(b)
+
+        logger.info(
+            "%s %s: %d brackets loaded (event=%s)",
+            station,
+            signal_type.upper(),
+            len(brackets),
+            event_ticker,
+        )
+    except Exception as e:
+        logger.error("%s %s: failed to load — %s", station, signal_type.upper(), e)
+
+    return brackets
+
+
+def load_all_brackets(client: KalshiClient, stations: dict) -> Dict[str, Dict[str, List[Bracket]]]:
+    """
+    Load all brackets for all stations.
+
+    Returns: {station_code: {"high": [Bracket, ...], "low": [Bracket, ...]}}
+    """
+    today_suffix = get_today_suffix()
+    result = {}
+
+    for station, cfg in stations.items():
+        result[station] = {"high": [], "low": []}
+
+        high_ticker = cfg.get("high_ticker")
+        if high_ticker:
+            result[station]["high"] = load_brackets_for_station(
+                client, station, high_ticker, "high", today_suffix
+            )
+
+        low_ticker = cfg.get("low_ticker")
+        if low_ticker:
+            result[station]["low"] = load_brackets_for_station(
+                client, station, low_ticker, "low", today_suffix
+            )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Opportunity detection
+# ---------------------------------------------------------------------------
+
+def find_opportunities(
+    brackets: Dict[str, Dict[str, List[Bracket]]],
+    cli_high: int = None,
+    cli_low: int = None,
+    station: str = None,
+    max_price: int = 98,
+) -> List[dict]:
+    """
+    Given CLI temperatures, find brackets where:
+    1. The CLI temp resolves the bracket (locked or dead)
+    2. The winning side is priced below max_price
+
+    Returns list of opportunity dicts.
+    """
+    opportunities = []
+
+    if station and station in brackets:
+        station_brackets = brackets[station]
+    else:
+        return opportunities
+
+    # Check HIGH brackets
+    if cli_high is not None:
+        for b in station_brackets.get("high", []):
+            result = b.check_temp(cli_high)
+            if result == "locked" and b.yes_ask > 0 and b.yes_ask <= max_price:
+                opportunities.append({
+                    "action": "BUY_YES",
+                    "bracket": b,
+                    "price": b.yes_ask,
+                    "reason": f"CLI HIGH={cli_high}°F resolves {b.subtitle} → LOCKED (yes_ask={b.yes_ask}¢)",
+                    "edge_cents": 100 - b.yes_ask,
+                })
+            elif result == "dead" and b.no_ask > 0 and b.no_ask <= max_price:
+                opportunities.append({
+                    "action": "BUY_NO",
+                    "bracket": b,
+                    "price": b.no_ask,
+                    "reason": f"CLI HIGH={cli_high}°F resolves {b.subtitle} → DEAD (no_ask={b.no_ask}¢)",
+                    "edge_cents": 100 - b.no_ask,
+                })
+
+    # Check LOW brackets
+    if cli_low is not None:
+        for b in station_brackets.get("low", []):
+            result = b.check_temp(cli_low)
+            if result == "locked" and b.yes_ask > 0 and b.yes_ask <= max_price:
+                opportunities.append({
+                    "action": "BUY_YES",
+                    "bracket": b,
+                    "price": b.yes_ask,
+                    "reason": f"CLI LOW={cli_low}°F resolves {b.subtitle} → LOCKED (yes_ask={b.yes_ask}¢)",
+                    "edge_cents": 100 - b.yes_ask,
+                })
+            elif result == "dead" and b.no_ask > 0 and b.no_ask <= max_price:
+                opportunities.append({
+                    "action": "BUY_NO",
+                    "bracket": b,
+                    "price": b.no_ask,
+                    "reason": f"CLI LOW={cli_low}°F resolves {b.subtitle} → DEAD (no_ask={b.no_ask}¢)",
+                    "edge_cents": 100 - b.no_ask,
+                })
+
+    return sorted(opportunities, key=lambda x: x["edge_cents"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Order execution
+# ---------------------------------------------------------------------------
+
+def execute_snipe(
+    client: KalshiClient,
+    opportunity: dict,
+    order_size: int = 10,
+    live_mode: bool = False,
+    processed_tickers: set = None,
+) -> dict:
+    """
+    Execute a snipe trade for an opportunity.
+    Returns trade record dict.
+    """
+    bracket = opportunity["bracket"]
+
+    if processed_tickers and bracket.ticker in processed_tickers:
+        logger.warning("SKIP: %s already traded", bracket.ticker)
+        return {"success": False, "reason": "duplicate"}
+
+    side = "yes" if opportunity["action"] == "BUY_YES" else "no"
+    execution_price = 99  # Max bid to guarantee fill
+
+    record = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "station": bracket.station,
+        "ticker": bracket.ticker,
+        "subtitle": bracket.subtitle,
+        "action": opportunity["action"],
+        "side": side,
+        "price": execution_price,
+        "quantity": order_size,
+        "original_ask": opportunity["price"],
+        "edge_cents": opportunity["edge_cents"],
+        "reason": opportunity["reason"],
+        "live": live_mode,
+        "success": False,
+    }
+
+    if live_mode and client.private_key:
+        try:
+            result = client.create_order(
+                ticker=bracket.ticker,
+                side=side,
+                action="buy",
+                count=order_size,
+                order_type="limit",
+                price_cents=execution_price,
+            )
+            record["success"] = True
+            record["order_id"] = result.get("order", {}).get("order_id")
+            record["latency_ms"] = client.last_latency_ms
+            logger.info("🎯 FILLED: %s %s @ %d¢", side, bracket.ticker, execution_price)
+        except Exception as e:
+            record["error"] = str(e)
+            logger.error("❌ ORDER FAILED: %s — %s", bracket.ticker, e)
+    else:
+        record["success"] = True
+        logger.info("🧪 DRY RUN: %s %s %s @ %d¢", opportunity["action"], side, bracket.ticker, execution_price)
+
+    bracket.traded = True
+    if processed_tickers is not None:
+        processed_tickers.add(bracket.ticker)
+
+    return record
