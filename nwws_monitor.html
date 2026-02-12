@@ -37,14 +37,10 @@ body { background:#0d1117; color:#c9d1d9; font-family:'SF Mono',Monaco,'Cascadia
 .station-header .cli-temp .high { color:#f97583; }
 .station-header .cli-temp .low { color:#79c0ff; }
 
-table { width:100%; border-collapse:collapse; }
-th { text-align:left; padding:4px 8px; color:#8b949e; font-size:11px; font-weight:500; text-transform:uppercase; border-bottom:1px solid #21262d; white-space:nowrap; }
-td { padding:5px 8px; border-bottom:1px solid #161b22; white-space:nowrap; }
+table { border-collapse:collapse; }
+th { text-align:left; padding:4px 12px; color:#8b949e; font-size:11px; font-weight:500; text-transform:uppercase; border-bottom:1px solid #21262d; white-space:nowrap; }
+td { padding:5px 12px; border-bottom:1px solid #161b22; white-space:nowrap; }
 tr:hover { background:#161b22; }
-col.col-bracket { width:25%; }
-col.col-num { width:10%; }
-col.col-price { width:12%; }
-col.col-status { width:15%; }
 
 .price { font-weight:bold; }
 .price-hot { color:#f97583; }  /* below 98 */
@@ -333,7 +329,7 @@ function renderBrackets() {
 
         if (highBrackets.length > 0) {
             html += `<table>
-                <colgroup><col class="col-bracket"><col class="col-num"><col class="col-num"><col class="col-price"><col class="col-price"><col class="col-status"></colgroup>
+                
                 <tr><th colspan="6" style="color:#f97583;padding:6px 8px;">HIGH TEMP</th></tr>
                 <tr><th>Bracket</th><th style="text-align:right">Floor</th><th style="text-align:right">Cap</th><th style="text-align:right">YES Ask</th><th style="text-align:right">NO Ask</th><th style="text-align:center">Status</th></tr>`;
             for (const b of highBrackets) {
@@ -365,7 +361,7 @@ function renderBrackets() {
 
         if (lowBrackets.length > 0) {
             html += `<table style="margin-top:8px">
-                <colgroup><col class="col-bracket"><col class="col-num"><col class="col-num"><col class="col-price"><col class="col-price"><col class="col-status"></colgroup>
+                
                 <tr><th colspan="6" style="color:#79c0ff;padding:6px 8px;">LOW TEMP</th></tr>
                 <tr><th>Bracket</th><th style="text-align:right">Floor</th><th style="text-align:right">Cap</th><th style="text-align:right">YES Ask</th><th style="text-align:right">NO Ask</th><th style="text-align:center">Status</th></tr>`;
             for (const b of lowBrackets) {
