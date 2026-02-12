@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WX SNIPER — NWWS Monitor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0a;
+    color: #e0e0e0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+  }
+  .header {
+    border-bottom: 1px solid #1a1a2e;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(180deg, #0f0f1a 0%, #0a0a0a 100%);
+  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo { font-size: 18px; font-weight: 700; color: #f0f0f0; letter-spacing: -0.5px; }
+  .subtitle { font-size: 11px; color: #666; }
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+  }
+  .dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .dot.off { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  .status { font-size: 11px; }
+  .status.on { color: #22c55e; }
+  .status.off { color: #ef4444; }
+
+  .controls {
+    padding: 12px 24px;
+    display: flex; gap: 8px; align-items: center;
+    border-bottom: 1px solid #111;
+  }
+  .controls label { font-size: 11px; color: #555; margin-right: 8px; }
+  .controls input {
+    background: #111; border: 1px solid #222; color: #ccc;
+    padding: 4px 10px; border-radius: 4px; font-family: inherit; font-size: 12px;
+    width: 260px;
+  }
+  .controls input:focus { outline: none; border-color: #444; }
+  .btn {
+    padding: 4px 14px; font-size: 11px; font-family: inherit;
+    border: 1px solid transparent; border-radius: 4px;
+    background: transparent; color: #555; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .btn.active { border-color: #333; background: #1a1a2e; color: #fff; }
+  .btn:hover { color: #aaa; }
+
+  .section-label {
+    font-size: 11px; color: #555; padding: 16px 24px 8px;
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .empty {
+    padding: 40px 0; text-align: center; color: #333; font-size: 13px;
+  }
+
+  .product-row {
+    display: grid;
+    grid-template-columns: 95px 55px 70px 1fr 110px;
+    align-items: center;
+    padding: 10px 12px;
+    margin: 1px 24px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+  .product-row.watched {
+    background: #0d0d1a;
+    border: 1px solid #111;
+  }
+  .product-row.watched.has-temp {
+    border-color: #1a1a3a;
+  }
+  .product-row.other {
+    background: #080808;
+    border: 1px solid #0a0a0a;
+  }
+  .time { color: #444; font-size: 11px; }
+  .badge {
+    font-size: 10px; padding: 2px 8px; border-radius: 3px;
+    font-weight: 600; text-align: center; display: inline-block;
+  }
+  .badge.cli { background: #1a1a3a; color: #818cf8; }
+  .badge.dsm { background: #1a1500; color: #fbbf24; }
+  .station-watched { color: #e0e0e0; font-weight: 600; }
+  .station-other { color: #555; }
+  .temp-high { color: #f87171; font-weight: 700; font-size: 16px; }
+  .temp-low { color: #60a5fa; font-weight: 700; font-size: 16px; }
+  .temp-label { color: #777; font-size: 10px; }
+  .temp-time { color: #555; font-size: 10px; margin-left: 4px; }
+  .valid-as { color: #444; font-size: 10px; text-align: right; }
+  .city-name { color: #333; font-size: 11px; }
+
+  .raw-feed {
+    margin: 16px 24px; padding: 12px;
+    background: #050508; border: 1px solid #151520; border-radius: 6px;
+    max-height: 200px; overflow-y: auto;
+    font-size: 11px; color: #444; line-height: 1.7;
+  }
+  .raw-time { color: #333; }
+  .raw-cli { color: #6366f1; }
+  .raw-dsm { color: #f59e0b; }
+  .raw-cccc { color: #555; }
+  .raw-awips { color: #777; }
+  .raw-high { color: #ef4444; }
+  .raw-low { color: #3b82f6; margin-left: 8px; }
+
+  .count-badge {
+    background: #1a1a1a; color: #666; font-size: 10px;
+    padding: 1px 6px; border-radius: 3px; margin-left: 4px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <span class="logo">WX SNIPER</span>
+    <span class="subtitle">NWWS-OI MONITOR</span>
+  </div>
+  <div class="header-right">
+    <span class="dot off" id="dot"></span>
+    <span class="status off" id="status-text">DISCONNECTED</span>
+    <span style="font-size:11px;color:#555" id="clock"></span>
+  </div>
+</div>
+
+<div class="controls">
+  <label>WS:</label>
+  <input type="text" id="ws-url" value="ws://54.91.7.11:8765" />
+  <button class="btn active" id="btn-connect" onclick="toggleConnect()">Connect</button>
+  <span style="width:20px"></span>
+  <button class="btn active" id="btn-all" onclick="setFilter('all')">All <span class="count-badge" id="count-all">0</span></button>
+  <button class="btn" id="btn-cli" onclick="setFilter('cli')">CLI <span class="count-badge" id="count-cli">0</span></button>
+  <button class="btn" id="btn-dsm" onclick="setFilter('dsm')">DSM <span class="count-badge" id="count-dsm">0</span></button>
+</div>
+
+<div class="section-label">Watched Stations</div>
+<div id="watched-products"><div class="empty">Waiting for CLI/DSM products for watched stations...</div></div>
+
+<div class="section-label">Other Stations</div>
+<div id="other-products"><div class="empty">—</div></div>
+
+<div class="section-label">Raw Feed</div>
+<div class="raw-feed" id="raw-feed"></div>
+
+<script>
+const WATCHED_STATIONS = new Set([
+  'KNYC','KPHL','KMDW','KLAX','KMIA','KAUS','KDEN','KSFO','KSEA',
+  'KDCA','KMSY','KLAS','KDFW','KHOU','KBOS','KMSP','KSAT','KOKC','KPHX'
+]);
+
+const STATION_NAMES = {
+  KNYC:'NYC', KPHL:'Philadelphia', KMDW:'Chicago', KLAX:'Los Angeles',
+  KMIA:'Miami', KAUS:'Austin', KDEN:'Denver', KSFO:'San Francisco',
+  KSEA:'Seattle', KDCA:'Washington DC', KMSY:'New Orleans', KLAS:'Las Vegas',
+  KDFW:'Dallas', KHOU:'Houston', KBOS:'Boston', KMSP:'Minneapolis',
+  KSAT:'San Antonio', KOKC:'Oklahoma City', KPHX:'Phoenix'
+};
+
+let ws = null;
+let products = [];
+let filter = 'all';
+
+function setFilter(f) {
+  filter = f;
+  document.querySelectorAll('.controls .btn').forEach(b => {
+    if(b.id === 'btn-connect') return;
+    b.classList.toggle('active', b.id === 'btn-' + f);
+  });
+  render();
+}
+
+function toggleConnect() {
+  if (ws && ws.readyState <= 1) {
+    ws.close();
+    return;
+  }
+  const url = document.getElementById('ws-url').value;
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    document.getElementById('dot').className = 'dot on';
+    document.getElementById('status-text').className = 'status on';
+    document.getElementById('status-text').textContent = 'CONNECTED';
+    document.getElementById('btn-connect').textContent = 'Disconnect';
+  };
+  ws.onclose = () => {
+    document.getElementById('dot').className = 'dot off';
+    document.getElementById('status-text').className = 'status off';
+    document.getElementById('status-text').textContent = 'DISCONNECTED';
+    document.getElementById('btn-connect').textContent = 'Connect';
+  };
+  ws.onerror = () => {
+    document.getElementById('dot').className = 'dot off';
+    document.getElementById('status-text').className = 'status off';
+    document.getElementById('status-text').textContent = 'ERROR';
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'product') {
+        const p = msg.data;
+        p.receivedAt = new Date();
+        products.unshift(p);
+        if (products.length > 500) products.pop();
+        render();
+      } else if (msg.type === 'history') {
+        msg.data.forEach(p => {
+          p.receivedAt = new Date(p.timestamp || Date.now());
+          products.push(p);
+        });
+        render();
+      }
+    } catch(err) { console.error('Parse error:', err); }
+  };
+}
+
+function fmtTime(d) {
+  if (typeof d === 'string') d = new Date(d);
+  if (!(d instanceof Date) || isNaN(d)) return '--:--:--';
+  return d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+}
+
+function render() {
+  const filtered = products.filter(p => {
+    if (filter === 'cli') return (p.product_type || p.type || '').toUpperCase() === 'CLI';
+    if (filter === 'dsm') return (p.product_type || p.type || '').toUpperCase() === 'DSM';
+    return true;
+  });
+
+  const cliCount = products.filter(p => (p.product_type||p.type||'').toUpperCase() === 'CLI').length;
+  const dsmCount = products.filter(p => (p.product_type||p.type||'').toUpperCase() === 'DSM').length;
+  document.getElementById('count-all').textContent = products.length;
+  document.getElementById('count-cli').textContent = cliCount;
+  document.getElementById('count-dsm').textContent = dsmCount;
+
+  const watched = filtered.filter(p => p.station && WATCHED_STATIONS.has(p.station));
+  const other = filtered.filter(p => !p.station || !WATCHED_STATIONS.has(p.station));
+
+  const watchedDiv = document.getElementById('watched-products');
+  const otherDiv = document.getElementById('other-products');
+  const rawDiv = document.getElementById('raw-feed');
+
+  if (watched.length === 0) {
+    watchedDiv.innerHTML = '<div class="empty">Waiting for CLI/DSM products for watched stations...</div>';
+  } else {
+    watchedDiv.innerHTML = watched.map(p => productRowHTML(p, true)).join('');
+  }
+
+  if (other.length === 0) {
+    otherDiv.innerHTML = '<div class="empty">—</div>';
+  } else {
+    otherDiv.innerHTML = other.map(p => productRowHTML(p, false)).join('');
+  }
+
+  rawDiv.innerHTML = filtered.slice(0, 100).map(p => {
+    const ptype = (p.product_type || p.type || '').toUpperCase();
+    const cls = ptype === 'CLI' ? 'raw-cli' : 'raw-dsm';
+    let temps = '';
+    if (p.high != null) temps += `<span class="raw-high">H:${p.high}°F</span>`;
+    if (p.low != null) temps += `<span class="raw-low">L:${p.low}°F</span>`;
+    return `<div><span class="raw-time">${fmtTime(p.receivedAt)}</span> <span class="${cls}">${ptype}</span> <span class="raw-cccc">${p.cccc||''}</span> <span class="raw-awips">${p.awipsid||''}</span> ${temps}</div>`;
+  }).join('');
+}
+
+function productRowHTML(p, isWatched) {
+  const ptype = (p.product_type || p.type || '').toUpperCase();
+  const hasTemp = p.high != null || p.low != null;
+  const rowClass = isWatched
+    ? `product-row watched${hasTemp ? ' has-temp' : ''}`
+    : 'product-row other';
+
+  const stationLabel = p.station
+    ? `${p.station} <span style="color:#555;font-weight:400;font-size:10px">${STATION_NAMES[p.station]||''}</span>`
+    : (p.awipsid || '').slice(3);
+
+  let tempHTML = '';
+  if (p.high != null) {
+    tempHTML += `<span><span class="temp-label">HIGH </span><span class="temp-high">${p.high}°F</span>`;
+    if (p.high_time) tempHTML += `<span class="temp-time">@ ${p.high_time}</span>`;
+    tempHTML += '</span>';
+  }
+  if (p.low != null) {
+    tempHTML += `<span style="margin-left:16px"><span class="temp-label">LOW </span><span class="temp-low">${p.low}°F</span>`;
+    if (p.low_time) tempHTML += `<span class="temp-time">@ ${p.low_time}</span>`;
+    tempHTML += '</span>';
+  }
+  if (!hasTemp) {
+    tempHTML = `<span class="city-name">${p.city || p.awipsid || '—'}</span>`;
+  }
+
+  const validAs = p.valid_as ? `as of ${p.valid_as}` : '';
+
+  return `<div class="${rowClass}">
+    <span class="time">${fmtTime(p.receivedAt)}</span>
+    <span class="badge ${ptype.toLowerCase()}">${ptype}</span>
+    <span class="${isWatched ? 'station-watched' : 'station-other'}">${stationLabel}</span>
+    <div>${tempHTML}</div>
+    <span class="valid-as">${validAs}</span>
+  </div>`;
+}
+
+// Clock
+setInterval(() => {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true});
+}, 1000);
+
+// Auto-connect on load
+window.addEventListener('load', () => setTimeout(toggleConnect, 500));
+</script>
+</body>
+</html>
