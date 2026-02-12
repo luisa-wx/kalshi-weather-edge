@@ -41,6 +41,10 @@ table { width:100%; border-collapse:collapse; }
 th { text-align:left; padding:4px 8px; color:#8b949e; font-size:11px; font-weight:500; text-transform:uppercase; border-bottom:1px solid #21262d; white-space:nowrap; }
 td { padding:5px 8px; border-bottom:1px solid #161b22; white-space:nowrap; }
 tr:hover { background:#161b22; }
+col.col-bracket { width:25%; }
+col.col-num { width:10%; }
+col.col-price { width:12%; }
+col.col-status { width:15%; }
 
 .price { font-weight:bold; }
 .price-hot { color:#f97583; }  /* below 98 */
@@ -329,8 +333,9 @@ function renderBrackets() {
 
         if (highBrackets.length > 0) {
             html += `<table>
+                <colgroup><col class="col-bracket"><col class="col-num"><col class="col-num"><col class="col-price"><col class="col-price"><col class="col-status"></colgroup>
                 <tr><th colspan="6" style="color:#f97583;padding:6px 8px;">HIGH TEMP</th></tr>
-                <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
+                <tr><th>Bracket</th><th style="text-align:right">Floor</th><th style="text-align:right">Cap</th><th style="text-align:right">YES Ask</th><th style="text-align:right">NO Ask</th><th style="text-align:center">Status</th></tr>`;
             for (const b of highBrackets) {
                 const isLocked = b.status === 'locked';
                 const isDead = b.status === 'dead';
@@ -348,11 +353,11 @@ function renderBrackets() {
 
                 html += `<tr style="${rowStyle}">
                     <td>${b.subtitle}</td>
-                    <td>${b.floor ?? '—'}</td>
-                    <td>${b.cap ?? '—'}</td>
-                    <td class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
-                    <td class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
-                    <td>${statusHtml}</td>
+                    <td style="text-align:right">${b.floor ?? '—'}</td>
+                    <td style="text-align:right">${b.cap ?? '—'}</td>
+                    <td style="text-align:right" class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
+                    <td style="text-align:right" class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
+                    <td style="text-align:center">${statusHtml}</td>
                 </tr>`;
             }
             html += '</table>';
@@ -360,8 +365,9 @@ function renderBrackets() {
 
         if (lowBrackets.length > 0) {
             html += `<table style="margin-top:8px">
+                <colgroup><col class="col-bracket"><col class="col-num"><col class="col-num"><col class="col-price"><col class="col-price"><col class="col-status"></colgroup>
                 <tr><th colspan="6" style="color:#79c0ff;padding:6px 8px;">LOW TEMP</th></tr>
-                <tr><th>Bracket</th><th>Floor</th><th>Cap</th><th>YES Ask</th><th>NO Ask</th><th>Status</th></tr>`;
+                <tr><th>Bracket</th><th style="text-align:right">Floor</th><th style="text-align:right">Cap</th><th style="text-align:right">YES Ask</th><th style="text-align:right">NO Ask</th><th style="text-align:center">Status</th></tr>`;
             for (const b of lowBrackets) {
                 const isLocked = b.status === 'locked';
                 const isDead = b.status === 'dead';
@@ -378,11 +384,11 @@ function renderBrackets() {
                 }
                 html += `<tr style="${rowStyle}">
                     <td>${b.subtitle}</td>
-                    <td>${b.floor ?? '—'}</td>
-                    <td>${b.cap ?? '—'}</td>
-                    <td class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
-                    <td class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
-                    <td>${statusHtml}</td>
+                    <td style="text-align:right">${b.floor ?? '—'}</td>
+                    <td style="text-align:right">${b.cap ?? '—'}</td>
+                    <td style="text-align:right" class="price ${priceClass(b.yes_ask)}">${b.yes_ask}¢</td>
+                    <td style="text-align:right" class="price ${priceClass(b.no_ask)}">${b.no_ask}¢</td>
+                    <td style="text-align:center">${statusHtml}</td>
                 </tr>`;
             }
             html += '</table>';
