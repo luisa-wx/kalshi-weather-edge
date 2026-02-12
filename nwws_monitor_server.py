@@ -8,8 +8,7 @@ Usage:
     python3 nwws_monitor_server.py
 
 Serves:
-    - ws://0.0.0.0:8765  — WebSocket for real-time product feed
-    - http://0.0.0.0:8765 — Simple health check
+    - ws://0.0.0.0:8766  — WebSocket for real-time product feed
 """
 
 import asyncio
@@ -17,7 +16,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,7 +37,7 @@ logger = logging.getLogger("nwws_monitor")
 NWWS_ROOM = "nwws@conference.nwws-oi.weather.gov"
 NWWS_OI_NS = "nwws-oi"
 
-# Our 19 watched stations — ICAO -> city + tickers
+# Our 19 watched stations
 STATIONS = {
     "KNYC": {"city": "NYC", "tz": "ET", "cli_suffix": "NYC"},
     "KPHL": {"city": "Philadelphia", "tz": "ET", "cli_suffix": "PHL"},
@@ -64,8 +62,39 @@ STATIONS = {
 
 # Reverse lookups
 CLI_SUFFIX_TO_STATION = {v["cli_suffix"]: k for k, v in STATIONS.items()}
-DSM_SUFFIX_TO_STATION = {k[1:]: k for k in STATIONS}  # NYC->KNYC, etc.
-WATCHED_DSM_IDS = {f"DSM{k[1:]}" for k in STATIONS}   # DSMNYC, DSMPHL, ...
+DSM_SUFFIX_TO_STATION = {k[1:]: k for k in STATIONS}
+WATCHED_DSM_IDS = {f"DSM{k[1:]}" for k in STATIONS}
+
+# ---------------------------------------------------------------------------
+# Persistent product logging
+# ---------------------------------------------------------------------------
+
+PRODUCT_FILE = "logs/cli_dsm_products.jsonl"
+os.makedirs("logs", exist_ok=True)
+
+
+def save_product(product: dict):
+    """Append product to persistent JSONL file."""
+    try:
+        with open(PRODUCT_FILE, "a") as f:
+            f.write(json.dumps(product) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to save product: {e}")
+
+
+def load_products() -> list:
+    """Load all products from persistent file."""
+    products = []
+    if os.path.exists(PRODUCT_FILE):
+        with open(PRODUCT_FILE, "r") as f:
+            for line in f:
+                try:
+                    products.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+    logger.info(f"Loaded {len(products)} historical products from {PRODUCT_FILE}")
+    return products
+
 
 # ---------------------------------------------------------------------------
 # Parsers
@@ -79,17 +108,14 @@ def parse_cli(raw: str) -> dict:
         "valid_as": None, "city_name": None,
     }
 
-    # Extract city name from header
     city_match = re.search(r'\.\.\.THE (.+?) CLIMATE SUMMARY', raw)
     if city_match:
         result["city_name"] = city_match.group(1)
 
-    # Valid time
     valid_match = re.search(r'VALID.*?AS OF (\d{4} [AP]M) LOCAL TIME', raw, re.IGNORECASE)
     if valid_match:
         result["valid_as"] = valid_match.group(1)
 
-    # Find TEMPERATURE section and parse MAXIMUM/MINIMUM
     temp_section = raw[raw.find("TEMPERATURE (F)"):] if "TEMPERATURE (F)" in raw else ""
 
     max_match = re.search(r'MAXIMUM\s+(-?\d+)\s+([\d:]+\s*[AP]M|MM)', temp_section)
@@ -106,22 +132,13 @@ def parse_cli(raw: str) -> dict:
 
 
 def parse_dsm(raw: str) -> dict:
-    """
-    Parse a DSM (Daily Summary Message) for high/low temps.
-    
-    Format: STATION DS HHMM MM/DD HIGH_TEMP_FTIME/ LOW_TEMP_FTIME/ ...
-    Example: KLAX DS 1400 11/02 641323/ 570150// 64/ 57//...
-    
-    The high is encoded as: VALUE + 4-digit time (HHMM local)
-    e.g., 641323 = 64°F at 13:23 local
-    """
+    """Parse a DSM (Daily Summary Message) for high/low temps."""
     result = {
         "high": None, "low": None,
         "high_time": None, "low_time": None,
         "station_in_dsm": None,
     }
 
-    # Try to find the DS line
     ds_match = re.search(
         r'([A-Z]{4})\s+DS\s+(\d{4})\s+(\d{2}/\d{2})\s+'
         r'(\d{2,3})(\d{4})/\s*'
@@ -142,13 +159,11 @@ def parse_dsm(raw: str) -> dict:
 
 
 def resolve_cli_station(awipsid: str) -> Optional[str]:
-    """Map CLI awipsid like CLILAS -> KLAS, CLIPHX -> KPHX."""
     suffix = awipsid[3:].upper()
     return CLI_SUFFIX_TO_STATION.get(suffix)
 
 
 def resolve_dsm_station(awipsid: str) -> Optional[str]:
-    """Map DSM awipsid like DSMLAS -> KLAS."""
     suffix = awipsid[3:].upper()
     return DSM_SUFFIX_TO_STATION.get(suffix)
 
@@ -158,12 +173,13 @@ def resolve_dsm_station(awipsid: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 CLIENTS = set()
-PRODUCT_LOG = []  # In-memory log, last 500 products
+PRODUCT_LOG = []
 MAX_LOG = 500
 
 
 async def broadcast(message: dict):
     """Send a JSON message to all connected WebSocket clients."""
+    global CLIENTS
     payload = json.dumps(message)
     dead = set()
     for ws in CLIENTS:
@@ -179,15 +195,24 @@ async def ws_handler(websocket):
     CLIENTS.add(websocket)
     logger.info(f"Dashboard connected ({len(CLIENTS)} total)")
 
-    # Send recent history
     try:
+        # Send full history on connect
         await websocket.send(json.dumps({
             "type": "history",
-            "products": PRODUCT_LOG[-100:],
+            "data": PRODUCT_LOG[-200:],
         }))
 
+        # Listen for injected test products
         async for msg in websocket:
-            pass  # Client doesn't send us anything
+            try:
+                data = json.loads(msg)
+                if data.get("type") == "product":
+                    product = data["data"]
+                    PRODUCT_LOG.append(product)
+                    save_product(product)
+                    await broadcast(data)
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
@@ -209,7 +234,7 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         self.add_event_handler("message", self._on_message)
         self.add_event_handler("disconnected", self._on_disconnected)
         self.add_event_handler("connection_failed", self._on_conn_failed)
-        self.stats = {"total": 0, "cli": 0, "dsm": 0, "errors": 0}
+        self.stats = {"total": 0, "cli": 0, "dsm": 0}
 
     async def _on_start(self, event):
         logger.info("NWWS-OI session started, joining room...")
@@ -219,8 +244,6 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         ET.SubElement(pres.xml, '{http://jabber.org/protocol/muc}x')
         pres.send()
         logger.info("Joined NWWS-OI chatroom")
-
-        # Notify dashboards
         asyncio.ensure_future(broadcast({
             "type": "status",
             "connected": True,
@@ -257,12 +280,11 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
 
         prefix = awipsid[:3].upper()
 
-        # --- CLI ---
         if prefix == "CLI":
             station = resolve_cli_station(awipsid)
             parsed = parse_cli(raw)
             product = {
-                "type": "CLI",
+                "product_type": "CLI",
                 "awipsid": awipsid,
                 "cccc": cccc,
                 "station": station,
@@ -273,18 +295,18 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
                 "low_time": parsed["low_time"],
                 "valid_as": parsed["valid_as"],
                 "watched": station is not None,
-                "received_at": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "issue": issue,
+                "raw_excerpt": raw[:500],
             }
             self.stats["cli"] += 1
             self._emit(product)
 
-        # --- DSM ---
         elif prefix == "DSM":
             station = resolve_dsm_station(awipsid)
             parsed = parse_dsm(raw)
             product = {
-                "type": "DSM",
+                "product_type": "DSM",
                 "awipsid": awipsid,
                 "cccc": cccc,
                 "station": station,
@@ -295,33 +317,36 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
                 "low_time": parsed["low_time"],
                 "valid_as": None,
                 "watched": station is not None,
-                "received_at": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "issue": issue,
+                "raw_excerpt": raw[:500],
             }
             self.stats["dsm"] += 1
             self._emit(product)
 
     def _emit(self, product):
-        """Log and broadcast a parsed product."""
-        # Only broadcast watched stations
-        if not product["watched"]:
-            return
-
-        PRODUCT_LOG.append(product)
-        if len(PRODUCT_LOG) > MAX_LOG:
-            PRODUCT_LOG.pop(0)
-
+        """Log, persist, and broadcast a parsed product."""
         tag = "🟢" if product["high"] is not None else "⚪"
+        w = "★" if product["watched"] else " "
         logger.info(
-            f"{tag} {product['type']} {product['awipsid']} | "
+            f"{tag}{w} {product['product_type']} {product['awipsid']} | "
             f"station={product['station']} | "
             f"H={product['high']}°F L={product['low']}°F | "
             f"valid={product['valid_as']}"
         )
 
+        # Always save to file (watched and unwatched)
+        save_product(product)
+
+        # Always add to in-memory log
+        PRODUCT_LOG.append(product)
+        if len(PRODUCT_LOG) > MAX_LOG:
+            PRODUCT_LOG.pop(0)
+
+        # Broadcast to dashboards
         asyncio.ensure_future(broadcast({
             "type": "product",
-            "product": product,
+            "data": product,
         }))
 
 
@@ -343,18 +368,21 @@ async def main():
 
     jid = f"{user_id}@{server}"
 
+    # Load historical products
+    PRODUCT_LOG.extend(load_products())
+    logger.info(f"Product log has {len(PRODUCT_LOG)} entries")
+
     # Start WebSocket server
     try:
         import websockets
     except ImportError:
-        logger.info("Installing websockets...")
         import subprocess
         subprocess.check_call([sys.executable, "-m", "pip", "install",
                                "websockets", "--break-system-packages", "-q"])
         import websockets
 
-    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8765)
-    logger.info("WebSocket server running on ws://0.0.0.0:8765")
+    ws_server = await websockets.serve(ws_handler, "0.0.0.0", 8766)
+    logger.info("WebSocket server running on ws://0.0.0.0:8766")
 
     # Start NWWS-OI client
     client = NWWSMonitorClient(jid, password)
@@ -362,9 +390,8 @@ async def main():
 
     logger.info(f"Connecting to NWWS-OI as {jid}...")
     logger.info(f"Watching {len(STATIONS)} stations for CLI/DSM products")
-    logger.info(f"Dashboard: open nwws_monitor.html and connect to ws://YOUR_EC2_IP:8765")
+    logger.info(f"Dashboard: http://YOUR_EC2_IP:8080/nwws_monitor.html")
 
-    # Run forever
     try:
         await asyncio.Future()
     except (KeyboardInterrupt, SystemExit):
