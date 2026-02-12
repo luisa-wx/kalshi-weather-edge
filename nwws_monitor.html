@@ -37,10 +37,16 @@ body { background:#0d1117; color:#c9d1d9; font-family:'SF Mono',Monaco,'Cascadia
 .station-header .cli-temp .high { color:#f97583; }
 .station-header .cli-temp .low { color:#79c0ff; }
 
-table { width:100%; border-collapse:collapse; }
+table { width:100%; border-collapse:collapse; table-layout:fixed; }
 th { text-align:left; padding:4px 8px; color:#8b949e; font-size:11px; font-weight:500; text-transform:uppercase; border-bottom:1px solid #21262d; }
-td { padding:5px 8px; border-bottom:1px solid #161b22; }
+td { padding:5px 8px; border-bottom:1px solid #161b22; overflow:hidden; text-overflow:ellipsis; }
 tr:hover { background:#161b22; }
+th:nth-child(1), td:nth-child(1) { width:35%; }
+th:nth-child(2), td:nth-child(2) { width:12%; text-align:right; }
+th:nth-child(3), td:nth-child(3) { width:12%; text-align:right; }
+th:nth-child(4), td:nth-child(4) { width:14%; text-align:right; }
+th:nth-child(5), td:nth-child(5) { width:14%; text-align:right; }
+th:nth-child(6), td:nth-child(6) { width:13%; text-align:center; }
 
 .price { font-weight:bold; }
 .price-hot { color:#f97583; }  /* below 98 */
@@ -298,21 +304,11 @@ function renderBrackets() {
         const lowBrackets = bkts.filter(b => b.signal_type === 'low')
             .sort((a, b) => (a.floor || -999) - (b.floor || -999));
 
-        // Determine which bracket is resolved by CLI
-        let resolvedTicker = null;
-        if (cli && cli.high !== null) {
-            for (const b of highBrackets) {
-                if (b.floor !== null && b.cap !== null && b.floor <= cli.high && cli.high <= b.cap) {
-                    resolvedTicker = b.ticker;
-                }
-                if (b.floor !== null && b.cap === null && cli.high >= b.floor) {
-                    resolvedTicker = b.ticker;  // "X or above"
-                }
-                if (b.floor === null && b.cap !== null && cli.high < b.cap) {
-                    resolvedTicker = b.ticker;  // "X or below"
-                }
-            }
-        }
+        // Get local info from first bracket for this station
+        const firstBracket = bkts[0] || {};
+        const localTime = firstBracket.local_time || '';
+        const localDate = firstBracket.local_date || '';
+        const suffix = firstBracket.suffix || '';
 
         let cliHtml = '';
         if (cli) {
@@ -329,7 +325,10 @@ function renderBrackets() {
 
         html += `<div class="station-group${isOpen}" onclick="this.classList.toggle('open')">
             <div class="station-header">
-                <h3>${station} <span class="city">${city}</span></h3>
+                <h3>${station} <span class="city">${city}</span>
+                    <span style="color:#484f58;font-size:11px;margin-left:8px;">${localDate} ${localTime}</span>
+                    <span style="color:#30363d;font-size:10px;margin-left:6px;">${suffix}</span>
+                </h3>
                 ${cliHtml}
             </div>
             <div class="collapsible-body">`;

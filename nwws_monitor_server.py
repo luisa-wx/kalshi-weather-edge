@@ -309,6 +309,8 @@ def get_brackets_summary() -> list:
     summary = []
     for station, data in BRACKETS.items():
         cfg = STATIONS.get(station, {})
+        local_info = data.get("local_info", {})
+        suffix = data.get("suffix", "")
         for signal_type in ("high", "low"):
             for b in data.get(signal_type, []):
                 summary.append({
@@ -325,6 +327,9 @@ def get_brackets_summary() -> list:
                     "no_bid": b.no_bid,
                     "status": b.status,
                     "traded": b.traded,
+                    "local_time": local_info.get("local_time", ""),
+                    "local_date": local_info.get("local_date", ""),
+                    "suffix": suffix,
                 })
     return summary
 

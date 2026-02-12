@@ -145,6 +145,12 @@ class KalshiClient:
     def get_market(self, ticker: str) -> Dict:
         return self._make_request("GET", f"/markets/{ticker}")
 
+    def get_orderbook(self, ticker: str, depth: int = 5) -> Dict:
+        """Get the live orderbook for a market. Returns yes/no bid/ask levels."""
+        return self._make_request(
+            "GET", f"/markets/{ticker}/orderbook", params={"depth": str(depth)}
+        )
+
     def create_order(
         self,
         ticker: str,
@@ -306,8 +312,33 @@ def _parse_price(price_raw, price_dollars) -> int:
 
 
 def get_today_suffix() -> str:
-    """Kalshi event date suffix like '26FEB11'."""
+    """Kalshi event date suffix like '26FEB11' in UTC. Use get_station_suffix for accuracy."""
     return datetime.now(timezone.utc).strftime("%y%b%d").upper()
+
+
+def get_station_suffix(tz_name: str) -> str:
+    """Kalshi event date suffix using station's LOCAL date.
+    
+    Kalshi weather markets settle on local calendar date, so the event
+    ticker must match the station's local date, not UTC.
+    E.g. at 11:30 PM PT on Feb 11, UTC is Feb 12, but the Kalshi market
+    is still for Feb 11.
+    """
+    tz = ZoneInfo(tz_name)
+    local_now = datetime.now(tz)
+    return local_now.strftime("%y%b%d").upper()
+
+
+def get_station_local_info(tz_name: str) -> dict:
+    """Get station's local time, date, and suffix for display."""
+    tz = ZoneInfo(tz_name)
+    local_now = datetime.now(tz)
+    return {
+        "local_time": local_now.strftime("%I:%M %p"),
+        "local_date": local_now.strftime("%m/%d"),
+        "suffix": local_now.strftime("%y%b%d").upper(),
+        "date_iso": local_now.strftime("%Y-%m-%d"),
+    }
 
 
 def load_brackets_for_station(
@@ -362,26 +393,30 @@ def load_brackets_for_station(
 
 def load_all_brackets(client: KalshiClient, stations: dict) -> Dict[str, Dict[str, List[Bracket]]]:
     """
-    Load all brackets for all stations.
+    Load all brackets for all stations, using each station's LOCAL date
+    for the event ticker suffix.
 
-    Returns: {station_code: {"high": [Bracket, ...], "low": [Bracket, ...]}}
+    Returns: {station_code: {"high": [Bracket, ...], "low": [Bracket, ...], "suffix": "26FEB11", "local_info": {...}}}
     """
-    today_suffix = get_today_suffix()
     result = {}
 
     for station, cfg in stations.items():
-        result[station] = {"high": [], "low": []}
+        tz_name = cfg.get("tz_name", "America/New_York")
+        suffix = get_station_suffix(tz_name)
+        local_info = get_station_local_info(tz_name)
+
+        result[station] = {"high": [], "low": [], "suffix": suffix, "local_info": local_info}
 
         high_ticker = cfg.get("high_ticker")
         if high_ticker:
             result[station]["high"] = load_brackets_for_station(
-                client, station, high_ticker, "high", today_suffix
+                client, station, high_ticker, "high", suffix
             )
 
         low_ticker = cfg.get("low_ticker")
         if low_ticker:
             result[station]["low"] = load_brackets_for_station(
-                client, station, low_ticker, "low", today_suffix
+                client, station, low_ticker, "low", suffix
             )
 
     return result
