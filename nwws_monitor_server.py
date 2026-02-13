@@ -138,9 +138,21 @@ def parse_cli(raw: str) -> dict:
     if city_match:
         result["city_name"] = city_match.group(1)
 
-    valid_match = re.search(r'VALID.*?AS OF (\d{4} [AP]M) LOCAL TIME', raw, re.IGNORECASE)
-    if valid_match:
-        result["valid_as"] = valid_match.group(1)
+    # Extract the CLI date from "CLIMATE SUMMARY FOR FEBRUARY 11 2026"
+    date_match = re.search(r'CLIMATE SUMMARY FOR\s+(\w+\s+\d+\s+\d{4})', raw, re.IGNORECASE)
+    if date_match:
+        result["valid_as"] = date_match.group(1)
+    else:
+        # Fallback: try "FOR TUESDAY FEBRUARY 11 2026" pattern
+        date_match2 = re.search(r'FOR\s+\w+DAY\s+(\w+\s+\d+\s+\d{4})', raw, re.IGNORECASE)
+        if date_match2:
+            result["valid_as"] = date_match2.group(1)
+
+    # Also check if it's preliminary
+    if re.search(r'PRELIMINARY', raw, re.IGNORECASE):
+        result["is_preliminary"] = True
+    else:
+        result["is_preliminary"] = False
 
     temp_section = raw[raw.find("TEMPERATURE (F)"):] if "TEMPERATURE (F)" in raw else ""
 
@@ -199,6 +211,7 @@ def resolve_dsm_station(awipsid: str) -> Optional[str]:
 
 BRACKETS = {}
 KALSHI_CLIENT = None
+KALSHI_WS = None
 OPPORTUNITIES = []
 SNIPE_LOG = []
 PROCESSED_TICKERS = set()
@@ -335,6 +348,7 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
                     order_size=ORDER_SIZE,
                     live_mode=LIVE_MODE,
                     processed_tickers=PROCESSED_TICKERS,
+                    kalshi_ws=KALSHI_WS,
                 )
                 SNIPE_LOG.append(record)
 
@@ -729,6 +743,7 @@ async def main():
     logger.info(f"Dashboard: http://YOUR_EC2_IP:8080/nwws_monitor.html")
 
     # Start Kalshi WebSocket for real-time orderbook/ticker data
+    global KALSHI_WS
     kalshi_ws = None
     if KALSHI_CLIENT and KALSHI_CLIENT.private_key and BRACKETS:
         try:
@@ -748,6 +763,7 @@ async def main():
                 on_ticker_update=on_ticker_update,
             )
             asyncio.ensure_future(kalshi_ws.run())
+            KALSHI_WS = kalshi_ws
             logger.info("📡 Kalshi WebSocket streaming started")
         except Exception as e:
             logger.error(f"Failed to start Kalshi WebSocket: {e}")

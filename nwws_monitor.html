@@ -413,9 +413,8 @@ function renderProducts() {
         const dt = p.timestamp ? new Date(p.timestamp).toLocaleDateString('en-US', {month:'numeric', day:'numeric'}) : '';
         const badgeClass = p.product_type === 'CLI' ? 'badge-cli' : 'badge-dsm';
         // valid_as contains "PRELIMINARY" or the date — use it to determine type
-        const validAs = (p.valid_as || '').toUpperCase();
-        const isPrelim = validAs.includes('PRELIM');
-        const isFinal = validAs && !isPrelim;
+        const isPrelim = p.is_preliminary === true || (p.valid_as || '').toUpperCase().includes('PRELIM');
+        const isFinal = !isPrelim && (p.valid_as || p.product_type === 'CLI');
         const typeTag = isPrelim
             ? '<span style="color:#d29922;font-size:11px;margin-left:6px;">PRELIM</span>'
             : isFinal
@@ -474,18 +473,21 @@ function renderSnipes() {
         return;
     }
 
-    let html = '<table><tr><th>Time</th><th>Action</th><th>Station</th><th>Bracket</th><th>Price</th><th>Edge</th><th>Live</th><th>Status</th></tr>';
+    let html = '<table><tr><th>Time</th><th>Action</th><th>Station</th><th>Bracket</th><th>Price</th><th>Edge</th><th>Book</th><th>Live</th><th>Status</th></tr>';
     for (const s of snipes.slice().reverse()) {
         const ts = s.time ? new Date(s.time).toLocaleTimeString() : '';
         const actionClass = s.action === 'BUY_YES' ? 'snipe-buy-yes' : 'snipe-buy-no';
         const statusClass = s.success ? 'snipe-success' : 'snipe-fail';
+        const bi = s.book_info || {};
+        const bookStr = bi.yes_bid_qty ? `${bi.yes_bid_qty}q` : bi.available_qty ? `${bi.available_qty}q` : '—';
         html += `<tr>
             <td>${ts}</td>
             <td><span class="snipe-action ${actionClass}">${s.action}</span></td>
             <td>${s.station}</td>
             <td>${s.subtitle || s.ticker}</td>
-            <td>${s.original_ask}¢ → ${s.price}¢</td>
+            <td>${s.price}¢ x${s.quantity || '?'}</td>
             <td>${s.edge_cents || '?'}¢</td>
+            <td>${bookStr}</td>
             <td>${s.live ? '🔴' : '🧪'}</td>
             <td class="${statusClass}">${s.success ? '✅' : '❌'}</td>
         </tr>`;

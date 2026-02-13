@@ -564,10 +564,16 @@ def execute_snipe(
     order_size: int = 10,
     live_mode: bool = False,
     processed_tickers: set = None,
+    kalshi_ws=None,
 ) -> dict:
     """
     Execute a snipe trade for an opportunity.
-    Returns trade record dict.
+    
+    If kalshi_ws is provided, checks the live orderbook for actual liquidity
+    before firing. Only trades if there's real volume to fill against.
+    
+    For BUY_NO on dead brackets: looks for YES bids (we're taking the other side)
+    For BUY_YES on last-man-standing: looks for YES asks below 99¢
     """
     bracket = opportunity["bracket"]
 
@@ -576,7 +582,68 @@ def execute_snipe(
         return {"success": False, "reason": "duplicate"}
 
     side = "yes" if opportunity["action"] == "BUY_YES" else "no"
-    execution_price = 99  # Max bid to guarantee fill
+    
+    # Check live orderbook for real liquidity
+    book_info = {}
+    execution_price = 99  # Default: max bid to guarantee fill
+    available_qty = 0
+    
+    if kalshi_ws:
+        book = kalshi_ws.get_orderbook(bracket.ticker)
+        
+        if opportunity["action"] == "BUY_NO":
+            # We want to buy NO. Check:
+            # 1. YES bids = people willing to buy YES on a dead bracket (we sell NO into them)
+            # 2. NO asks = people offering to sell NO contracts to us
+            yes_bids = book.get("yes", [])
+            no_asks = book.get("no", [])
+            
+            # Count available YES bid liquidity (free money — someone bidding YES on dead bracket)
+            for level in yes_bids:
+                price, qty = level[0], level[1]
+                price_cents = int(float(price) * 100) if isinstance(price, str) else (int(price * 100) if price < 2 else int(price))
+                if price_cents > 1:  # Any YES bid > 1¢ on a dead bracket is profit
+                    available_qty += int(float(qty)) if isinstance(qty, str) else int(qty)
+            
+            # Also check NO asks
+            best_no_ask = None
+            for level in no_asks:
+                price, qty = level[0], level[1]
+                price_cents = int(float(price) * 100) if isinstance(price, str) else (int(price * 100) if price < 2 else int(price))
+                if best_no_ask is None or price_cents < best_no_ask:
+                    best_no_ask = price_cents
+                    
+            book_info = {
+                "yes_bid_levels": len(yes_bids),
+                "yes_bid_qty": available_qty,
+                "best_no_ask": best_no_ask,
+            }
+            
+            if best_no_ask and best_no_ask < 99:
+                execution_price = min(99, best_no_ask)  # Match the ask
+                
+        elif opportunity["action"] == "BUY_YES":
+            # Last-man-standing: buy YES
+            yes_asks = book.get("yes", [])  # These are ask levels
+            
+            best_yes_ask = None
+            for level in yes_asks:
+                price, qty = level[0], level[1]
+                price_cents = int(float(price) * 100) if isinstance(price, str) else (int(price * 100) if price < 2 else int(price))
+                if best_yes_ask is None or price_cents < best_yes_ask:
+                    best_yes_ask = price_cents
+                    available_qty += int(float(qty)) if isinstance(qty, str) else int(qty)
+                    
+            book_info = {
+                "best_yes_ask": best_yes_ask,
+                "available_qty": available_qty,
+            }
+            
+            if best_yes_ask and best_yes_ask < 99:
+                execution_price = min(99, best_yes_ask)
+
+    # Determine actual order quantity
+    actual_qty = min(order_size, available_qty) if available_qty > 0 else order_size
 
     record = {
         "time": datetime.now(timezone.utc).isoformat(),
@@ -586,13 +653,20 @@ def execute_snipe(
         "action": opportunity["action"],
         "side": side,
         "price": execution_price,
-        "quantity": order_size,
+        "quantity": actual_qty,
         "original_ask": opportunity["price"],
-        "edge_cents": opportunity["edge_cents"],
+        "edge_cents": 100 - execution_price,
         "reason": opportunity["reason"],
+        "book_info": book_info,
         "live": live_mode,
         "success": False,
     }
+
+    # Skip if no liquidity found
+    if kalshi_ws and available_qty == 0 and not live_mode:
+        record["reason"] += " [NO LIQUIDITY — skipped]"
+        logger.info("📭 NO LIQUIDITY: %s %s %s — orderbook empty", opportunity["action"], bracket.subtitle, bracket.ticker)
+        return record
 
     if live_mode and client.private_key:
         try:
@@ -600,20 +674,27 @@ def execute_snipe(
                 ticker=bracket.ticker,
                 side=side,
                 action="buy",
-                count=order_size,
+                count=actual_qty,
                 order_type="limit",
                 price_cents=execution_price,
             )
             record["success"] = True
             record["order_id"] = result.get("order", {}).get("order_id")
             record["latency_ms"] = client.last_latency_ms
-            logger.info("🎯 FILLED: %s %s @ %d¢", side, bracket.ticker, execution_price)
+            logger.info(
+                "🎯 FILLED: %s %s @ %d¢ x%d (edge=%d¢)",
+                side, bracket.ticker, execution_price, actual_qty, 100 - execution_price,
+            )
         except Exception as e:
             record["error"] = str(e)
             logger.error("❌ ORDER FAILED: %s — %s", bracket.ticker, e)
     else:
         record["success"] = True
-        logger.info("🧪 DRY RUN: %s %s %s @ %d¢", opportunity["action"], side, bracket.ticker, execution_price)
+        logger.info(
+            "🧪 DRY RUN: %s %s %s @ %d¢ x%d (book: %s)",
+            opportunity["action"], side, bracket.ticker, execution_price, actual_qty,
+            json.dumps(book_info) if book_info else "no ws",
+        )
 
     bracket.traded = True
     if processed_tickers is not None:

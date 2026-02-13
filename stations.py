@@ -23,7 +23,7 @@ STATIONS = {
     },
     "KPHL": {
         "city": "Philadelphia",
-        "high_ticker": "KXHIGHPHL",
+        "high_ticker": "KXHIGHPHIL",
         "low_ticker": "KXLOWTPHIL",
         "timezone": ZoneInfo("America/New_York"),
         "tz_name": "America/New_York",
