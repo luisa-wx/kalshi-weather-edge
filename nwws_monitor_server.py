@@ -148,8 +148,8 @@ def parse_cli(raw: str) -> dict:
         if date_match2:
             result["valid_as"] = date_match2.group(1)
 
-    # Also check if it's preliminary
-    if re.search(r'PRELIMINARY', raw, re.IGNORECASE):
+    # Also check if it's preliminary — afternoon CLIs say "VALID TODAY AS OF"
+    if re.search(r'VALID\s+TODAY\s+AS\s+OF', raw, re.IGNORECASE):
         result["is_preliminary"] = True
     else:
         result["is_preliminary"] = False
@@ -561,6 +561,7 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
                 "high_time": parsed["high_time"],
                 "low_time": parsed["low_time"],
                 "valid_as": parsed["valid_as"],
+                "is_preliminary": parsed.get("is_preliminary", False),
                 "watched": station is not None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "issue": issue,
