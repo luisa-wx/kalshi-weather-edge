@@ -592,13 +592,20 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         }))
 
     def _on_conn_failed(self, event):
-        """Schedule a manual reconnect with our saved params."""
+        """Connection failure — log only.
+
+        With self.auto_reconnect = True, slixmpp handles the retry. Our
+        previous version scheduled an additional manual reconnect via
+        call_later, which raced with slixmpp's reconnect and produced
+        "There is already a scheduled event: Whitespace Keepalive" errors.
+
+        If slixmpp's auto-reconnect ever fails repeatedly, the watchdog
+        catches it via is_stale() and force-disconnects to retry.
+        """
         logger.error(
-            f"NWWS-OI connection failed. Retrying in 30s "
-            f"(connect_params={self._connect_params})"
+            f"NWWS-OI connection failed (auto_reconnect will retry; "
+            f"connect_params={self._connect_params})"
         )
-        if self._connect_params:
-            asyncio.get_event_loop().call_later(30, self._safe_reconnect)
 
     def _on_message(self, msg):
         if msg['type'] != 'groupchat':
