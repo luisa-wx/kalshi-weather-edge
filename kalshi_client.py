@@ -28,6 +28,15 @@ from requests.adapters import HTTPAdapter
 logger = logging.getLogger("kalshi_client")
 
 # ---------------------------------------------------------------------------
+# Configuration (env-driven)
+# ---------------------------------------------------------------------------
+# TEMP_BUFFER: degrees of safety margin before declaring a bracket dead.
+# Past-Luisa's Jan 26 rules: "2°+ buffer from bracket edge before betting."
+# Prevents firing on noise — sensor blips, rounding ambiguity, single-METAR
+# spikes that QC will likely revise. Set TEMP_BUFFER=0 to disable.
+TEMP_BUFFER = int(os.environ.get("TEMP_BUFFER", "2"))
+
+# ---------------------------------------------------------------------------
 # Kalshi REST Client
 # ---------------------------------------------------------------------------
 
@@ -122,10 +131,14 @@ class KalshiClient:
             "Content-Type": "application/json",
         }
 
+        # Tighter timeout for orders (POST /portfolio/orders) — fast-fail and
+        # let the bot re-evaluate rather than wait 10s with stale market data.
+        # GETs (price refreshes etc.) keep a more forgiving 10s.
         if method.upper() == "GET":
             resp = self.session.get(url, headers=headers, timeout=10)
         elif method.upper() == "POST":
-            resp = self.session.post(url, headers=headers, json=data, timeout=10)
+            timeout = 1.5 if endpoint == "/portfolio/orders" else 5
+            resp = self.session.post(url, headers=headers, json=data, timeout=timeout)
         else:
             raise ValueError(f"Unsupported method: {method}")
 
@@ -160,7 +173,20 @@ class KalshiClient:
         count: int,
         order_type: str = "limit",
         price_cents: int = None,
+        immediate_or_cancel: bool = True,
     ) -> Dict:
+        """Create a Kalshi order.
+
+        IMPORTANT: Defaults to IOC (Immediate-or-Cancel). With a limit-99¢ buy,
+        Kalshi will fill any available liquidity at any price ≤ 99¢ and CANCEL
+        the unfilled remainder instead of leaving it resting at 99¢ as a maker
+        order. This prevents the "robotically buying at 99¢" bug where the bot
+        accidentally market-makes on the wrong side of the spread — the most
+        likely cause of past production losses.
+
+        Pass immediate_or_cancel=False to opt out (e.g. for resting maker
+        orders in a liquidity provision strategy, which we don't currently use).
+        """
         data = {
             "ticker": ticker,
             "side": side,
@@ -174,7 +200,14 @@ class KalshiClient:
             else:
                 data["no_price"] = price_cents
 
-        logger.info("ORDER: %s %s %s x%d @ %s¢", action, side, ticker, count, price_cents)
+        if immediate_or_cancel:
+            data["time_in_force"] = "immediate_or_cancel"
+
+        tif = "IOC" if immediate_or_cancel else "GTC"
+        logger.info(
+            "ORDER: %s %s %s x%d @ %s¢ [%s]",
+            action, side, ticker, count, price_cents, tif,
+        )
         result = self._make_request("POST", "/portfolio/orders", data=data)
         logger.info("ORDER OK: latency=%dms", self.last_latency_ms)
         return result
@@ -242,29 +275,37 @@ class Bracket:
         return "open"
 
     def _eliminate_high(self, observed_high: int) -> str:
-        """Can we prove this HIGH bracket is dead given observed high?"""
+        """Can we prove this HIGH bracket is dead given observed high?
+
+        Applies TEMP_BUFFER (default 2°) before declaring dead — only fires
+        when observed temp comfortably exceeds the boundary, not when it's
+        just barely over (where one bad sensor reading could flip the outcome).
+        """
         if self.strike_type == "between":
-            # "72° to 73°" cap=73: dead if high already > 73
-            if self.cap_strike is not None and observed_high > self.cap_strike:
+            # "72° to 73°" cap=73: dead if high > 73 + buffer
+            if self.cap_strike is not None and observed_high > self.cap_strike + TEMP_BUFFER:
                 return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
             # "80° or above" floor=79: NEVER dead — high might still rise
             pass
         elif self.strike_type in ("less", "less_or_equal"):
-            # "70° or below" cap=71: dead if high already >= 71
-            if self.cap_strike is not None and observed_high >= self.cap_strike:
+            # "70° or below" cap=71: dead if high >= 71 + buffer
+            if self.cap_strike is not None and observed_high >= self.cap_strike + TEMP_BUFFER:
                 return "dead"
         return "open"
 
     def _eliminate_low(self, observed_low: int) -> str:
-        """Can we prove this LOW bracket is dead given observed low?"""
+        """Can we prove this LOW bracket is dead given observed low?
+
+        Applies TEMP_BUFFER (default 2°) before declaring dead.
+        """
         if self.strike_type == "between":
-            # "35° to 36°" floor=35: dead if low already < 35
-            if self.floor_strike is not None and observed_low < self.floor_strike:
+            # "35° to 36°" floor=35: dead if low < 35 - buffer
+            if self.floor_strike is not None and observed_low < self.floor_strike - TEMP_BUFFER:
                 return "dead"
         elif self.strike_type in ("greater", "greater_or_equal"):
-            # "37° or above" floor=36: dead if low already <= 36
-            if self.floor_strike is not None and observed_low <= self.floor_strike:
+            # "37° or above" floor=36: dead if low <= 36 - buffer
+            if self.floor_strike is not None and observed_low <= self.floor_strike - TEMP_BUFFER:
                 return "dead"
         elif self.strike_type in ("less", "less_or_equal"):
             # "34° or below" cap=35: NEVER dead — low dropping helps it

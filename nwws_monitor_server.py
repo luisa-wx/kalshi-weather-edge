@@ -229,6 +229,14 @@ def init_kalshi():
         KALSHI_CLIENT = KalshiClient()
 
         if KALSHI_CLIENT.private_key:
+            # Connection warming: pre-establish TLS + auth on startup so the
+            # first real snipe doesn't pay the ~150ms handshake cost.
+            try:
+                KALSHI_CLIENT.get_exchange_status()
+                logger.info(f"Kalshi: connection warm ({KALSHI_CLIENT.last_latency_ms:.0f}ms)")
+            except Exception as e:
+                logger.warning(f"Kalshi: connection warming failed: {e}")
+
             BRACKETS = load_all_brackets(KALSHI_CLIENT, STATIONS)
             total_h = sum(len(v["high"]) for v in BRACKETS.values())
             total_l = sum(len(v["low"]) for v in BRACKETS.values())
@@ -781,7 +789,37 @@ async def main():
             # Cleanup old products every refresh cycle
             cleanup_product_file(max_age_hours=48)
 
+    async def watchdog_loop():
+        """Detect silent NWWS-OI stalls and force reconnect.
+
+        slixmpp's auto-reconnect handles socket-level disconnects, but
+        NWWS-OI is known to silently stop sending data while the TCP
+        connection looks alive. This loop checks every minute whether
+        the client has gone silent (no products in >stale_threshold) and
+        force-disconnects, which triggers a fresh reconnect.
+
+        This is what was broken Feb 18 → May 5 — bot ran "fine" for 78 days
+        without ingesting a single product because nothing detected the stall.
+        """
+        await asyncio.sleep(120)  # initial 2-min grace period after startup
+        while True:
+            try:
+                if client.is_stale():
+                    last = client.stats.get("last_product_time", "never")
+                    logger.warning(
+                        f"🐶 WATCHDOG: NWWS-OI stale (last product: {last}). "
+                        f"Forcing reconnect..."
+                    )
+                    try:
+                        client.disconnect()
+                    except Exception as e:
+                        logger.error(f"Watchdog disconnect failed: {e}")
+            except Exception as e:
+                logger.error(f"Watchdog loop error: {e}")
+            await asyncio.sleep(60)
+
     asyncio.ensure_future(refresh_loop())
+    asyncio.ensure_future(watchdog_loop())
 
     try:
         await asyncio.Future()
