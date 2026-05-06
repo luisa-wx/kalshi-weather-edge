@@ -505,11 +505,63 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         self.room = NWWS_ROOM
         self.nick = jid.split("@")[0]
         self.register_plugin("xep_0199")
+
+        # Auto-reconnect on socket-level disconnects (slixmpp built-in).
+        self.auto_reconnect = True
+
+        # Track connect params so _safe_reconnect() can re-establish.
+        self._connect_params = None
+
+        # Watchdog config — if no products received in this long, the
+        # connection is treated as silently dead and force-disconnected.
+        self.stale_threshold_seconds = 600  # 10 min
+
         self.add_event_handler("session_start", self._on_start)
         self.add_event_handler("message", self._on_message)
         self.add_event_handler("disconnected", self._on_disconnected)
         self.add_event_handler("connection_failed", self._on_conn_failed)
-        self.stats = {"total": 0, "cli": 0, "dsm": 0}
+
+        self.stats = {
+            "total": 0,
+            "cli": 0,
+            "dsm": 0,
+            "last_product_time": None,
+            "connected_at": None,
+            "reconnects": 0,
+        }
+
+    def connect(self, address=None, **kwargs):
+        """Override connect to remember address for reconnect."""
+        if address is not None:
+            self._connect_params = address
+        return super().connect(address, **kwargs)
+
+    def is_stale(self) -> bool:
+        """True if connection appears stalled — no products in stale_threshold_seconds.
+
+        Used by watchdog_loop in main() to detect silent NWWS-OI stalls
+        (TCP alive but server stopped sending data).
+        """
+        if not self.stats["last_product_time"]:
+            # 5-min grace period from connection time before declaring stale
+            if self.stats["connected_at"]:
+                connected_at = datetime.fromisoformat(self.stats["connected_at"])
+                elapsed = (datetime.now(timezone.utc) - connected_at).total_seconds()
+                return elapsed > 300
+            return False
+        last_product = datetime.fromisoformat(self.stats["last_product_time"])
+        elapsed = (datetime.now(timezone.utc) - last_product).total_seconds()
+        return elapsed > self.stale_threshold_seconds
+
+    def _safe_reconnect(self):
+        """Force a fresh reconnect using last known connection params."""
+        if self._connect_params:
+            try:
+                logger.info(f"Reconnecting to NWWS-OI: {self._connect_params}")
+                self.connect(self._connect_params)
+            except Exception as e:
+                logger.error(f"Reconnect failed: {e}, retrying in 60s...")
+                asyncio.get_event_loop().call_later(60, self._safe_reconnect)
 
     async def _on_start(self, event):
         logger.info("NWWS-OI session started, joining room...")
@@ -519,6 +571,7 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         ET.SubElement(pres.xml, '{http://jabber.org/protocol/muc}x')
         pres.send()
         logger.info("Joined NWWS-OI chatroom")
+        self.stats["connected_at"] = datetime.now(timezone.utc).isoformat()
         asyncio.ensure_future(broadcast({
             "type": "status",
             "connected": True,
@@ -526,7 +579,12 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         }))
 
     def _on_disconnected(self, event):
-        logger.warning("Disconnected from NWWS-OI, will reconnect...")
+        """Auto-reconnect engaged via self.auto_reconnect. Watchdog catches stalls."""
+        self.stats["reconnects"] += 1
+        logger.warning(
+            f"Disconnected from NWWS-OI (reconnect #{self.stats['reconnects']}). "
+            f"Auto-reconnect engaged."
+        )
         asyncio.ensure_future(broadcast({
             "type": "status",
             "connected": False,
@@ -534,13 +592,25 @@ class NWWSMonitorClient(slixmpp.ClientXMPP):
         }))
 
     def _on_conn_failed(self, event):
-        logger.error("NWWS-OI connection failed")
+        """Schedule a manual reconnect with our saved params."""
+        logger.error(
+            f"NWWS-OI connection failed. Retrying in 30s "
+            f"(connect_params={self._connect_params})"
+        )
+        if self._connect_params:
+            asyncio.get_event_loop().call_later(30, self._safe_reconnect)
 
     def _on_message(self, msg):
         if msg['type'] != 'groupchat':
             return
 
         self.stats["total"] += 1
+        # Update last_product_time so the watchdog knows we're alive.
+        # This fires for ALL groupchat messages (including non-product noise),
+        # which is what we want — the watchdog only needs to know that the
+        # XMPP connection is still receiving data, not specifically NWS products.
+        self.stats["last_product_time"] = datetime.now(timezone.utc).isoformat()
+
         x_elem = msg.xml.find(f'{{{NWWS_OI_NS}}}x')
         if x_elem is None:
             return
