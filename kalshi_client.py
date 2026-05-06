@@ -109,42 +109,72 @@ class KalshiClient:
     # -- HTTP -----------------------------------------------------------------
 
     def _make_request(
-        self, method: str, endpoint: str, params: Dict = None, data: Dict = None
+        self, method: str, endpoint: str, params: Dict = None, data: Dict = None,
+        max_retries: int = 3,
     ) -> Dict:
-        start = time.perf_counter()
+        """Make an authenticated request to Kalshi with 429 backoff retry.
 
-        timestamp_ms = int(time.time() * 1000)
-        sign_path = f"/trade-api/v2{endpoint}"
-        url = f"{self.BASE_URL}{endpoint}"
+        On 429 (rate limit), sleeps with exponential backoff and retries.
+        Order placement (POST /portfolio/orders) is NOT retried — we don't
+        want to risk double-placing an order on a transient 429.
+        """
+        # Don't retry orders — risk of double-fill is worse than failing fast.
+        is_order = (method.upper() == "POST" and endpoint == "/portfolio/orders")
+        retries = 1 if is_order else max_retries
 
-        if params:
-            query_string = "&".join(f"{k}={v}" for k, v in params.items())
-            sign_path = f"/trade-api/v2{endpoint}?{query_string}"
-            url = f"{self.BASE_URL}{endpoint}?{query_string}"
+        last_exc = None
+        for attempt in range(retries):
+            start = time.perf_counter()
 
-        signature = self._sign_request(timestamp_ms, method.upper(), sign_path)
+            timestamp_ms = int(time.time() * 1000)
+            sign_path = f"/trade-api/v2{endpoint}"
+            url = f"{self.BASE_URL}{endpoint}"
 
-        headers = {
-            "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-SIGNATURE": signature,
-            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
-            "Content-Type": "application/json",
-        }
+            if params:
+                query_string = "&".join(f"{k}={v}" for k, v in params.items())
+                sign_path = f"/trade-api/v2{endpoint}?{query_string}"
+                url = f"{self.BASE_URL}{endpoint}?{query_string}"
 
-        # Tighter timeout for orders (POST /portfolio/orders) — fast-fail and
-        # let the bot re-evaluate rather than wait 10s with stale market data.
-        # GETs (price refreshes etc.) keep a more forgiving 10s.
-        if method.upper() == "GET":
-            resp = self.session.get(url, headers=headers, timeout=10)
-        elif method.upper() == "POST":
-            timeout = 1.5 if endpoint == "/portfolio/orders" else 5
-            resp = self.session.post(url, headers=headers, json=data, timeout=timeout)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
+            signature = self._sign_request(timestamp_ms, method.upper(), sign_path)
 
-        self.last_latency_ms = (time.perf_counter() - start) * 1000
-        resp.raise_for_status()
-        return resp.json()
+            headers = {
+                "KALSHI-ACCESS-KEY": self.api_key_id,
+                "KALSHI-ACCESS-SIGNATURE": signature,
+                "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+                "Content-Type": "application/json",
+            }
+
+            # Tighter timeout for orders — fast-fail rather than hold stale data.
+            if method.upper() == "GET":
+                resp = self.session.get(url, headers=headers, timeout=10)
+            elif method.upper() == "POST":
+                timeout = 1.5 if is_order else 5
+                resp = self.session.post(url, headers=headers, json=data, timeout=timeout)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+
+            self.last_latency_ms = (time.perf_counter() - start) * 1000
+
+            # Handle 429 (rate limit) with exponential backoff retry
+            if resp.status_code == 429 and attempt < retries - 1:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning("429 rate-limit on %s, retrying in %ds (attempt %d/%d)",
+                               endpoint, wait, attempt + 1, retries)
+                time.sleep(wait)
+                continue
+
+            try:
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                last_exc = e
+                if attempt < retries - 1:
+                    time.sleep(0.5)
+                    continue
+                raise
+
+        if last_exc:
+            raise last_exc
 
     # -- public API methods ---------------------------------------------------
 
@@ -445,6 +475,11 @@ def load_brackets_for_station(
 
     event_ticker = f"{ticker_base}-{today_suffix}"
     brackets = []
+
+    # Tiny throttle to avoid 429s when loading 80+ events at startup.
+    # Kalshi's rate limit is "fair" but not infinite. 50ms between calls
+    # caps load rate at 20/sec which Kalshi tolerates fine.
+    time.sleep(0.05)
 
     try:
         event_data = client.get_event(event_ticker)
