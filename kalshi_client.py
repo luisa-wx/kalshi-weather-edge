@@ -482,13 +482,28 @@ def load_brackets_for_station(
     return brackets
 
 
-def load_all_brackets(client: KalshiClient, stations: dict) -> Dict[str, Dict[str, List[Bracket]]]:
+def load_all_brackets(client: KalshiClient, stations: dict, include_yesterday: bool = True) -> Dict[str, Dict[str, List[Bracket]]]:
     """
     Load all brackets for all stations, using each station's LOCAL date
     for the event ticker suffix.
 
-    Returns: {station_code: {"high": [Bracket, ...], "low": [Bracket, ...], "suffix": "26FEB11", "local_info": {...}}}
+    When include_yesterday=True (default), ALSO loads yesterday's brackets
+    per station and stores them under "high_y", "low_y" keys with "suffix_y".
+    This is critical for catching the overnight settlement CLI: the May 5
+    contract for KMDW (Chicago) doesn't settle until ~5 AM CDT on May 6, so
+    if the bot starts at midnight on May 6 it would have May 6 brackets and
+    miss the May 5 finalizing CLI without yesterday's brackets loaded.
+
+    Returns: {
+      station_code: {
+        "high": [Bracket, ...],  "low": [Bracket, ...],   "suffix": "26MAY06",
+        "high_y": [Bracket, ...], "low_y": [Bracket, ...], "suffix_y": "26MAY05",
+        "local_info": {...},
+      }
+    }
     """
+    from datetime import timedelta
+
     result = {}
 
     for station, cfg in stations.items():
@@ -496,19 +511,36 @@ def load_all_brackets(client: KalshiClient, stations: dict) -> Dict[str, Dict[st
         suffix = get_station_suffix(tz_name)
         local_info = get_station_local_info(tz_name)
 
-        result[station] = {"high": [], "low": [], "suffix": suffix, "local_info": local_info}
+        # Compute yesterday's suffix in the station's local time
+        tz = ZoneInfo(tz_name)
+        yesterday_local = datetime.now(tz) - timedelta(days=1)
+        suffix_y = yesterday_local.strftime("%y%b%d").upper()
+
+        result[station] = {
+            "high": [], "low": [], "suffix": suffix,
+            "high_y": [], "low_y": [], "suffix_y": suffix_y,
+            "local_info": local_info,
+        }
 
         high_ticker = cfg.get("high_ticker")
         if high_ticker:
             result[station]["high"] = load_brackets_for_station(
                 client, station, high_ticker, "high", suffix
             )
+            if include_yesterday:
+                result[station]["high_y"] = load_brackets_for_station(
+                    client, station, high_ticker, "high", suffix_y
+                )
 
         low_ticker = cfg.get("low_ticker")
         if low_ticker:
             result[station]["low"] = load_brackets_for_station(
                 client, station, low_ticker, "low", suffix
             )
+            if include_yesterday:
+                result[station]["low_y"] = load_brackets_for_station(
+                    client, station, low_ticker, "low", suffix_y
+                )
 
     return result
 

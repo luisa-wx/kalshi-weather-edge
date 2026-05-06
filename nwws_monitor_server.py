@@ -248,52 +248,78 @@ def init_kalshi():
         KALSHI_CLIENT = None
 
 
-def _cli_date_matches_brackets(station: str, valid_as: str) -> bool:
-    """Check if CLI date matches the bracket date for this station.
-    
+def _cli_date_matches_brackets(station: str, valid_as: str) -> str | None:
+    """Check if CLI date matches today's OR yesterday's bracket date for this station.
+
     valid_as is like 'FEBRUARY 11 2026' from CLI parser.
-    Brackets have suffix like '26FEB11'.
-    Only apply eliminations if they match — don't use yesterday's CLI on today's brackets.
+    Brackets have a 'suffix' (today, e.g. '26MAY06') and 'suffix_y' (yesterday).
+
+    Returns:
+      'today' if CLI matches today's bracket date → use BRACKETS[station]['high'/'low']
+      'yesterday' if CLI matches yesterday's date → use BRACKETS[station]['high_y'/'low_y']
+      None if neither matches → skip the CLI
+
+    The 'yesterday' case is critical: overnight settlement CLIs drop early
+    AM local time (typically 12:30-5 AM) and report on the PREVIOUS day's
+    high/low. A bot that just rolled over to today's brackets would miss
+    these without yesterday's brackets also loaded.
     """
     if not valid_as or station not in BRACKETS:
-        return False
+        return None
 
     bracket_suffix = BRACKETS[station].get("suffix", "")
+    bracket_suffix_y = BRACKETS[station].get("suffix_y", "")
     if not bracket_suffix:
-        return True  # No suffix info, assume match
+        return "today"  # No suffix info, fall back to old assume-match behavior
 
     try:
-        # Parse "FEBRUARY 11 2026" → datetime → "26FEB11"
         from datetime import datetime as dt_cls
         cli_date = dt_cls.strptime(valid_as.strip(), "%B %d %Y")
         cli_suffix = cli_date.strftime("%y%b%d").upper()
-        matches = cli_suffix == bracket_suffix
-        if not matches:
-            logger.info(f"⏭️ {station}: CLI date {valid_as} ({cli_suffix}) != bracket date ({bracket_suffix}), skipping")
-        return matches
+
+        if cli_suffix == bracket_suffix:
+            return "today"
+        if cli_suffix == bracket_suffix_y:
+            logger.info(f"📅 {station}: CLI for yesterday ({cli_suffix}), applying to yesterday's brackets")
+            return "yesterday"
+
+        logger.info(
+            f"⏭️ {station}: CLI date {valid_as} ({cli_suffix}) matches "
+            f"neither today ({bracket_suffix}) nor yesterday ({bracket_suffix_y}), skipping"
+        )
+        return None
     except (ValueError, AttributeError) as e:
         logger.warning(f"Could not parse CLI date '{valid_as}': {e}")
-        return True  # Can't parse, assume match to be safe
+        return "today"  # Can't parse, fall back to today's brackets
 
 
 def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = None, valid_as: str = None) -> list:
     """When a CLI/DSM arrives, eliminate dead brackets and find opportunities.
-    
+
     Uses ELIMINATION ONLY:
       - Marks brackets as dead if the observed temp proves they can't win
       - BUY NO on dead brackets below max_price
       - If all but one bracket eliminated → last-man-standing BUY YES
-    
+
     Never asserts a bracket has won just because the temp is in its range.
+
+    Routes to TODAY's or YESTERDAY's bracket set based on the CLI's valid_as
+    date — critical for catching overnight settlement CLIs that report on the
+    previous day's data.
     """
     global OPPORTUNITIES
 
     if not BRACKETS or station not in BRACKETS:
         return []
 
-    # Don't apply yesterday's CLI to today's brackets
-    if valid_as and not _cli_date_matches_brackets(station, valid_as):
+    # Determine which bracket set this CLI applies to.
+    # Returns 'today', 'yesterday', or None.
+    match = _cli_date_matches_brackets(station, valid_as) if valid_as else "today"
+    if not match:
         return []
+
+    high_key = "high" if match == "today" else "high_y"
+    low_key = "low" if match == "today" else "low_y"
 
     try:
         from kalshi_client import find_opportunities, execute_snipe
@@ -301,9 +327,9 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
         station_data = BRACKETS[station]
         resolved_count = 0
 
-        # Eliminate HIGH brackets
+        # Eliminate HIGH brackets (today's or yesterday's based on CLI date)
         if cli_high is not None:
-            for b in station_data.get("high", []):
+            for b in station_data.get(high_key, []):
                 new_status = b.check_temp_intraday(cli_high)
                 if new_status == "dead" and b.status == "open":
                     b.status = "dead"
@@ -311,20 +337,20 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
 
         # Eliminate LOW brackets
         if cli_low is not None:
-            for b in station_data.get("low", []):
+            for b in station_data.get(low_key, []):
                 new_status = b.check_temp_intraday(cli_low)
                 if new_status == "dead" and b.status == "open":
                     b.status = "dead"
                     resolved_count += 1
 
-        # Check for last-man-standing
-        for signal_type in ("high", "low"):
-            group = station_data.get(signal_type, [])
+        # Check for last-man-standing — same bracket set as elimination
+        for sig_type, key in (("high", high_key), ("low", low_key)):
+            group = station_data.get(key, [])
             alive = [b for b in group if b.status != "dead"]
             if len(alive) == 1 and alive[0].status == "open":
                 alive[0].status = "locked"
                 resolved_count += 1
-                logger.info(f"🏆 {station} {signal_type.upper()}: LAST-MAN-STANDING → {alive[0].subtitle}")
+                logger.info(f"🏆 {station} {sig_type.upper()} ({match}): LAST-MAN-STANDING → {alive[0].subtitle}")
 
         if resolved_count > 0:
             logger.info(f"📊 {station}: {resolved_count} brackets resolved (H={cli_high} L={cli_low})")
@@ -335,9 +361,22 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
             "brackets": get_brackets_summary(),
         }))
 
-        # Find cheap opportunities
+        # Find cheap opportunities — pass the right bracket set.
+        # find_opportunities reads brackets[station]["high"/"low"], so when
+        # the CLI is for yesterday, build a temp dict that puts yesterday's
+        # brackets in the standard positions for this station.
+        if match == "yesterday":
+            brackets_for_search = dict(BRACKETS)
+            brackets_for_search[station] = {
+                **BRACKETS[station],
+                "high": BRACKETS[station].get("high_y", []),
+                "low": BRACKETS[station].get("low_y", []),
+            }
+        else:
+            brackets_for_search = BRACKETS
+
         opps = find_opportunities(
-            BRACKETS,
+            brackets_for_search,
             cli_high=cli_high,
             cli_low=cli_low,
             station=station,
