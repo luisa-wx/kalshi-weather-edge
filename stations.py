@@ -85,7 +85,7 @@ STATIONS = {
     "KSFO": {
         "city": "San Francisco",
         "high_ticker": "KXHIGHTSFO",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTSFO",
         "timezone": ZoneInfo("America/Los_Angeles"),
         "tz_name": "America/Los_Angeles",
         "wfo_cccc": "KMTR",
@@ -95,7 +95,7 @@ STATIONS = {
     "KSEA": {
         "city": "Seattle",
         "high_ticker": "KXHIGHTSEA",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTSEA",
         "timezone": ZoneInfo("America/Los_Angeles"),
         "tz_name": "America/Los_Angeles",
         "wfo_cccc": "KSEW",
@@ -105,7 +105,7 @@ STATIONS = {
     "KDCA": {
         "city": "Washington DC",
         "high_ticker": "KXHIGHTDC",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTDC",
         "timezone": ZoneInfo("America/New_York"),
         "tz_name": "America/New_York",
         "wfo_cccc": "KLWX",
@@ -115,7 +115,7 @@ STATIONS = {
     "KMSY": {
         "city": "New Orleans",
         "high_ticker": "KXHIGHTNOLA",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTNOLA",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KLIX",
@@ -125,7 +125,7 @@ STATIONS = {
     "KLAS": {
         "city": "Las Vegas",
         "high_ticker": "KXHIGHTLV",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTLV",
         "timezone": ZoneInfo("America/Los_Angeles"),
         "tz_name": "America/Los_Angeles",
         "wfo_cccc": "KVEF",
@@ -135,7 +135,7 @@ STATIONS = {
     "KDFW": {
         "city": "Dallas",
         "high_ticker": "KXHIGHTDAL",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTDAL",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KFWD",
@@ -145,7 +145,7 @@ STATIONS = {
     "KHOU": {
         "city": "Houston",
         "high_ticker": "KXHIGHTHOU",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTHOU",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KHGX",
@@ -155,7 +155,7 @@ STATIONS = {
     "KBOS": {
         "city": "Boston",
         "high_ticker": "KXHIGHTBOS",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTBOS",
         "timezone": ZoneInfo("America/New_York"),
         "tz_name": "America/New_York",
         "wfo_cccc": "KBOX",
@@ -165,7 +165,7 @@ STATIONS = {
     "KMSP": {
         "city": "Minneapolis",
         "high_ticker": "KXHIGHTMIN",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTMIN",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KMPX",
@@ -175,7 +175,7 @@ STATIONS = {
     "KSAT": {
         "city": "San Antonio",
         "high_ticker": "KXHIGHTSATX",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTSATX",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KEWX",
@@ -185,7 +185,7 @@ STATIONS = {
     "KOKC": {
         "city": "Oklahoma City",
         "high_ticker": "KXHIGHTOKC",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTOKC",
         "timezone": ZoneInfo("America/Chicago"),
         "tz_name": "America/Chicago",
         "wfo_cccc": "KOUN",
@@ -195,12 +195,23 @@ STATIONS = {
     "KPHX": {
         "city": "Phoenix",
         "high_ticker": "KXHIGHTPHX",
-        "low_ticker": None,
+        "low_ticker": "KXLOWTPHX",
         "timezone": ZoneInfo("America/Phoenix"),
         "tz_name": "America/Phoenix",
         "wfo_cccc": "KPSR",
         "dsm_awipsid": "DSMPHX",
         "metar_station": "KPHX",
+    },
+    # --- New station added 2026-05-06 ---
+    "KATL": {
+        "city": "Atlanta",
+        "high_ticker": "KXHIGHTATL",
+        "low_ticker": "KXLOWTATL",
+        "timezone": ZoneInfo("America/New_York"),
+        "tz_name": "America/New_York",
+        "wfo_cccc": "KFFC",  # Peachtree City WFO serves Atlanta
+        "dsm_awipsid": "DSMATL",
+        "metar_station": "KATL",
     },
 }
 
