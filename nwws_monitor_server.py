@@ -124,6 +124,57 @@ def cleanup_product_file(max_age_hours: int = 48):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic logging — added 2026-05-06
+# ---------------------------------------------------------------------------
+# To diagnose "why didn't the bot snipe", we log:
+#   1. decisions.jsonl — every CLI/DSM evaluation, whether or not it fired
+#   2. prices.jsonl — periodic (5 min) snapshot of every bracket's prices
+# Without these, "0 snipes" is ambiguous: was there no edge? wrong filter?
+# bug? Now we can answer post-hoc by reading these logs.
+
+DECISION_FILE = "logs/decisions.jsonl"
+PRICES_FILE = "logs/prices.jsonl"
+
+
+def write_decision(decision: dict):
+    """Append a decision record (every CLI evaluation, snipe or not)."""
+    decision.setdefault("time", datetime.now(timezone.utc).isoformat())
+    try:
+        with open(DECISION_FILE, "a") as f:
+            f.write(json.dumps(decision, default=str) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write decision: {e}")
+
+
+def write_price_snapshot(brackets_dict: dict):
+    """Append a snapshot of all brackets' current prices (for replay)."""
+    snapshot = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "stations": {},
+    }
+    for station, data in brackets_dict.items():
+        sn = {"suffix": data.get("suffix"), "suffix_y": data.get("suffix_y"), "brackets": []}
+        for key in ("high", "low", "high_y", "low_y"):
+            for b in data.get(key, []):
+                sn["brackets"].append({
+                    "key": key,
+                    "ticker": b.ticker,
+                    "subtitle": b.subtitle,
+                    "status": b.status,
+                    "yes_ask": b.yes_ask,
+                    "no_ask": b.no_ask,
+                    "yes_bid": b.yes_bid,
+                    "no_bid": b.no_bid,
+                })
+        snapshot["stations"][station] = sn
+    try:
+        with open(PRICES_FILE, "a") as f:
+            f.write(json.dumps(snapshot, default=str) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write price snapshot: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
 
@@ -309,17 +360,46 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
     """
     global OPPORTUNITIES
 
+    # Build decision record up-front so every code path writes one.
+    decision = {
+        "station": station,
+        "cli_high": cli_high,
+        "cli_low": cli_low,
+        "valid_as": valid_as,
+        "max_price": MAX_PRICE,
+    }
+
     if not BRACKETS or station not in BRACKETS:
+        decision["match"] = None
+        decision["skip_reason"] = "station_not_loaded"
+        decision["snipes_fired"] = 0
+        write_decision(decision)
         return []
 
     # Determine which bracket set this CLI applies to.
-    # Returns 'today', 'yesterday', or None.
     match = _cli_date_matches_brackets(station, valid_as) if valid_as else "today"
+    decision["match"] = match
     if not match:
+        decision["skip_reason"] = "cli_date_mismatch"
+        decision["snipes_fired"] = 0
+        write_decision(decision)
         return []
 
     high_key = "high" if match == "today" else "high_y"
     low_key = "low" if match == "today" else "low_y"
+
+    # Snapshot bracket state BEFORE elimination — for retroactive analysis.
+    decision["brackets_before"] = []
+    for sig_type, key in [("high", high_key), ("low", low_key)]:
+        for b in BRACKETS[station].get(key, []):
+            decision["brackets_before"].append({
+                "ticker": b.ticker,
+                "subtitle": b.subtitle,
+                "signal": sig_type,
+                "status": b.status,
+                "no_ask": b.no_ask,
+                "yes_ask": b.yes_ask,
+            })
 
     try:
         from kalshi_client import find_opportunities, execute_snipe
@@ -383,6 +463,10 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
             max_price=MAX_PRICE,
         )
 
+        decision["resolved_count"] = resolved_count
+        decision["opportunities_found"] = len(opps)
+
+        snipes_fired = 0
         if opps:
             logger.info(f"🎯 {station}: {len(opps)} opportunities found!")
             for opp in opps:
@@ -398,6 +482,8 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
                     kalshi_ws=KALSHI_WS,
                 )
                 SNIPE_LOG.append(record)
+                if record.get("success"):
+                    snipes_fired += 1
 
                 try:
                     with open("logs/snipes.jsonl", "a") as f:
@@ -409,10 +495,42 @@ def check_cli_opportunities(station: str, cli_high: int = None, cli_low: int = N
             if len(OPPORTUNITIES) > 100:
                 OPPORTUNITIES = OPPORTUNITIES[-100:]
 
+        decision["snipes_fired"] = snipes_fired
+
+        # Diagnose why we didn't snipe even when transitions occurred.
+        # If brackets were resolved but opps==0, it's the price filter rejecting them.
+        if resolved_count > 0 and len(opps) == 0:
+            decision["skip_reason"] = "price_filter_or_no_active_bid"
+            # Capture which brackets transitioned and at what price
+            decision["resolved_brackets_no_opp"] = []
+            for sig_type, key in [("high", high_key), ("low", low_key)]:
+                for b in BRACKETS[station].get(key, []):
+                    if b.status in ("dead", "locked"):
+                        decision["resolved_brackets_no_opp"].append({
+                            "ticker": b.ticker,
+                            "subtitle": b.subtitle,
+                            "signal": sig_type,
+                            "status": b.status,
+                            "no_ask": b.no_ask,
+                            "yes_ask": b.yes_ask,
+                            "above_max_price": (
+                                (b.no_ask is not None and b.no_ask > MAX_PRICE)
+                                if b.status == "dead"
+                                else (b.yes_ask is not None and b.yes_ask > MAX_PRICE)
+                            ),
+                        })
+        elif resolved_count == 0:
+            decision["skip_reason"] = "no_transitions"
+        elif snipes_fired == 0 and len(opps) > 0:
+            decision["skip_reason"] = "opps_found_but_snipes_failed"
+
+        write_decision(decision)
         return opps
 
     except Exception as e:
         logger.error(f"Opportunity check failed: {e}")
+        decision["error"] = str(e)
+        write_decision(decision)
         return []
 
 
@@ -934,8 +1052,25 @@ async def main():
                 logger.error(f"Watchdog loop error: {e}")
             await asyncio.sleep(60)
 
+    async def price_snapshot_loop():
+        """Every 5 min, dump all bracket prices to logs/prices.jsonl.
+
+        Lets us reconstruct the market timeline retrospectively to answer
+        questions like 'when did Vegas LOW move from 70¢ to 100¢?' which
+        is impossible without time-series data.
+        """
+        await asyncio.sleep(60)  # initial 1-min grace
+        while True:
+            try:
+                if BRACKETS:
+                    write_price_snapshot(BRACKETS)
+            except Exception as e:
+                logger.error(f"Price snapshot failed: {e}")
+            await asyncio.sleep(300)  # 5 min
+
     asyncio.ensure_future(refresh_loop())
     asyncio.ensure_future(watchdog_loop())
+    asyncio.ensure_future(price_snapshot_loop())
 
     try:
         await asyncio.Future()
