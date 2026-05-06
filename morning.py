@@ -25,6 +25,7 @@ LOG_DIR = PROJECT_DIR / "logs"
 SNIPES_LOG = LOG_DIR / "snipes.jsonl"
 MONITOR_LOG = LOG_DIR / "monitor.log"
 PRODUCTS_LOG = LOG_DIR / "cli_dsm_products.jsonl"
+DECISIONS_LOG = LOG_DIR / "decisions.jsonl"
 
 NOW = datetime.now(timezone.utc)
 DAY_AGO = NOW - timedelta(hours=24)
@@ -134,6 +135,31 @@ def load_recent_snipes() -> list[dict]:
     return out
 
 
+def load_recent_decisions() -> list[dict]:
+    """Load decisions.jsonl entries from the last 24h."""
+    if not DECISIONS_LOG.exists():
+        return []
+    out = []
+    try:
+        with open(DECISIONS_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    ts_str = d.get("time", "")
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str)
+                        if ts >= DAY_AGO:
+                            out.append(d)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
 # ------------- RENDER -------------
 
 def fmt_age(dt: datetime | None) -> str:
@@ -233,19 +259,76 @@ def main():
             ok = "✓" if s.get("success") else "✗"
             print(f"    {ts}  {mark}{ok}  {station:<5} {action:<8} {sub:<14} ask={ask}¢")
     else:
-        print("    (none — bot may not have caught any transitions yet,")
-        print("     or thresholds may need tuning. Check dashboard for context.)")
+        print("    (none — see DECISIONS section below for why.)")
+
+    # ----- DECISIONS BREAKDOWN (the new diagnostic data) -----
+    decisions = load_recent_decisions()
+    print(f"\n🔍 DECISIONS (last 24h): {len(decisions)} CLI evaluations")
+
+    if decisions:
+        # Bucket by skip_reason
+        skip_counts = Counter(d.get("skip_reason") or ("ok" if d.get("snipes_fired", 0) > 0 else "no_snipe") for d in decisions)
+        for reason, n in skip_counts.most_common():
+            label = {
+                "ok": "✅ snipes fired",
+                "no_snipe": "⚠️  no snipe (unknown reason)",
+                "cli_date_mismatch": "  CLI date didn't match brackets",
+                "no_transitions": "  No bracket transitions",
+                "price_filter_or_no_active_bid": "  Brackets dead but already at 100¢ (market converged before us)",
+                "station_not_loaded": "  Station not in BRACKETS dict",
+                "opps_found_but_snipes_failed": "❌ opportunities found but order failed",
+            }.get(reason, f"  {reason}")
+            print(f"    {n}× {label}")
+
+        # The KEY metric: any rejected brackets with no_ask < 90 → real edge existed
+        edge_moments = []
+        for d in decisions:
+            for b in d.get("resolved_brackets_no_opp", []):
+                no_ask = b.get("no_ask")
+                yes_ask = b.get("yes_ask")
+                # For dead brackets: low no_ask = edge existed
+                # For locked: low yes_ask = edge existed
+                price = no_ask if b.get("status") == "dead" else yes_ask
+                if isinstance(price, (int, float)) and 1 < price < 90:
+                    edge_moments.append({
+                        "time": d.get("time", "")[:19],
+                        "station": d.get("station"),
+                        "subtitle": b.get("subtitle"),
+                        "status": b.get("status"),
+                        "price": price,
+                        "edge": 100 - price,
+                    })
+
+        if edge_moments:
+            print(f"\n  ✨ {len(edge_moments)} REJECTED BRACKETS HAD REAL EDGE (no_ask < 90)")
+            print(f"     These would have been profitable trades had MAX_PRICE been higher:")
+            for m in edge_moments[:10]:
+                print(f"       {m['time']}  {m['station']:<5} {m['subtitle']:<14} {m['status']:<6} @ {m['price']}¢ (edge {m['edge']}¢)")
+            if len(edge_moments) > 10:
+                print(f"       ... and {len(edge_moments) - 10} more")
+        else:
+            print(f"\n  📊 Of all rejected brackets, NONE had no_ask < 90.")
+            print(f"     Market was fully converged (≥90¢) every time the bot saw a CLI.")
 
     # Bottom line
     print()
     print("━" * 60)
     overall_ok = alive and log_recent and errors_24h < 5
+
+    edge_count = len([d for d in decisions for b in d.get("resolved_brackets_no_opp", [])
+                      if isinstance(b.get("no_ask"), (int, float)) and 1 < b["no_ask"] < 90])
+
     if overall_ok and len(snipes) > 0:
-        print("  🎯 BOTTOM LINE: bot ran and found edges. Investigate snipes above.")
+        print("  🎯 BOTTOM LINE: bot ran and FIRED snipes. Audit them above.")
+    elif overall_ok and edge_count > 0:
+        print(f"  ✨ BOTTOM LINE: bot ran cleanly, no snipes, BUT {edge_count} rejected brackets")
+        print(f"     had real edge (no_ask < 90). Tune MAX_PRICE upward to capture them.")
+    elif overall_ok and len(decisions) > 0 and recent_products > 0:
+        print(f"  ✅ BOTTOM LINE: bot ran cleanly. {len(decisions)} CLI evaluations, 0 snipes.")
+        print(f"     Every rejected bracket was at ≥90¢ — market converges before our CLI.")
+        print(f"     Strategy may need faster data (METARs) or different game.")
     elif overall_ok and recent_products > 0:
-        print("  ✅ BOTTOM LINE: bot ran cleanly. No snipes — no transitions detected.")
-        print("     This may mean the strategy is too restrictive (try lower TEMP_BUFFER")
-        print("     or higher MAX_PRICE), or it was just a quiet night.")
+        print("  ✅ BOTTOM LINE: bot ran cleanly. No CLIs hit our stations yet today.")
     elif overall_ok and recent_products == 0:
         print("  ⚠️  BOTTOM LINE: bot is alive but received no NWS products.")
         print("     NWWS-OI may be silently stalling. Check `tail logs/monitor.log`.")
