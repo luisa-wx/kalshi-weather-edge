@@ -1079,13 +1079,22 @@ async def main():
         try:
             from parsers import DataSource
 
+            # SYNOPTIC GUARD: 6-hour MAX/MIN groups are ONLY present in METARs
+            # at synoptic times (00/06/12/18 UTC, observed at :53-:59 of those hours).
+            # If the parser claims to find 6hr data in a non-synoptic METAR, it's a
+            # FALSE POSITIVE — usually wind data (e.g. "PK WND 28030/0106" matches
+            # the 2xxxx regex and decodes as bogus +3.0°C → 37°F). Skip these to
+            # avoid firing snipes on phantom temperature observations.
+            is_synoptic = (obs_time.hour in {0, 6, 12, 18}) and (obs_time.minute >= 50)
+
             six_hr_max_f = None
             six_hr_min_f = None
             for t in parsed.temperatures:
-                if t.source == DataSource.METAR_6HR_MAX:
+                if t.source == DataSource.METAR_6HR_MAX and is_synoptic:
                     six_hr_max_f = t.temp_f
-                elif t.source == DataSource.METAR_6HR_MIN:
+                elif t.source == DataSource.METAR_6HR_MIN and is_synoptic:
                     six_hr_min_f = t.temp_f
+                # Non-synoptic 6hr matches are silently dropped (parser false positives)
 
             # V1: only act on synoptic METARs (those with 6-hour groups).
             # T-group precision logic (rounding-ambiguity edge) is a future enhancement.
