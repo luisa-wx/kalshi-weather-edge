@@ -1068,9 +1068,63 @@ async def main():
                 logger.error(f"Price snapshot failed: {e}")
             await asyncio.sleep(300)  # 5 min
 
+    # ---- METAR POLLER ----
+    # Augments the CLI flow with hourly METAR signals. At synoptic times
+    # (00/06/12/18 UTC) METARs include 6-hour MAX/MIN groups which give
+    # mathematical eliminations earlier than waiting for the daily CLI.
+    def on_new_metar(station, raw, obs_time, parsed):
+        """Callback for each new METAR. Triggers bracket elimination if 6hr group present."""
+        if parsed is None or not getattr(parsed, "temperatures", None):
+            return
+        try:
+            from parsers import DataSource
+
+            six_hr_max_f = None
+            six_hr_min_f = None
+            for t in parsed.temperatures:
+                if t.source == DataSource.METAR_6HR_MAX:
+                    six_hr_max_f = t.temp_f
+                elif t.source == DataSource.METAR_6HR_MIN:
+                    six_hr_min_f = t.temp_f
+
+            # V1: only act on synoptic METARs (those with 6-hour groups).
+            # T-group precision logic (rounding-ambiguity edge) is a future enhancement.
+            if six_hr_max_f is None and six_hr_min_f is None:
+                return
+
+            logger.info(
+                "📡 [METAR %s] obs=%s 6hr_max=%s°F 6hr_min=%s°F → routing to bracket eval",
+                station, obs_time.strftime("%H:%M:%SZ"),
+                six_hr_max_f, six_hr_min_f,
+            )
+
+            # Route through existing check_cli_opportunities for today's brackets.
+            # valid_as=None lets the function default to match='today'.
+            check_cli_opportunities(
+                station=station,
+                cli_high=six_hr_max_f,
+                cli_low=six_hr_min_f,
+                valid_as=None,
+            )
+        except Exception as e:
+            logger.error(f"on_new_metar failed for {station}: {e}")
+
+    metar_poller = None
+    try:
+        from metar_poller import AviationWeatherPoller
+        metar_poller = AviationWeatherPoller(
+            stations=list(STATIONS.keys()),
+            on_new_metar=on_new_metar,
+        )
+        logger.info("📡 METAR poller initialized for %d stations", len(STATIONS))
+    except Exception as e:
+        logger.error(f"Failed to initialize METAR poller: {e}")
+
     asyncio.ensure_future(refresh_loop())
     asyncio.ensure_future(watchdog_loop())
     asyncio.ensure_future(price_snapshot_loop())
+    if metar_poller is not None:
+        asyncio.ensure_future(metar_poller.run())
 
     try:
         await asyncio.Future()
